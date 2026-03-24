@@ -24,18 +24,20 @@ export default function AccountCard({ account }: Props) {
   }).format(balance);
 
   return (
-    <div className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="font-medium text-gray-900">{account.name}</h3>
-        <span className="text-xs rounded-full bg-gray-100 px-2 py-1 text-gray-600">
+    <div className="apple-card p-4 transition-shadow duration-200 hover:shadow-apple">
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <h3 className="text-apple-subhead font-semibold text-gray-900">{account.name}</h3>
+          <p className="text-apple-caption1 text-apple-gray-1 mt-0.5">
+            {typeLabels[account.type] || account.type}
+            {account.iban ? ` · ${account.iban}` : ''}
+          </p>
+        </div>
+        <span className="apple-badge bg-apple-gray-6 text-apple-gray-1">
           {institutionLabels[account.institution] || account.institution}
         </span>
       </div>
-      <p className="text-xs text-gray-500 mb-3">
-        {typeLabels[account.type] || account.type}
-        {account.iban ? ` \u00b7 ${account.iban}` : ''}
-      </p>
-      <p className={`text-xl font-semibold ${balance >= 0 ? 'text-gray-900' : 'text-red-600'}`}>
+      <p className={`text-apple-title3 ${balance >= 0 ? 'text-gray-900' : 'text-apple-red'}`}>
         {formatted}
       </p>
     </div>

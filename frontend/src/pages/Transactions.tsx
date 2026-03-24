@@ -28,59 +28,63 @@ export default function Transactions() {
   const fmtDate = (d: string) =>
     new Date(d).toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' });
 
-  const typeColors: Record<string, string> = {
-    buy: 'bg-blue-100 text-blue-700',
-    sell: 'bg-orange-100 text-orange-700',
-    dividend: 'bg-green-100 text-green-700',
-    deposit: 'bg-emerald-100 text-emerald-700',
-    withdrawal: 'bg-red-100 text-red-700',
-    interest: 'bg-yellow-100 text-yellow-700',
-    fee: 'bg-gray-100 text-gray-700',
-    transfer: 'bg-purple-100 text-purple-700',
-    savings_plan: 'bg-indigo-100 text-indigo-700',
+  const typeStyles: Record<string, string> = {
+    buy: 'bg-apple-blue/10 text-apple-blue',
+    sell: 'bg-apple-orange/10 text-apple-orange',
+    dividend: 'bg-apple-green/10 text-apple-green',
+    deposit: 'bg-emerald-50 text-emerald-600',
+    withdrawal: 'bg-apple-red/10 text-apple-red',
+    interest: 'bg-apple-yellow/10 text-yellow-700',
+    fee: 'bg-apple-gray-6 text-apple-gray-1',
+    transfer: 'bg-apple-purple/10 text-apple-purple',
+    savings_plan: 'bg-apple-indigo/10 text-apple-indigo',
   };
 
   const pages = Math.ceil(total / limit);
   const currentPage = Math.floor(offset / limit) + 1;
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-lg font-semibold text-gray-900">
-          Transactions <span className="text-sm font-normal text-gray-500">({total} total)</span>
-        </h1>
+    <div className="space-y-5">
+      <div className="flex items-baseline justify-between">
+        <h1 className="text-apple-title1 text-gray-900">Transactions</h1>
+        <span className="text-apple-footnote text-apple-gray-1">{total} total</span>
       </div>
 
-      <div className="rounded-xl bg-white shadow-sm border border-gray-200 overflow-hidden">
+      <div className="apple-card overflow-hidden">
         {loading ? (
-          <div className="flex items-center justify-center py-20 text-gray-400">Loading...</div>
+          <div className="flex items-center justify-center py-20 text-apple-callout text-apple-gray-2">Loading...</div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="w-full">
               <thead>
-                <tr className="border-b border-gray-200 bg-gray-50 text-left text-gray-500">
-                  <th className="px-4 py-3 font-medium">Date</th>
-                  <th className="px-4 py-3 font-medium">Type</th>
-                  <th className="px-4 py-3 font-medium">Account</th>
-                  <th className="px-4 py-3 font-medium">Counterparty</th>
-                  <th className="px-4 py-3 font-medium">Reference</th>
-                  <th className="px-4 py-3 font-medium text-right">Amount</th>
+                <tr className="text-left text-apple-caption1 text-apple-gray-1 uppercase tracking-wider bg-apple-gray-6/50">
+                  <th className="px-5 py-2.5 font-medium">Date</th>
+                  <th className="px-5 py-2.5 font-medium">Type</th>
+                  <th className="px-5 py-2.5 font-medium">Account</th>
+                  <th className="px-5 py-2.5 font-medium">Counterparty</th>
+                  <th className="px-5 py-2.5 font-medium">Reference</th>
+                  <th className="px-5 py-2.5 font-medium text-right">Amount</th>
                 </tr>
               </thead>
               <tbody>
-                {transactions.map((t) => (
-                  <tr key={t.id} className="border-b border-gray-100 hover:bg-gray-50">
-                    <td className="px-4 py-3 whitespace-nowrap">{fmtDate(t.date)}</td>
-                    <td className="px-4 py-3">
-                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${typeColors[t.type] || 'bg-gray-100 text-gray-600'}`}>
+                {transactions.map((t, i) => (
+                  <tr
+                    key={t.id}
+                    className={`transition-colors hover:bg-apple-gray-6/40 ${
+                      i < transactions.length - 1 ? 'border-b border-apple-gray-5' : ''
+                    }`}
+                  >
+                    <td className="px-5 py-3 whitespace-nowrap text-apple-subhead tabular-nums">{fmtDate(t.date)}</td>
+                    <td className="px-5 py-3">
+                      <span className={`apple-badge ${typeStyles[t.type] || 'bg-apple-gray-6 text-apple-gray-1'}`}>
                         {t.type}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-gray-600">{t.account_name}</td>
-                    <td className="px-4 py-3 text-gray-600 max-w-[200px] truncate">{t.counterparty || '-'}</td>
-                    <td className="px-4 py-3 text-gray-500 max-w-[200px] truncate">{t.reference || '-'}</td>
-                    <td className={`px-4 py-3 text-right font-medium whitespace-nowrap ${
-                      t.amount >= 0 ? 'text-gray-900' : 'text-red-600'
+                    <td className="px-5 py-3 text-apple-subhead text-apple-gray-1">{t.account_name}</td>
+                    <td className="px-5 py-3 text-apple-subhead text-apple-gray-1 max-w-[200px] truncate">{t.counterparty || '—'}</td>
+                    <td className="px-5 py-3 text-apple-subhead text-apple-gray-1 max-w-[200px] truncate">{t.reference || '—'}</td>
+                    <td className={`px-5 py-3 text-right text-apple-subhead font-medium whitespace-nowrap tabular-nums ${
+                      t.amount >= 0 ? 'text-gray-900' : 'text-apple-red'
                     }`}>
                       {fmt(t.amount)}
                     </td>
@@ -88,7 +92,7 @@ export default function Transactions() {
                 ))}
                 {transactions.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="px-4 py-12 text-center text-gray-400">
+                    <td colSpan={6} className="px-5 py-12 text-center text-apple-callout text-apple-gray-2">
                       No transactions yet. Import a CSV to get started.
                     </td>
                   </tr>
@@ -104,15 +108,15 @@ export default function Transactions() {
           <button
             onClick={() => setOffset(Math.max(0, offset - limit))}
             disabled={offset === 0}
-            className="rounded-lg border border-gray-300 px-4 py-2 text-sm disabled:opacity-50 hover:bg-gray-50"
+            className="apple-btn-secondary"
           >
             Previous
           </button>
-          <span className="text-sm text-gray-500">Page {currentPage} of {pages}</span>
+          <span className="text-apple-footnote text-apple-gray-1">Page {currentPage} of {pages}</span>
           <button
             onClick={() => setOffset(offset + limit)}
             disabled={offset + limit >= total}
-            className="rounded-lg border border-gray-300 px-4 py-2 text-sm disabled:opacity-50 hover:bg-gray-50"
+            className="apple-btn-secondary"
           >
             Next
           </button>

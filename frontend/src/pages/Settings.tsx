@@ -60,147 +60,144 @@ export default function Settings() {
   };
 
   if (loading) {
-    return <div className="flex items-center justify-center py-20 text-gray-400">Loading...</div>;
+    return <div className="flex items-center justify-center py-20 text-apple-callout text-apple-gray-2">Loading...</div>;
   }
 
   return (
     <div className="space-y-8">
-      {/* Create Account */}
-      <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Add Account</h2>
-        <form onSubmit={handleCreateAccount} className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
-          <input
-            type="text"
-            placeholder="Account name"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
-            required
-          />
-          <select
-            value={newInstitution}
-            onChange={(e) => setNewInstitution(e.target.value)}
-            className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
-          >
-            <option value="sparkasse">Sparkasse</option>
-            <option value="n26">N26</option>
-            <option value="scalable_capital">Scalable Capital</option>
-          </select>
-          <select
-            value={newType}
-            onChange={(e) => setNewType(e.target.value)}
-            className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
-          >
-            <option value="checking">Checking</option>
-            <option value="savings">Savings</option>
-            <option value="brokerage">Brokerage</option>
-          </select>
-          <input
-            type="text"
-            placeholder="IBAN (optional)"
-            value={newIBAN}
-            onChange={(e) => setNewIBAN(e.target.value)}
-            className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
-          />
-          <button
-            type="submit"
-            disabled={creating}
-            className="rounded-lg bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
-          >
-            {creating ? 'Creating...' : 'Add Account'}
-          </button>
+      <h1 className="text-apple-title1 text-gray-900">Settings</h1>
+
+      {/* Create Account — iOS grouped form style */}
+      <div>
+        <h2 className="text-apple-footnote text-apple-gray-1 uppercase tracking-wider px-4 mb-2">Add Account</h2>
+        <form onSubmit={handleCreateAccount} className="apple-card divide-y divide-apple-gray-5">
+          <div className="flex items-center px-4 py-0">
+            <label className="w-28 shrink-0 text-apple-body text-gray-900">Name</label>
+            <input
+              type="text"
+              placeholder="Account name"
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              className="flex-1 py-3 text-apple-body text-gray-900 placeholder-apple-gray-3 bg-transparent outline-none"
+              required
+            />
+          </div>
+          <div className="flex items-center px-4 py-0">
+            <label className="w-28 shrink-0 text-apple-body text-gray-900">Institution</label>
+            <select
+              value={newInstitution}
+              onChange={(e) => setNewInstitution(e.target.value)}
+              className="flex-1 py-3 text-apple-body text-apple-gray-1 bg-transparent outline-none appearance-none"
+            >
+              <option value="sparkasse">Sparkasse</option>
+              <option value="n26">N26</option>
+              <option value="scalable_capital">Scalable Capital</option>
+            </select>
+          </div>
+          <div className="flex items-center px-4 py-0">
+            <label className="w-28 shrink-0 text-apple-body text-gray-900">Type</label>
+            <select
+              value={newType}
+              onChange={(e) => setNewType(e.target.value)}
+              className="flex-1 py-3 text-apple-body text-apple-gray-1 bg-transparent outline-none appearance-none"
+            >
+              <option value="checking">Checking</option>
+              <option value="savings">Savings</option>
+              <option value="brokerage">Brokerage</option>
+            </select>
+          </div>
+          <div className="flex items-center px-4 py-0">
+            <label className="w-28 shrink-0 text-apple-body text-gray-900">IBAN</label>
+            <input
+              type="text"
+              placeholder="Optional"
+              value={newIBAN}
+              onChange={(e) => setNewIBAN(e.target.value)}
+              className="flex-1 py-3 text-apple-body text-gray-900 placeholder-apple-gray-3 bg-transparent outline-none"
+            />
+          </div>
+          <div className="px-4 py-3">
+            <button
+              type="submit"
+              disabled={creating}
+              className="apple-btn-primary w-full"
+            >
+              {creating ? 'Creating...' : 'Add Account'}
+            </button>
+          </div>
         </form>
       </div>
 
       {/* Accounts List */}
-      <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Accounts</h2>
+      <div>
+        <h2 className="text-apple-footnote text-apple-gray-1 uppercase tracking-wider px-4 mb-2">Accounts</h2>
         {accounts.length === 0 ? (
-          <p className="text-gray-400">No accounts yet. Create one above.</p>
+          <div className="apple-card px-4 py-8 text-center text-apple-callout text-apple-gray-2">
+            No accounts yet. Create one above.
+          </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-gray-200 text-left text-gray-500">
-                  <th className="pb-3 pr-4 font-medium">Name</th>
-                  <th className="pb-3 pr-4 font-medium">Institution</th>
-                  <th className="pb-3 pr-4 font-medium">Type</th>
-                  <th className="pb-3 pr-4 font-medium">IBAN</th>
-                  <th className="pb-3 font-medium">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {accounts.map((acc) => (
-                  <tr key={acc.id} className="border-b border-gray-100">
-                    <td className="py-3 pr-4 font-medium text-gray-900">{acc.name}</td>
-                    <td className="py-3 pr-4 text-gray-600">{acc.institution}</td>
-                    <td className="py-3 pr-4 text-gray-600">{acc.type}</td>
-                    <td className="py-3 pr-4 text-gray-500">{acc.iban || '-'}</td>
-                    <td className="py-3">
-                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                        acc.is_active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'
-                      }`}>
-                        {acc.is_active ? 'Active' : 'Inactive'}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="apple-card divide-y divide-apple-gray-5">
+            {accounts.map((acc) => (
+              <div key={acc.id} className="flex items-center justify-between px-4 py-3">
+                <div>
+                  <p className="text-apple-body text-gray-900">{acc.name}</p>
+                  <p className="text-apple-footnote text-apple-gray-1 mt-0.5">
+                    {acc.institution} · {acc.type}
+                    {acc.iban ? ` · ${acc.iban}` : ''}
+                  </p>
+                </div>
+                <span className={`apple-badge ${
+                  acc.is_active ? 'bg-apple-green/10 text-apple-green' : 'bg-apple-gray-6 text-apple-gray-1'
+                }`}>
+                  {acc.is_active ? 'Active' : 'Inactive'}
+                </span>
+              </div>
+            ))}
           </div>
         )}
       </div>
 
       {/* Securities */}
-      <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-gray-900">Securities</h2>
+      <div>
+        <div className="flex items-center justify-between px-4 mb-2">
+          <h2 className="text-apple-footnote text-apple-gray-1 uppercase tracking-wider">Securities</h2>
           <a
             href="/api/settings/template"
-            className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50"
+            className="text-apple-footnote text-apple-blue hover:text-apple-blue/80 transition-colors"
           >
-            Download Holdings Template
+            Download Template
           </a>
         </div>
         {securities.length === 0 ? (
-          <p className="text-gray-400">No securities yet. Import transactions with ISINs to populate.</p>
+          <div className="apple-card px-4 py-8 text-center text-apple-callout text-apple-gray-2">
+            No securities yet. Import transactions with ISINs to populate.
+          </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-gray-200 text-left text-gray-500">
-                  <th className="pb-3 pr-4 font-medium">ISIN</th>
-                  <th className="pb-3 pr-4 font-medium">Name</th>
-                  <th className="pb-3 pr-4 font-medium">Class</th>
-                  <th className="pb-3 pr-4 font-medium">Symbol</th>
-                  <th className="pb-3 font-medium">Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {securities.map((sec) => (
-                  <tr key={sec.isin} className="border-b border-gray-100">
-                    <td className="py-3 pr-4 font-mono text-gray-600">{sec.isin}</td>
-                    <td className="py-3 pr-4 text-gray-900">{sec.name}</td>
-                    <td className="py-3 pr-4 text-gray-600">{sec.asset_class}</td>
-                    <td className="py-3 pr-4">
-                      {sec.symbol ? (
-                        <span className="font-mono text-gray-700">{sec.symbol}</span>
-                      ) : (
-                        <span className="text-amber-600 text-xs">Not set</span>
-                      )}
-                    </td>
-                    <td className="py-3">
-                      <button
-                        onClick={() => handleUpdateSymbol(sec.isin)}
-                        className="text-blue-600 hover:text-blue-800 text-xs"
-                      >
-                        Edit Symbol
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="apple-card divide-y divide-apple-gray-5">
+            {securities.map((sec) => (
+              <div key={sec.isin} className="flex items-center justify-between px-4 py-3">
+                <div className="min-w-0 flex-1">
+                  <p className="text-apple-body text-gray-900">{sec.name}</p>
+                  <p className="text-apple-footnote text-apple-gray-1 mt-0.5">
+                    <span className="font-mono">{sec.isin}</span>
+                    <span className="mx-1.5">·</span>
+                    {sec.asset_class}
+                    {sec.symbol && (
+                      <>
+                        <span className="mx-1.5">·</span>
+                        <span className="font-mono">{sec.symbol}</span>
+                      </>
+                    )}
+                  </p>
+                </div>
+                <button
+                  onClick={() => handleUpdateSymbol(sec.isin)}
+                  className="shrink-0 ml-3 text-apple-subhead text-apple-blue hover:text-apple-blue/80 transition-colors"
+                >
+                  {sec.symbol ? 'Edit' : 'Set Symbol'}
+                </button>
+              </div>
+            ))}
           </div>
         )}
       </div>

@@ -14,7 +14,7 @@ export default function Portfolio() {
   }, []);
 
   if (loading) {
-    return <div className="flex items-center justify-center py-20 text-gray-400">Loading...</div>;
+    return <div className="flex items-center justify-center py-20 text-apple-callout text-apple-gray-2">Loading...</div>;
   }
 
   const totalValue = holdings.reduce((sum, h) => sum + h.quantity * h.avg_cost_basis, 0);
@@ -24,23 +24,27 @@ export default function Portfolio() {
 
   return (
     <div className="space-y-6">
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-          <p className="text-sm text-gray-500">Portfolio Value (Cost Basis)</p>
-          <p className="text-2xl font-bold text-gray-900 mt-1">{fmt(totalValue)}</p>
+      <h1 className="text-apple-title1 text-gray-900">Portfolio</h1>
+
+      {/* KPI row */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="apple-card p-5">
+          <p className="text-apple-footnote text-apple-gray-1">Portfolio Value (Cost Basis)</p>
+          <p className="text-apple-title2 text-gray-900 mt-1 tabular-nums">{fmt(totalValue)}</p>
         </div>
-        <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-          <p className="text-sm text-gray-500">Positions</p>
-          <p className="text-2xl font-bold text-gray-900 mt-1">{holdings.length}</p>
+        <div className="apple-card p-5">
+          <p className="text-apple-footnote text-apple-gray-1">Positions</p>
+          <p className="text-apple-title2 text-gray-900 mt-1">{holdings.length}</p>
         </div>
-        <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-          <p className="text-sm text-gray-500">Total Dividends</p>
-          <p className="text-2xl font-bold text-green-600 mt-1">{fmt(totalDividends)}</p>
+        <div className="apple-card p-5">
+          <p className="text-apple-footnote text-apple-gray-1">Total Dividends</p>
+          <p className="text-apple-title2 text-apple-green mt-1 tabular-nums">{fmt(totalDividends)}</p>
         </div>
       </div>
 
-      <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Holdings</h2>
+      {/* Holdings */}
+      <div className="apple-card p-5">
+        <h2 className="text-apple-headline text-gray-900 mb-4">Holdings</h2>
         <HoldingsTable holdings={holdings} />
       </div>
     </div>

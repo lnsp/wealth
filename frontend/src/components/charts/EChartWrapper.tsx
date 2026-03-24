@@ -13,6 +13,8 @@ export default function EChartWrapper({ option, height = '400px', className }: P
     ...option,
     color: option.color || chartTheme.color,
     textStyle: { ...chartTheme.textStyle, ...((option.textStyle as Record<string, unknown>) || {}) },
+    animationDuration: 600,
+    animationEasing: 'cubicInOut',
   };
 
   return (

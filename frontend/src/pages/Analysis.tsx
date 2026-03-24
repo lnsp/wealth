@@ -45,7 +45,7 @@ export default function Analysis() {
   };
 
   if (loading) {
-    return <div className="flex items-center justify-center py-20 text-gray-400">Loading...</div>;
+    return <div className="flex items-center justify-center py-20 text-apple-callout text-apple-gray-2">Loading...</div>;
   }
 
   const sectorEntries = Object.entries(sectors).sort(([, a], [, b]) => b - a);
@@ -57,7 +57,8 @@ export default function Analysis() {
       type: 'pie' as const,
       radius: ['40%', '70%'],
       data: sectorEntries.map(([name, value]) => ({ name, value: Math.round(value * 100) / 100 })),
-      label: { fontSize: 11 },
+      label: { fontSize: 12, color: '#3C3C43' },
+      itemStyle: { borderColor: '#fff', borderWidth: 2 },
     }],
   };
 
@@ -65,16 +66,19 @@ export default function Analysis() {
     tooltip: { trigger: 'axis' as const },
     xAxis: {
       type: 'value' as const,
-      axisLabel: { formatter: (v: number) => `${v.toFixed(0)}%`, fontSize: 11 },
+      axisLabel: { formatter: (v: number) => `${v.toFixed(0)}%`, fontSize: 12, color: '#8E8E93' },
+      splitLine: { lineStyle: { color: '#F2F2F7' } },
     },
     yAxis: {
       type: 'category' as const,
       data: countryEntries.slice(0, 15).reverse().map(([name]) => name),
-      axisLabel: { fontSize: 11 },
+      axisLabel: { fontSize: 12, color: '#3C3C43' },
     },
     series: [{
       type: 'bar' as const,
       data: countryEntries.slice(0, 15).reverse().map(([, value]) => Math.round(value * 100) / 100),
+      itemStyle: { borderRadius: [0, 4, 4, 0] },
+      barMaxWidth: 20,
     }],
     grid: { left: 80, right: 20, top: 10, bottom: 30 },
   };
@@ -89,12 +93,12 @@ export default function Analysis() {
     xAxis: {
       type: 'category' as const,
       data: overlap.labels,
-      axisLabel: { rotate: 45, fontSize: 10 },
+      axisLabel: { rotate: 45, fontSize: 11, color: '#3C3C43' },
     },
     yAxis: {
       type: 'category' as const,
       data: overlap.labels,
-      axisLabel: { fontSize: 10 },
+      axisLabel: { fontSize: 11, color: '#3C3C43' },
     },
     visualMap: {
       min: 0,
@@ -103,14 +107,16 @@ export default function Analysis() {
       orient: 'horizontal' as const,
       left: 'center',
       bottom: 0,
-      inRange: { color: ['#f0fdf4', '#16a34a'] },
+      inRange: { color: ['#F2F2F7', '#34C759'] },
+      textStyle: { color: '#8E8E93' },
     },
     series: [{
       type: 'heatmap' as const,
       data: overlap.matrix.flatMap((row, i) =>
         row.map((val, j) => [i, j, Math.round(val * 10) / 10])
       ),
-      label: { show: true, fontSize: 10, formatter: (p: { data: number[] }) => `${p.data[2]}%` },
+      label: { show: true, fontSize: 11, formatter: (p: { data: number[] }) => `${p.data[2]}%` },
+      itemStyle: { borderColor: '#fff', borderWidth: 2 },
     }],
     grid: { left: 100, right: 20, top: 10, bottom: 80 },
   } : null;
@@ -119,46 +125,50 @@ export default function Analysis() {
 
   return (
     <div className="space-y-6">
+      <h1 className="text-apple-title1 text-gray-900">Analysis</h1>
+
       {!hasData && holdings.length === 0 && (
-        <div className="rounded-xl bg-white p-12 shadow-sm border border-gray-200 text-center text-gray-400">
+        <div className="apple-card p-12 text-center text-apple-callout text-apple-gray-2">
           No analysis data available yet. Import transactions and wait for ETF metadata to be fetched.
         </div>
       )}
 
       {sectorEntries.length > 0 && (
-        <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Sector Allocation</h2>
+        <div className="apple-card p-5">
+          <h2 className="text-apple-headline text-gray-900 mb-4">Sector Allocation</h2>
           <EChartWrapper option={sectorChartOption} />
         </div>
       )}
 
       {countryEntries.length > 0 && (
-        <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Country Allocation</h2>
+        <div className="apple-card p-5">
+          <h2 className="text-apple-headline text-gray-900 mb-4">Country Allocation</h2>
           <EChartWrapper option={countryChartOption} height="500px" />
         </div>
       )}
 
       {overlapChartOption && (
-        <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">ETF Overlap Matrix</h2>
+        <div className="apple-card p-5">
+          <h2 className="text-apple-headline text-gray-900 mb-4">ETF Overlap Matrix</h2>
           <EChartWrapper option={overlapChartOption} height="500px" />
         </div>
       )}
 
       {holdings.length > 0 && (
-        <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">ETF Holdings Breakdown</h2>
-          <p className="text-sm text-gray-500 mb-4">Select an ETF to view its individual constituent positions.</p>
-          <div className="flex flex-wrap gap-2 mb-4">
+        <div className="apple-card p-5">
+          <h2 className="text-apple-headline text-gray-900 mb-1">ETF Holdings Breakdown</h2>
+          <p className="text-apple-footnote text-apple-gray-1 mb-4">Select an ETF to view its individual constituent positions.</p>
+
+          {/* Segmented-control-style ETF selector */}
+          <div className="flex flex-wrap gap-2 mb-5">
             {holdings.map((h) => (
               <button
                 key={h.security_isin}
                 onClick={() => loadETFHoldings(h.security_isin)}
-                className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+                className={`rounded-[8px] px-3.5 py-[7px] text-apple-subhead font-medium transition-all duration-150 ${
                   selectedETF === h.security_isin
-                    ? 'bg-gray-900 text-white'
-                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                    ? 'bg-apple-blue text-white shadow-apple-sm'
+                    : 'bg-apple-gray-6 text-gray-700 hover:bg-apple-gray-5 active:bg-apple-gray-4'
                 }`}
               >
                 {h.name}
@@ -167,49 +177,54 @@ export default function Analysis() {
           </div>
 
           {etfLoading && (
-            <div className="py-8 text-center text-gray-400">Loading holdings...</div>
+            <div className="py-8 text-center text-apple-callout text-apple-gray-2">Loading holdings...</div>
           )}
 
           {selectedETF && !etfLoading && etfHoldings.length === 0 && (
-            <div className="py-8 text-center text-gray-400">
-              No constituent data available for this ETF yet. Holdings are fetched weekly on Sundays.
+            <div className="py-8 text-center text-apple-callout text-apple-gray-2">
+              No constituent data available for this ETF yet.
             </div>
           )}
 
           {selectedETF && !etfLoading && etfHoldings.length > 0 && (
             <div>
-              <h3 className="text-sm font-semibold text-gray-700 mb-2">
+              <h3 className="text-apple-subhead font-semibold text-gray-700 mb-3">
                 {etfName} — {etfHoldings.length} positions
               </h3>
-              <div className="overflow-x-auto">
-                <table className="min-w-full text-sm">
+              <div className="overflow-x-auto -mx-5">
+                <table className="w-full">
                   <thead>
-                    <tr className="border-b border-gray-200 text-left text-gray-500">
-                      <th className="py-2 pr-4 font-medium">#</th>
-                      <th className="py-2 pr-4 font-medium">Name</th>
-                      <th className="py-2 pr-4 font-medium">ISIN</th>
-                      <th className="py-2 pr-4 font-medium text-right">Weight</th>
-                      <th className="py-2 pr-4 font-medium">Sector</th>
-                      <th className="py-2 font-medium">Country</th>
+                    <tr className="text-left text-apple-caption1 text-apple-gray-1 uppercase tracking-wider">
+                      <th className="px-5 pb-2 font-medium">#</th>
+                      <th className="px-5 pb-2 font-medium">Name</th>
+                      <th className="px-5 pb-2 font-medium">ISIN</th>
+                      <th className="px-5 pb-2 font-medium text-right">Weight</th>
+                      <th className="px-5 pb-2 font-medium">Sector</th>
+                      <th className="px-5 pb-2 font-medium">Country</th>
                     </tr>
                   </thead>
                   <tbody>
                     {etfHoldings.map((entry, i) => (
-                      <tr key={entry.isin} className="border-b border-gray-100 hover:bg-gray-50">
-                        <td className="py-2 pr-4 text-gray-400">{i + 1}</td>
-                        <td className="py-2 pr-4 font-medium text-gray-900">{entry.name}</td>
-                        <td className="py-2 pr-4 font-mono text-xs text-gray-500">{entry.isin}</td>
-                        <td className="py-2 pr-4 text-right">
-                          <span className="font-medium">{entry.weight.toFixed(2)}%</span>
-                          <div className="mt-0.5 h-1 w-full rounded bg-gray-100">
+                      <tr
+                        key={entry.isin}
+                        className={`transition-colors hover:bg-apple-gray-6/60 ${
+                          i < etfHoldings.length - 1 ? 'border-b border-apple-gray-5' : ''
+                        }`}
+                      >
+                        <td className="px-5 py-2.5 text-apple-caption1 text-apple-gray-2 tabular-nums">{i + 1}</td>
+                        <td className="px-5 py-2.5 text-apple-subhead font-medium text-gray-900">{entry.name}</td>
+                        <td className="px-5 py-2.5 font-mono text-apple-caption1 text-apple-gray-1">{entry.isin}</td>
+                        <td className="px-5 py-2.5 text-right">
+                          <span className="text-apple-subhead font-medium tabular-nums">{entry.weight.toFixed(2)}%</span>
+                          <div className="mt-1 h-1 w-full rounded-full bg-apple-gray-5">
                             <div
-                              className="h-1 rounded bg-green-500"
+                              className="h-1 rounded-full bg-apple-blue transition-all duration-300"
                               style={{ width: `${Math.min(entry.weight * 2, 100)}%` }}
                             />
                           </div>
                         </td>
-                        <td className="py-2 pr-4 text-gray-600">{entry.sector || '—'}</td>
-                        <td className="py-2 text-gray-600">{entry.country || '—'}</td>
+                        <td className="px-5 py-2.5 text-apple-subhead text-apple-gray-1">{entry.sector || '—'}</td>
+                        <td className="px-5 py-2.5 text-apple-subhead text-apple-gray-1">{entry.country || '—'}</td>
                       </tr>
                     ))}
                   </tbody>

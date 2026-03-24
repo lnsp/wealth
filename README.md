@@ -132,6 +132,7 @@ go test ./...
 | GET | `/api/analysis/sectors` | Weighted sector allocation |
 | GET | `/api/analysis/countries` | Weighted country allocation |
 | GET | `/api/analysis/overlap` | ETF overlap matrix |
+| GET | `/api/analysis/etf/{isin}/holdings` | Individual ETF constituent positions |
 | POST | `/api/settings/accounts` | Create account |
 | PUT | `/api/settings/accounts/{id}` | Update account |
 | GET | `/api/settings/securities` | List securities |

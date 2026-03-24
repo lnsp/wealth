@@ -1,23 +1,48 @@
 import { useState, useEffect } from 'react';
-import { api } from '../api/client';
+import { api, type ETFHoldingEntry, type HoldingRow } from '../api/client';
 import EChartWrapper from '../components/charts/EChartWrapper';
 
 export default function Analysis() {
   const [sectors, setSectors] = useState<Record<string, number>>({});
   const [countries, setCountries] = useState<Record<string, number>>({});
   const [overlap, setOverlap] = useState<{ labels: string[]; matrix: number[][] } | null>(null);
+  const [holdings, setHoldings] = useState<HoldingRow[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // ETF holdings drill-down
+  const [selectedETF, setSelectedETF] = useState<string | null>(null);
+  const [etfHoldings, setEtfHoldings] = useState<ETFHoldingEntry[]>([]);
+  const [etfName, setEtfName] = useState('');
+  const [etfLoading, setEtfLoading] = useState(false);
+
   useEffect(() => {
-    Promise.all([api.getSectors(), api.getCountries(), api.getOverlap()])
-      .then(([sec, ctr, ovl]) => {
+    Promise.all([api.getSectors(), api.getCountries(), api.getOverlap(), api.listHoldings()])
+      .then(([sec, ctr, ovl, hld]) => {
         setSectors(sec.sectors);
         setCountries(ctr.countries);
         setOverlap(ovl);
+        setHoldings(hld.holdings.filter(h => h.asset_class === 'etf'));
       })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
+
+  const loadETFHoldings = (isin: string) => {
+    if (selectedETF === isin) {
+      setSelectedETF(null);
+      setEtfHoldings([]);
+      return;
+    }
+    setSelectedETF(isin);
+    setEtfLoading(true);
+    api.getETFHoldings(isin)
+      .then((data) => {
+        setEtfHoldings(data.holdings);
+        setEtfName(data.etf_name);
+      })
+      .catch(console.error)
+      .finally(() => setEtfLoading(false));
+  };
 
   if (loading) {
     return <div className="flex items-center justify-center py-20 text-gray-400">Loading...</div>;
@@ -94,7 +119,7 @@ export default function Analysis() {
 
   return (
     <div className="space-y-6">
-      {!hasData && (
+      {!hasData && holdings.length === 0 && (
         <div className="rounded-xl bg-white p-12 shadow-sm border border-gray-200 text-center text-gray-400">
           No analysis data available yet. Import transactions and wait for ETF metadata to be fetched.
         </div>
@@ -118,6 +143,80 @@ export default function Analysis() {
         <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
           <h2 className="text-lg font-semibold text-gray-900 mb-4">ETF Overlap Matrix</h2>
           <EChartWrapper option={overlapChartOption} height="500px" />
+        </div>
+      )}
+
+      {holdings.length > 0 && (
+        <div className="rounded-xl bg-white p-6 shadow-sm border border-gray-200">
+          <h2 className="text-lg font-semibold text-gray-900 mb-4">ETF Holdings Breakdown</h2>
+          <p className="text-sm text-gray-500 mb-4">Select an ETF to view its individual constituent positions.</p>
+          <div className="flex flex-wrap gap-2 mb-4">
+            {holdings.map((h) => (
+              <button
+                key={h.security_isin}
+                onClick={() => loadETFHoldings(h.security_isin)}
+                className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+                  selectedETF === h.security_isin
+                    ? 'bg-gray-900 text-white'
+                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                }`}
+              >
+                {h.name}
+              </button>
+            ))}
+          </div>
+
+          {etfLoading && (
+            <div className="py-8 text-center text-gray-400">Loading holdings...</div>
+          )}
+
+          {selectedETF && !etfLoading && etfHoldings.length === 0 && (
+            <div className="py-8 text-center text-gray-400">
+              No constituent data available for this ETF yet. Holdings are fetched weekly on Sundays.
+            </div>
+          )}
+
+          {selectedETF && !etfLoading && etfHoldings.length > 0 && (
+            <div>
+              <h3 className="text-sm font-semibold text-gray-700 mb-2">
+                {etfName} — {etfHoldings.length} positions
+              </h3>
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-200 text-left text-gray-500">
+                      <th className="py-2 pr-4 font-medium">#</th>
+                      <th className="py-2 pr-4 font-medium">Name</th>
+                      <th className="py-2 pr-4 font-medium">ISIN</th>
+                      <th className="py-2 pr-4 font-medium text-right">Weight</th>
+                      <th className="py-2 pr-4 font-medium">Sector</th>
+                      <th className="py-2 font-medium">Country</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {etfHoldings.map((entry, i) => (
+                      <tr key={entry.isin} className="border-b border-gray-100 hover:bg-gray-50">
+                        <td className="py-2 pr-4 text-gray-400">{i + 1}</td>
+                        <td className="py-2 pr-4 font-medium text-gray-900">{entry.name}</td>
+                        <td className="py-2 pr-4 font-mono text-xs text-gray-500">{entry.isin}</td>
+                        <td className="py-2 pr-4 text-right">
+                          <span className="font-medium">{entry.weight.toFixed(2)}%</span>
+                          <div className="mt-0.5 h-1 w-full rounded bg-gray-100">
+                            <div
+                              className="h-1 rounded bg-green-500"
+                              style={{ width: `${Math.min(entry.weight * 2, 100)}%` }}
+                            />
+                          </div>
+                        </td>
+                        <td className="py-2 pr-4 text-gray-600">{entry.sector || '—'}</td>
+                        <td className="py-2 text-gray-600">{entry.country || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

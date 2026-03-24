@@ -69,6 +69,14 @@ export interface ImportResult {
   errors?: string[];
 }
 
+export interface ETFHoldingEntry {
+  isin: string;
+  name: string;
+  weight: number;
+  sector?: string;
+  country?: string;
+}
+
 export interface Security {
   isin: string;
   wkn: string | null;
@@ -110,6 +118,8 @@ export const api = {
   getSectors: () => request<{ sectors: Record<string, number> }>('/analysis/sectors'),
   getCountries: () => request<{ countries: Record<string, number> }>('/analysis/countries'),
   getOverlap: () => request<{ labels: string[]; matrix: number[][] }>('/analysis/overlap'),
+  getETFHoldings: (isin: string) =>
+    request<{ etf_isin: string; etf_name: string; holdings: ETFHoldingEntry[] }>(`/analysis/etf/${isin}/holdings`),
 
   // Settings
   listSecurities: () => request<{ securities: Security[] }>('/settings/securities'),

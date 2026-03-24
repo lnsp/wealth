@@ -99,6 +99,7 @@ func main() {
 		r.Get("/analysis/sectors", analysisH.HandleSectors)
 		r.Get("/analysis/countries", analysisH.HandleCountries)
 		r.Get("/analysis/overlap", analysisH.HandleOverlap)
+		r.Get("/analysis/etf/{isin}/holdings", analysisH.HandleETFHoldings)
 
 		r.Post("/settings/accounts", settingsH.HandleCreateAccount)
 		r.Put("/settings/accounts/{id}", settingsH.HandleUpdateAccount)

@@ -3,6 +3,8 @@ package handler
 import (
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
+
 	db "github.com/lnsp/wealth/internal/database/generated"
 	"github.com/lnsp/wealth/internal/analytics"
 )
@@ -90,6 +92,66 @@ func (h *AnalysisHandler) HandleCountries(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"countries": exposure})
+}
+
+func (h *AnalysisHandler) HandleETFHoldings(w http.ResponseWriter, r *http.Request) {
+	isin := chi.URLParam(r, "isin")
+	if isin == "" {
+		writeError(w, http.StatusBadRequest, "isin is required")
+		return
+	}
+
+	sec, err := h.queries.GetSecurity(r.Context(), isin)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "security not found")
+		return
+	}
+
+	if sec.AssetClass != "etf" {
+		writeError(w, http.StatusBadRequest, "security is not an ETF")
+		return
+	}
+
+	etfHoldings, err := h.queries.ListETFHoldings(r.Context(), isin)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list holdings: "+err.Error())
+		return
+	}
+
+	type holdingEntry struct {
+		ISIN    string  `json:"isin"`
+		Name    string  `json:"name"`
+		Weight  float64 `json:"weight"`
+		Sector  string  `json:"sector,omitempty"`
+		Country string  `json:"country,omitempty"`
+	}
+
+	holdings := make([]holdingEntry, 0, len(etfHoldings))
+	for _, eh := range etfHoldings {
+		weight := 0.0
+		if eh.WeightPct.Valid {
+			f, _ := eh.WeightPct.Float64Value()
+			weight = f.Float64
+		}
+		entry := holdingEntry{
+			ISIN:   eh.HoldingISIN,
+			Name:   eh.HoldingName,
+			Weight: weight,
+		}
+		if eh.Sector.Valid {
+			entry.Sector = eh.Sector.String
+		}
+		if eh.Country.Valid {
+			entry.Country = eh.Country.String
+		}
+		holdings = append(holdings, entry)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"etf_isin":  sec.ISIN,
+		"etf_name":  sec.Name,
+		"holdings":  holdings,
+	})
 }
 
 func (h *AnalysisHandler) HandleOverlap(w http.ResponseWriter, r *http.Request) {

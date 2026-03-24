@@ -121,10 +121,10 @@ func (p *ScalableCapitalParser) Parse(records [][]string, accountID uuid.UUID) (
 
 func classifyScalableTransaction(txnType string) string {
 	switch {
-	case strings.Contains(txnType, "buy") || strings.Contains(txnType, "kauf"):
-		return "buy"
 	case strings.Contains(txnType, "sell") || strings.Contains(txnType, "verkauf"):
 		return "sell"
+	case strings.Contains(txnType, "buy") || strings.Contains(txnType, "kauf"):
+		return "buy"
 	case strings.Contains(txnType, "dividend") || strings.Contains(txnType, "dividende") || strings.Contains(txnType, "ausschüttung"):
 		return "dividend"
 	case strings.Contains(txnType, "savings") || strings.Contains(txnType, "sparplan"):

@@ -64,7 +64,10 @@ func (c *YahooClient) FetchPrices(ctx context.Context, symbols map[string]string
 
 func (c *YahooClient) fetchPrice(ctx context.Context, symbol string) (float64, string, time.Time, error) {
 	url := fmt.Sprintf("https://query1.finance.yahoo.com/v8/finance/chart/%s?range=5d&interval=1d", symbol)
+	return c.fetchPriceFromURL(ctx, url)
+}
 
+func (c *YahooClient) fetchPriceFromURL(ctx context.Context, url string) (float64, string, time.Time, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return 0, "", time.Time{}, err
@@ -78,7 +81,7 @@ func (c *YahooClient) fetchPrice(ctx context.Context, symbol string) (float64, s
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, "", time.Time{}, fmt.Errorf("yahoo API returned %d for %s", resp.StatusCode, symbol)
+		return 0, "", time.Time{}, fmt.Errorf("yahoo API returned %d for %s", resp.StatusCode, url)
 	}
 
 	var result struct {
@@ -111,7 +114,7 @@ func (c *YahooClient) fetchPrice(ctx context.Context, symbol string) (float64, s
 	}
 
 	if len(result.Chart.Result) == 0 {
-		return 0, "", time.Time{}, fmt.Errorf("no data for %s", symbol)
+		return 0, "", time.Time{}, fmt.Errorf("no data for %s", url)
 	}
 
 	r := result.Chart.Result[0]

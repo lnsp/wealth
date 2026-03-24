@@ -1,0 +1,25 @@
+# Go
+/finance-tracker
+
+# Frontend
+frontend/node_modules/
+frontend/dist/*.js
+frontend/dist/*.css
+frontend/dist/*.html
+frontend/dist/*.svg
+frontend/dist/assets/
+!frontend/dist/embed.go
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Backups
+*.sql.gz

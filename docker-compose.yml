@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8443:8443"
+    environment:
+      - DATABASE_URL=postgres://finance:finance@db:5432/finance?sslmode=disable
+      - PORT=8443
+      - SESSION_SECRET=${SESSION_SECRET:-change-me}
+      - TZ=Europe/Berlin
+      - BACKUP_PATH=/backups
+    volumes:
+      - backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=finance
+      - POSTGRES_PASSWORD=finance
+      - POSTGRES_DB=finance
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finance"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+      - FOWNER
+      - CHOWN
+
+volumes:
+  pgdata:
+  backups:

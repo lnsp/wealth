@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <circle cx="16" cy="16" r="16" fill="#1B3D2F"/>
+  <circle cx="16" cy="16" r="12.5" fill="none" stroke="#FAF9F6" stroke-width="0.75"/>
+  <text x="16" y="16" text-anchor="middle" dominant-baseline="central" font-family="EB Garamond, Georgia, serif" font-size="16" font-weight="500" fill="#FAF9F6" dy="1">W</text>
+</svg>

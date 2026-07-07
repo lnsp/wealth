@@ -1,0 +1,9 @@
+Ausgeführte Orders vom 17.05.2026 18:10;Kunde;Max Mustermann
+
+Depotnummer;1234567890
+
+Orderart;Ausführungsdatum;Ordernummer;ISIN;Wertpapiername;Stück/Nominale;Einheitskennzeichen;Limit;Start Buy/Stop Loss;Abstand;Limittyp;Ausführungskurs;Währung;Status
+Kauf;07.05.2026;466391180;IE00B4L5YC18;ISHSIII-MSCI EM USD(ACC);6,76942;Stück;;;;Billigst;42,692;EUR;Ausgeführt
+Kauf;14.05.2026;466482591;IE00B3RBWM25;VANGUARD FTSE ALL-WORLD;12,000;Stück;;;;Billigst;107,540;EUR;Ausgeführt
+Verkauf;16.05.2026;466510042;DE000ENAG999;E.ON SE NA O.N.;50,00;Stück;;;;Billigst;17,67;EUR;Ausgeführt
+Kauf;17.05.2026;466520099;IE00B3RBWM25;VANGUARD FTSE ALL-WORLD;5,000;Stück;;;;Billigst;108,100;EUR;Storniert

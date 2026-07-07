@@ -1,0 +1,276 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Light mode — the club at noon.
+   ink-muted and amber were each ≈4.3:1 on parchment-deep — under WCAG AA for
+   normal text. Darkened to clear 4.5:1 on every light surface (parchment,
+   parchment-deep, inset, divider). */
+:root {
+  --color-parchment: #FAF9F6;
+  --color-parchment-deep: #F5F3EE;
+  --color-ink: #1C1917;
+  --color-ink-body: #44403C;
+  --color-ink-muted: #5E5853;
+  --color-divider: #E5E0D8;
+  --color-inset: #F0EDE8;
+  --color-forest: #1B3D2F;
+  --color-forest-light: #2A5A45;
+  --color-gold: #7A6330;
+  --color-sage: #4A6A4A;
+  --color-claret: #7A3040;
+  --color-amber: #7A5520;
+  --color-walnut: #7A5C3A;
+  --color-slate: #5E626C;
+}
+
+/* Dark mode — the club at midnight.
+   Every accent lightened to pass WCAG AA (≥4.5:1) against #1C1917. */
+.dark {
+  --color-parchment: #141210;
+  --color-parchment-deep: #1E1B18;
+  --color-ink: #EDE9E3;
+  --color-ink-body: #C8C3BB;
+  --color-ink-muted: #9C968E;
+  --color-divider: #332E28;
+  --color-inset: #1A1816;
+  --color-forest: #5AAD85;
+  --color-forest-light: #78C4A0;
+  --color-gold: #C8A960;
+  --color-sage: #7EAE7E;
+  --color-claret: #D07080;
+  --color-amber: #D4AA50;
+  --color-walnut: #B89870;
+  --color-slate: #9AA0AD;
+}
+
+@layer base {
+  html {
+    /* Safe-area handled per-element so fixed bars can bleed behind notch/dynamic island */
+  }
+
+  body {
+    background-color: var(--color-parchment);
+    color: var(--color-ink-body);
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "kern" 1;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  /* Focus states — racing green on cream, WCAG compliant */
+  :focus-visible {
+    outline: 2px solid var(--color-forest);
+    outline-offset: 2px;
+  }
+
+  /* Paper-grain texture — subtle warmth, almost imperceptible */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    pointer-events: none;
+    opacity: 0.025;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='256' height='256' filter='url(%23n)' opacity='1'/%3E%3C/svg%3E");
+    background-repeat: repeat;
+    background-size: 256px 256px;
+  }
+
+  /* Heritage selection */
+  ::selection {
+    background-color: color-mix(in srgb, var(--color-forest) 15%, transparent);
+  }
+
+  /* Warm-toned scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-ink-muted);
+    border-radius: 3px;
+    opacity: 0.5;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-ink-body);
+  }
+}
+
+@layer components {
+  .apple-card {
+    background-color: var(--color-parchment);
+    border-radius: 8px;
+    border: 1px solid var(--color-divider);
+  }
+
+  .apple-separator {
+    border-bottom: 1px solid var(--color-divider);
+  }
+
+  .apple-input {
+    width: 100%;
+    border-radius: 6px;
+    background-color: var(--color-parchment-deep);
+    padding: 0.625rem 0.875rem;
+    font-size: 16px;
+    border: 1px solid var(--color-divider);
+    transition: all 250ms cubic-bezier(0.16, 1, 0.3, 1);
+    color: var(--color-ink-body);
+  }
+  .apple-input::placeholder { color: var(--color-ink-muted); opacity: 0.4; }
+  .apple-input:focus { border-color: var(--color-forest); background-color: var(--color-parchment); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-forest) 20%, transparent); }
+
+  .apple-select {
+    width: 100%;
+    border-radius: 6px;
+    background-color: var(--color-parchment-deep);
+    padding: 0.625rem 0.875rem;
+    font-size: 16px;
+    border: 1px solid var(--color-divider);
+    appearance: none;
+    transition: all 250ms cubic-bezier(0.16, 1, 0.3, 1);
+    color: var(--color-ink-body);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238E8E93' d='M6 8.825a.6.6 0 01-.424-.176l-3.6-3.6a.6.6 0 01.848-.849L6 7.376 9.176 4.2a.6.6 0 01.848.849l-3.6 3.6A.6.6 0 016 8.825z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 32px;
+  }
+  .apple-select:focus { border-color: var(--color-forest); background-color: var(--color-parchment); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-forest) 20%, transparent); }
+
+  .apple-btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    background-color: var(--color-forest);
+    padding: 0.625rem 1.25rem;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--color-parchment);
+    transition: all 350ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .apple-btn-primary:hover { background-color: var(--color-forest-light); }
+  .apple-btn-primary:active { opacity: 0.8; }
+  .apple-btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .apple-btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    border: 1px solid color-mix(in srgb, var(--color-forest) 30%, transparent);
+    background-color: transparent;
+    padding: 0.625rem 1.25rem;
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--color-forest);
+    transition: all 350ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .apple-btn-secondary:hover { background-color: color-mix(in srgb, var(--color-forest) 5%, transparent); }
+  .apple-btn-secondary:active { background-color: color-mix(in srgb, var(--color-forest) 10%, transparent); }
+  .apple-btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .apple-badge {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 9999px;
+    padding: 0.125rem 0.625rem;
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  /* Typography polish — opt-in OpenType features for EB Garamond.
+     Use .font-smallcaps on all-caps labels for refined editorial cadence.
+     Use .font-oldstyle on standalone prose numerals (NOT in tables — tables
+     keep the body default of tabular lining figures for column alignment). */
+  .font-smallcaps {
+    font-variant-caps: all-small-caps;
+    letter-spacing: 0.04em;
+  }
+  .font-oldstyle {
+    font-variant-numeric: oldstyle-nums proportional-nums;
+  }
+
+  /* Safe area padding for mobile bottom tab bar */
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  /* Main content offset: header height + safe-area top (dynamic island / notch) */
+  .safe-area-header-offset {
+    padding-top: calc(3rem + env(safe-area-inset-top, 0px));
+  }
+  @media (min-width: 768px) {
+    .safe-area-header-offset {
+      padding-top: 0;
+    }
+  }
+
+  /* Hide scrollbar while keeping scroll functionality */
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Privacy mode: blur monetary values — stronger blur for larger text */
+  .privacy .tabular-nums:not(h1):not([class*="text-heading"]),
+  .privacy .font-serif.font-semibold:not(h1):not(h2):not(h3),
+  .privacy .font-serif.text-\[15px\].tabular-nums,
+  .privacy .font-serif.text-\[17px\]:not(h1),
+  .privacy .font-serif.text-\[18px\] {
+    filter: blur(4px);
+    user-select: none;
+  }
+  .privacy .font-serif.text-\[20px\] {
+    filter: blur(5px);
+    user-select: none;
+  }
+  .privacy .font-serif.text-\[36px\],
+  .privacy .font-serif.text-\[48px\] {
+    filter: blur(8px);
+    user-select: none;
+  }
+
+  /* Privacy mode: blur all ECharts so chart values are hidden */
+  .privacy .echarts-for-react {
+    filter: blur(6px);
+    pointer-events: none;
+  }
+
+  /* Privacy mode: blur native number/decimal inputs. filter:blur is unreliable
+     on native inputs, so use transparent text + blurry text-shadow as the
+     reliable variant. */
+  .privacy input[type="number"],
+  .privacy input[inputmode="decimal"],
+  .privacy input[inputmode="numeric"] {
+    color: transparent;
+    text-shadow: 0 0 6px var(--color-ink-body);
+    caret-color: transparent;
+  }
+
+  /* Privacy mode: blur monospace cells. ISINs and account references identify
+     specific holdings and counterparties — same leak class as the values. */
+  .privacy .font-mono {
+    filter: blur(4px);
+    user-select: none;
+  }
+
+  /* Privacy mode: blur any element opted-in via `data-privacy="blur"`. Used
+     when copy mixes prose and numbers (e.g. "116.3% of net worth · 18.285 €")
+     and the numeric span must be hidden without blurring the surrounding text. */
+  .privacy [data-privacy="blur"] {
+    filter: blur(4px);
+    user-select: none;
+  }
+}

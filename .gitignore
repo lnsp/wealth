@@ -1,0 +1,33 @@
+# Go
+/finance-tracker
+
+# Frontend
+frontend/node_modules/
+frontend/dist/*
+!frontend/dist/.gitkeep
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Screenshots and images (dev artifacts)
+*.png
+*.jpg
+*.jpeg
+
+# Playwright
+.playwright-mcp/
+frontend/test-results/
+frontend/playwright-report/
+
+# Backups
+*.sql.gz
+exports/
+/server

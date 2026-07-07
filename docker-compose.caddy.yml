@@ -1,0 +1,28 @@
+# Optional Caddy HTTPS overlay
+# Usage: docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d
+#
+# Set DOMAIN env var for your domain (default: localhost with self-signed cert)
+
+services:
+  caddy:
+    image: docker.io/library/caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  app:
+    # Remove direct port exposure when behind Caddy
+    ports: !reset []
+
+volumes:
+  caddy_data:
+  caddy_config:

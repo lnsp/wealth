@@ -1,0 +1,7 @@
+-- +goose Up
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT false;
+
+-- +goose Down
+ALTER TABLE users DROP COLUMN IF EXISTS totp_enabled;
+ALTER TABLE users DROP COLUMN IF EXISTS totp_secret;

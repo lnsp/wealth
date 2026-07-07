@@ -1,0 +1,47 @@
+{
+  "IE00BK5BQT80": {
+    "name": "Vanguard FTSE All-World (Acc)",
+    "index": "FTSE All-World",
+    "ter": 0.22,
+    "alternatives": [
+      {"isin": "IE00BJ0KDQ92", "name": "Xtrackers MSCI ACWI (Acc)", "ter": 0.17, "index": "MSCI ACWI"},
+      {"isin": "IE000716YHJ7", "name": "Amundi Prime All Country World (Acc)", "ter": 0.07, "index": "Solactive GBS Global Markets"}
+    ]
+  },
+  "IE00B5BMR087": {
+    "name": "iShares Core S&P 500 (Acc)",
+    "index": "S&P 500",
+    "ter": 0.07,
+    "alternatives": [
+      {"isin": "IE00BFMXXD54", "name": "Vanguard S&P 500 (Acc)", "ter": 0.07, "index": "S&P 500"},
+      {"isin": "LU0496786574", "name": "Xtrackers S&P 500 Swap (Acc)", "ter": 0.06, "index": "S&P 500"}
+    ]
+  },
+  "IE00BTJRMP35": {
+    "name": "Xtrackers MSCI Emerging Markets (Acc)",
+    "index": "MSCI Emerging Markets",
+    "ter": 0.18,
+    "alternatives": [
+      {"isin": "IE00BKM4GZ66", "name": "iShares Core MSCI EM IMI (Acc)", "ter": 0.18, "index": "MSCI EM IMI"},
+      {"isin": "LU1681045370", "name": "Amundi MSCI Emerging Markets (Acc)", "ter": 0.10, "index": "MSCI Emerging Markets"}
+    ]
+  },
+  "LU0908500753": {
+    "name": "Amundi Core Stoxx Europe 600 (Acc)",
+    "index": "STOXX Europe 600",
+    "ter": 0.07,
+    "alternatives": [
+      {"isin": "DE0002635307", "name": "iShares STOXX Europe 600 (Dist)", "ter": 0.20, "index": "STOXX Europe 600"},
+      {"isin": "LU0908501058", "name": "Amundi Prime Europe (Acc)", "ter": 0.05, "index": "Solactive GBS Developed Markets Europe"}
+    ]
+  },
+  "IE00B4WXJJ64": {
+    "name": "iShares Core Euro Govt Bond (Dist)",
+    "index": "EUR Government Bond",
+    "ter": 0.09,
+    "alternatives": [
+      {"isin": "LU1931975152", "name": "Amundi Euro Government Bond (Acc)", "ter": 0.05, "index": "JPM EMU Government Bond"},
+      {"isin": "DE000ETFL177", "name": "Deka Euro Govt Bond (Dist)", "ter": 0.15, "index": "iBoxx EUR Sovereigns"}
+    ]
+  }
+}

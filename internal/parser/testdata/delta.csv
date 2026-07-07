@@ -1,0 +1,6 @@
+"Date","Way","Base amount","Base currency (name)","Base type","Quote amount","Quote currency","Exchange","Sent/Received from","Sent to","Fee amount","Fee currency (name)","Broker","Notes","Sync Base Holding","Leverage Metadata"
+"2016-08-25T14:55:00.000Z","DEPOSIT",0.67420698,"BTC (Bitcoin)","CRYPTO",,,,"OTHER","MY_WALLET",,,,,true,
+"2023-10-10T08:54:12.000Z","WITHDRAW",6769.420,"EUR (Euro)","FIAT",,,"Xetra","MY_WALLET","OTHER",,,,"SYNC-BASE-HOLDINGS_BUY_EUNM.DE/EUR",false,
+"2023-10-17T16:31:51.000Z","BUY",67,"ASME.DE (ASML Holding NV)","STOCK",6769,"EUR","Xetra",,,11,"EUR (Euro)",,,true,
+"2023-11-02T10:12:00.000Z","BUY",1.5,"ETH (Ethereum)","CRYPTO",2500,"EUR","Kraken",,,5,"EUR (Euro)",,,true,
+"2024-02-14T09:00:00.000Z","SELL",10,"ASME.DE (ASML Holding NV)","STOCK",1080,"EUR","Xetra",,,2,"EUR (Euro)",,,true,

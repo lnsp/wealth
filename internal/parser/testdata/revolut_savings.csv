@@ -1,0 +1,11 @@
+Date,Description,Gross interest,Money in,Money out,Balance
+
+Date,Description,Gross interest,Money in,Money out,Balance
+"Apr 25, 2025","Deposit to ""Instant Access Savings""",,"€2,000.00",,"€2,000.00"
+"Apr 25, 2025","Deposit to ""Instant Access Savings""",,€826.00,,"€2,826.00"
+"Apr 25, 2025","Withdrawal from ""Instant Access Savings""",,,"€1,000.00","€1,826.00"
+"Apr 25, 2025","Deposit to ""Instant Access Savings""",,"€4,542.63",,"€6,368.63"
+"Apr 26, 2025","Net interest paid to ""Instant Access Savings"" for Apr 26, 2025",2.25%,€0.30,,"€6,368.93"
+"Apr 27, 2025","Net interest paid to ""Instant Access Savings"" for Apr 27, 2025",2.25%,€0.39,,"€6,369.32"
+"Apr 30, 2025","Withdrawal from ""Instant Access Savings""",,,"€500.00","€5,869.32"
+"May 02, 2025","Deposit to ""Instant Access Savings""",,"€1,200.00",,"€7,069.32"

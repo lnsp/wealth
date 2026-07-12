@@ -351,6 +351,26 @@ UPDATE users SET totp_enabled = false, totp_secret = '' WHERE id = $1;
 -- name: GetTransactionIDByHash :one
 SELECT id FROM transactions WHERE import_hash = $1;
 
+-- name: ListSimilarTransactions :many
+-- Finds existing rows that carry the same economic content as an incoming
+-- import row, regardless of import_hash. Used to detect duplicates when the
+-- hash scheme changed between importer versions. Amount/fee/tax are rounded
+-- to the column scale so higher-precision parser values still match.
+SELECT id, import_hash FROM transactions
+WHERE account_id = $1
+  AND date = $2
+  AND type = $3
+  AND security_isin IS NOT DISTINCT FROM $4
+  AND coalesce(quantity, 0) = coalesce(round(sqlc.arg(quantity)::numeric, 8), 0)
+  AND amount = round(sqlc.arg(amount)::numeric, 4)
+  AND fee = round(sqlc.arg(fee)::numeric, 4)
+  AND tax = round(sqlc.arg(tax)::numeric, 4)
+  AND currency = sqlc.arg(currency)
+ORDER BY id;
+
+-- name: UpdateTransactionImportHash :exec
+UPDATE transactions SET import_hash = $2 WHERE id = $1;
+
 -- name: InsertRSUVest :exec
 INSERT INTO rsu_vests (
     account_id, security_isin, vest_date, grant_number,

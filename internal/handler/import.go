@@ -127,26 +127,18 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Count transactions before insert to detect actual new rows
-	countBefore, _ := h.queries.CountTransactions(r.Context())
-
-	imported, skipped, newSecurities, err := h.insertTransactions(r.Context(), txns)
+	imported, skipped, adopted, newSecurities, err := h.insertTransactions(r.Context(), txns)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "insert transactions: "+err.Error())
 		return
 	}
-
-	// Use actual DB count difference to determine real imported vs skipped
-	countAfter, _ := h.queries.CountTransactions(r.Context())
-	actualNew := int(countAfter - countBefore)
-	if actualNew >= 0 && actualNew <= len(txns) {
-		result.Imported = actualNew
-		result.Skipped = len(txns) - actualNew
-	} else {
-		result.Imported = imported
-		result.Skipped = skipped
-	}
+	result.Imported = imported
+	result.Skipped = skipped
 	result.NewSecurities = newSecurities
+	if adopted > 0 {
+		result.Warnings = append(result.Warnings,
+			fmt.Sprintf("%d transactions matched existing rows imported by an older version (same date, type, quantity and amount) and were deduplicated instead of inserted.", adopted))
+	}
 
 	// Insert RSU vests (if any)
 	if len(vests) > 0 {
@@ -181,8 +173,17 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Transaction) (imported, skipped int, newSecurities []string, err error) {
+func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Transaction) (imported, skipped, adopted int, newSecurities []string, err error) {
 	seenSecurities := make(map[string]bool)
+
+	// Hashes of the whole batch: an existing row whose hash appears here is
+	// (or will be) accounted for by its own incoming row, so a different
+	// incoming row must not adopt it as a legacy duplicate.
+	batchHashes := make(map[string]bool, len(txns))
+	for _, txn := range txns {
+		batchHashes[txn.ImportHash] = true
+	}
+	claimed := make(map[uuid.UUID]bool)
 
 	for _, txn := range txns {
 		// Auto-create securities for new ISINs
@@ -199,7 +200,7 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Tr
 					ISIN: txn.SecurityISIN, WKN: pgtype.Text{}, Symbol: pgtype.Text{},
 					Name: name, AssetClass: parser.ClassifyAsset(txn.SecurityISIN, name), Currency: txn.Currency,
 				}); err != nil {
-					return imported, skipped, newSecurities, fmt.Errorf("create security %s: %w", txn.SecurityISIN, err)
+					return imported, skipped, adopted, newSecurities, fmt.Errorf("create security %s: %w", txn.SecurityISIN, err)
 				}
 				newSecurities = append(newSecurities, txn.SecurityISIN)
 
@@ -236,17 +237,50 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Tr
 			category = pgtype.Text{String: txn.Category, Valid: true}
 		}
 
-		err := h.queries.InsertTransaction(ctx, db.InsertTransactionParams{
+		insertParams := db.InsertTransactionParams{
 			AccountID: txn.AccountID, Date: txn.Date, Type: txn.Type,
 			SecurityISIN: secISIN, Quantity: quantity, Price: price, Amount: amount,
 			Fee: fee, Tax: tax, Currency: txn.Currency,
 			Counterparty: counterparty, Reference: reference, Category: category,
 			ImportHash: txn.ImportHash,
+		}
+
+		// Exact hash already present: re-run the upsert so type reclassification
+		// still applies, but count the row as skipped.
+		if _, hashErr := h.queries.GetTransactionIDByHash(ctx, txn.ImportHash); hashErr == nil {
+			if err := h.queries.InsertTransaction(ctx, insertParams); err != nil {
+				log.Printf("upsert transaction: %v", err)
+			}
+			skipped++
+			continue
+		}
+
+		// Hash unknown — the same transaction may still exist under a hash from
+		// an older importer version. Adopt the first economically identical row
+		// not accounted for by this batch, upgrading its hash to the current
+		// scheme so future imports dedup directly.
+		similar, simErr := h.queries.ListSimilarTransactions(ctx, db.ListSimilarTransactionsParams{
+			AccountID: txn.AccountID, Date: txn.Date, Type: txn.Type,
+			SecurityISIN: secISIN, Quantity: quantity, Amount: amount,
+			Fee: fee, Tax: tax, Currency: txn.Currency,
 		})
-		if err != nil {
-			// ON CONFLICT DO NOTHING means no error for duplicates in PostgreSQL,
-			// but we can't easily detect skips vs inserts without checking affected rows.
-			// For simplicity, count everything as imported.
+		if simErr != nil {
+			log.Printf("WARNING: list similar transactions: %v", simErr)
+		}
+		if id, ok := pickAdoptable(similar, batchHashes, claimed); ok {
+			if updErr := h.queries.UpdateTransactionImportHash(ctx, db.UpdateTransactionImportHashParams{
+				ID: id, ImportHash: txn.ImportHash,
+			}); updErr != nil {
+				log.Printf("WARNING: adopt legacy transaction %s: %v", id, updErr)
+			} else {
+				claimed[id] = true
+				adopted++
+				skipped++
+				continue
+			}
+		}
+
+		if err := h.queries.InsertTransaction(ctx, insertParams); err != nil {
 			log.Printf("insert transaction: %v", err)
 			skipped++
 			continue
@@ -254,7 +288,24 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Tr
 		imported++
 	}
 
-	return imported, skipped, newSecurities, nil
+	return imported, skipped, adopted, newSecurities, nil
+}
+
+// pickAdoptable returns the first similar existing row that this batch does
+// not otherwise account for: rows whose import_hash matches any incoming row
+// belong to that row (they will dedup by hash), and rows already claimed by an
+// earlier incoming transaction of identical content stay claimed. This keeps
+// the multiset semantics right when a file legitimately contains several
+// identical transactions (e.g. two grants vesting the same quantity on the
+// same day).
+func pickAdoptable(candidates []db.ListSimilarTransactionsRow, batchHashes map[string]bool, claimed map[uuid.UUID]bool) (uuid.UUID, bool) {
+	for _, c := range candidates {
+		if batchHashes[c.ImportHash] || claimed[c.ID] {
+			continue
+		}
+		return c.ID, true
+	}
+	return uuid.UUID{}, false
 }
 
 func numericFromFloat(f float64) pgtype.Numeric {

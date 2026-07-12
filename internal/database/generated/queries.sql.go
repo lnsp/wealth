@@ -304,6 +304,9 @@ const deleteAccountRSUVests = `-- name: DeleteAccountRSUVests :exec
 DELETE FROM rsu_vests WHERE account_id = $1
 `
 
+// Must run before DeleteAccountTransactions: rsu_vests.transaction_id
+// references transactions(id) with no ON DELETE behavior, so removing the
+// linked transactions first would violate the FK constraint.
 func (q *Queries) DeleteAccountRSUVests(ctx context.Context, accountID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteAccountRSUVests, accountID)
 	return err
@@ -1602,6 +1605,71 @@ func (q *Queries) ListSecuritiesWithSymbol(ctx context.Context) ([]ListSecuritie
 	return items, nil
 }
 
+const listSimilarTransactions = `-- name: ListSimilarTransactions :many
+SELECT id, import_hash FROM transactions
+WHERE account_id = $1
+  AND date = $2
+  AND type = $3
+  AND security_isin IS NOT DISTINCT FROM $4
+  AND coalesce(quantity, 0) = coalesce(round($5::numeric, 8), 0)
+  AND amount = round($6::numeric, 4)
+  AND fee = round($7::numeric, 4)
+  AND tax = round($8::numeric, 4)
+  AND currency = $9
+ORDER BY id
+`
+
+type ListSimilarTransactionsParams struct {
+	AccountID    uuid.UUID      `json:"account_id"`
+	Date         time.Time      `json:"date"`
+	Type         string         `json:"type"`
+	SecurityISIN pgtype.Text    `json:"security_isin"`
+	Quantity     pgtype.Numeric `json:"quantity"`
+	Amount       pgtype.Numeric `json:"amount"`
+	Fee          pgtype.Numeric `json:"fee"`
+	Tax          pgtype.Numeric `json:"tax"`
+	Currency     string         `json:"currency"`
+}
+
+type ListSimilarTransactionsRow struct {
+	ID         uuid.UUID `json:"id"`
+	ImportHash string    `json:"import_hash"`
+}
+
+// Finds existing rows that carry the same economic content as an incoming
+// import row, regardless of import_hash. Used to detect duplicates when the
+// hash scheme changed between importer versions. Amount/fee/tax are rounded
+// to the column scale so higher-precision parser values still match.
+func (q *Queries) ListSimilarTransactions(ctx context.Context, arg ListSimilarTransactionsParams) ([]ListSimilarTransactionsRow, error) {
+	rows, err := q.db.Query(ctx, listSimilarTransactions,
+		arg.AccountID,
+		arg.Date,
+		arg.Type,
+		arg.SecurityISIN,
+		arg.Quantity,
+		arg.Amount,
+		arg.Fee,
+		arg.Tax,
+		arg.Currency,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSimilarTransactionsRow{}
+	for rows.Next() {
+		var i ListSimilarTransactionsRow
+		if err := rows.Scan(&i.ID, &i.ImportHash); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTargetAllocations = `-- name: ListTargetAllocations :many
 SELECT ta.security_isin, ta.target_weight_pct, ta.updated_at, s.name as security_name
 FROM target_allocations ta
@@ -2157,6 +2225,20 @@ type UpdateTransactionCategoryParams struct {
 
 func (q *Queries) UpdateTransactionCategory(ctx context.Context, arg UpdateTransactionCategoryParams) error {
 	_, err := q.db.Exec(ctx, updateTransactionCategory, arg.ID, arg.Category)
+	return err
+}
+
+const updateTransactionImportHash = `-- name: UpdateTransactionImportHash :exec
+UPDATE transactions SET import_hash = $2 WHERE id = $1
+`
+
+type UpdateTransactionImportHashParams struct {
+	ID         uuid.UUID `json:"id"`
+	ImportHash string    `json:"import_hash"`
+}
+
+func (q *Queries) UpdateTransactionImportHash(ctx context.Context, arg UpdateTransactionImportHashParams) error {
+	_, err := q.db.Exec(ctx, updateTransactionImportHash, arg.ID, arg.ImportHash)
 	return err
 }
 

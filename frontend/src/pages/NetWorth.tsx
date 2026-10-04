@@ -586,30 +586,35 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
                 if (!Array.isArray(ps) || ps.length === 0) return '';
                 const p = ps[0];
                 const bar = bars[p.dataIndex];
-                const displayValue = Array.isArray(p.value) ? bar.value : (p.value as number);
-                return `${p.name}<br/><strong>${displayValue >= 0 ? '+' : ''}${fmt(displayValue)}</strong>`;
+                const displayValue = bar.value;
+                return `${p.name}<br/><strong>${bar.type === 'total' || displayValue < 0 ? '' : '+'}${fmt(displayValue)}</strong>`;
               }},
               grid: { top: 12, right: 10, bottom: 36, left: 56 },
               xAxis: { type: 'category' as const, data: bars.map(w => w.label), axisLabel: { fontSize: 10, interval: 0, rotate: 0, color: tc.inkMuted }, axisLine: { lineStyle: { color: tc.divider } }, axisTick: { show: false } },
               yAxis: { type: 'value' as const, axisLabel: { fontSize: 10, color: tc.inkMuted, formatter: (v: number) => v >= 1000 ? `${Math.round(v/1000)}K` : String(Math.round(v)) }, splitLine: { lineStyle: { color: tc.divider, type: 'dashed' as const } } },
-              series: [{
-                type: 'bar' as const,
-                barWidth: '60%',
-                data: (() => {
-                  let cumulative = 0;
-                  return bars.map(w => {
-                    if (w.type === 'total') {
-                      return { value: w.value, itemStyle: { color: tc.forest, borderRadius: [2, 2, 0, 0] } };
-                    }
-                    const start = cumulative;
-                    cumulative += w.value;
-                    return {
-                      value: [start, cumulative],
-                      itemStyle: { color: w.value >= 0 ? tc.sage : tc.claret, borderRadius: 2 },
-                    };
-                  });
-                })(),
-              }],
+              // Classic waterfall: an invisible stacked base lifts each delta bar
+              // to its running start, so every bar is a plain number (ECharts
+              // reads [a, b] array values as [categoryIndex, value]).
+              series: (() => {
+                let cumulative = 0;
+                const base: number[] = [];
+                const delta: { value: number; itemStyle: { color: string; borderRadius: number | number[] } }[] = [];
+                for (const w of bars) {
+                  if (w.type === 'total') {
+                    base.push(0);
+                    delta.push({ value: w.value, itemStyle: { color: tc.forest, borderRadius: [2, 2, 0, 0] } });
+                    continue;
+                  }
+                  const start = cumulative;
+                  cumulative += w.value;
+                  base.push(Math.min(start, cumulative));
+                  delta.push({ value: Math.abs(w.value), itemStyle: { color: w.value >= 0 ? tc.sage : tc.claret, borderRadius: 2 } });
+                }
+                return [
+                  { type: 'bar' as const, stack: 'wf', barWidth: '60%', silent: true, itemStyle: { color: 'transparent' }, emphasis: { disabled: true }, data: base },
+                  { type: 'bar' as const, stack: 'wf', barWidth: '60%', data: delta },
+                ];
+              })(),
             }} height="220px" />
 
             {/* Breakdown summary — explicit numbers to make the chart readable

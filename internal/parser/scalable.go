@@ -75,6 +75,7 @@ func (p *ScalableCapitalParser) Parse(records [][]string, accountID uuid.UUID) (
 	}
 
 	var txns []Transaction
+	var nonTrade []bool // parallel to txns: row is a non-cancelled non_trade_security_transaction
 	p.warnings = nil
 	for i, record := range records[1:] {
 		if len(record) == 0 || (len(record) == 1 && record[0] == "") {
@@ -157,9 +158,68 @@ func (p *ScalableCapitalParser) Parse(records [][]string, accountID uuid.UUID) (
 		}
 
 		txns = append(txns, txn)
+		nonTrade = append(nonTrade, typeRaw == "non_trade_security_transaction" && !isCancellation)
 	}
 
-	return txns, nil, nil
+	return p.mergeCloseouts(txns, nonTrade), nil, nil
+}
+
+// mergeCloseouts folds knock-outs, redemptions and similar close-outs into a
+// single sell. Scalable books these as a non-trade security row (unsigned
+// quantity, nominal amount — indistinguishable from an inbound transfer) plus
+// a same-day cash distribution for the same ISIN carrying the payout. Left
+// alone they import as a phantom incoming transfer and a dividend, doubling
+// the position and turning the realised loss into dividend income.
+//
+// The payout row becomes the sell and keeps its import hash, so re-importing
+// over previously misclassified rows reclassifies it in place.
+func (p *ScalableCapitalParser) mergeCloseouts(txns []Transaction, nonTrade []bool) []Transaction {
+	type key struct {
+		date string
+		isin string
+	}
+	payouts := make(map[key][]int)
+	for j, t := range txns {
+		if t.Type == "dividend" && t.SecurityISIN != "" && t.Amount > 0 {
+			k := key{t.Date.Format("2006-01-02"), t.SecurityISIN}
+			payouts[k] = append(payouts[k], j)
+		}
+	}
+	if len(payouts) == 0 {
+		return txns
+	}
+
+	drop := make(map[int]bool)
+	for i, t := range txns {
+		if !nonTrade[i] || t.SecurityISIN == "" || t.Quantity <= 0 {
+			continue
+		}
+		k := key{t.Date.Format("2006-01-02"), t.SecurityISIN}
+		cands := payouts[k]
+		if len(cands) == 0 {
+			continue
+		}
+		j := cands[0]
+		payouts[k] = cands[1:]
+
+		txns[j].Type = "sell"
+		txns[j].Quantity = t.Quantity
+		txns[j].Price = txns[j].Amount / t.Quantity
+		drop[i] = true
+		p.warnings = append(p.warnings, fmt.Sprintf("%s %s: close-out (knock-out/redemption) of %g units booked as a sale for %.2f %s",
+			k.date, t.SecurityISIN, t.Quantity, txns[j].Amount, txns[j].Currency))
+	}
+	if len(drop) == 0 {
+		return txns
+	}
+
+	out := txns[:0]
+	for i, t := range txns {
+		if !drop[i] {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func classifyScalableType(txnType, subType, side string) string {

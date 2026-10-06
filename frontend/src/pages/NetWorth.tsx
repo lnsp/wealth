@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { api, type Account, type HoldingRow, type NetWorthSnapshot, type GoalProgress, type ProjectionData, type SavingsRateData } from '../api/client';
+import { api, type Account, type HoldingRow, type NetWorthSnapshot, type GoalProgress, type ProjectionData } from '../api/client';
 import EChartWrapper from '../components/charts/EChartWrapper';
 import AccountCard from '../components/AccountCard';
 import { TabBar } from '../components/ui';
@@ -76,7 +76,6 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
     try { return JSON.parse(localStorage.getItem('proj_scenarios') || '[]'); } catch { return []; }
   });
   const [activeScenarios, setActiveScenarios] = useState<Set<number>>(() => new Set());
-  const [savingsRate, setSavingsRate] = useState<SavingsRateData | null>(null);
   const [showAllMilestones, setShowAllMilestones] = useState(false);
   const [nextActions, setNextActions] = useState<{ title: string; detail: string; impact_eur: number; urgency: string; category: string; link: string }[]>([]);
   const [unreadAlerts, setUnreadAlerts] = useState(0);
@@ -138,7 +137,6 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
 
   useEffect(() => {
     api.getGoalsProgress().then(r => setGoals(r.goals || [])).catch(() => {});
-    api.getSavingsRate().then(setSavingsRate).catch(() => {});
     fetch('/api/portfolio/next-actions').then(r => r.json()).then(d => setNextActions(d.actions || [])).catch(() => {});
     api.listNotifications().then(r => setUnreadAlerts(r.unread_count)).catch(() => {});
     api.getAttribution().then(r => { setAttribution(r.summary); setAttributionTotal(r.total_change ?? null); }).catch(() => {});
@@ -353,7 +351,9 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
   }
 
   // Compute key metrics for Rule of Three
-  const investedCapital = savingsRate ? savingsRate.total_deposits - savingsRate.total_withdrawals : 0;
+  // Same definition as the Wealth Attribution waterfall (RSU vests count as
+  // contributions at FMV), so Invested/Return reconcile with it.
+  const investedCapital = wfData ? wfData.net_contributions : 0;
   const allTimeReturn = totalNetWorth - investedCapital;
   const allTimeReturnPct = investedCapital > 0 ? (allTimeReturn / investedCapital) * 100 : 0;
   const cashBalance = accounts.reduce((s, a) => s + (a.cash_balance ?? a.balance ?? 0), 0);
@@ -705,10 +705,10 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
           add(classLabelByType[acc.type] || 'Other', acc.balance ?? 0);
         }
         // Brokerage holdings — bin by asset_class via the securities table.
+        // value_eur falls back to cost basis for unpriced positions, matching
+        // account balances, so the donut total reconciles with net worth.
         for (const h of holdings) {
-          const mv = h.market_value;
-          if (mv == null || mv === 0) continue;
-          add(assetClassLabels[h.asset_class] || 'Other', mv);
+          add(assetClassLabels[h.asset_class] || 'Other', h.value_eur ?? h.market_value ?? 0);
         }
         const entries = Object.entries(byClass).filter(([, v]) => v !== 0).sort(([, a], [, b]) => Math.abs(b) - Math.abs(a));
         if (entries.length < 2) return null;

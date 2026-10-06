@@ -91,6 +91,8 @@ export interface HoldingRow {
   currency: string;
   current_price: number | null;
   market_value: number | null;
+  value_eur: number;
+  price_missing: boolean;
   unrealized_pl: number | null;
   weight_pct: number | null;
   fx_exposure?: string;

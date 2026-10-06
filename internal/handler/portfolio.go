@@ -102,6 +102,11 @@ func (h *PortfolioHandler) HandleHoldings(w http.ResponseWriter, r *http.Request
 		FXExposure   string   `json:"fx_exposure,omitempty"`   // dominant currency
 		FXImpactPct  *float64 `json:"fx_impact_pct,omitempty"` // estimated FX contribution to return
 		AssetReturnPct *float64 `json:"asset_return_pct,omitempty"` // return excluding FX
+		// ValueEUR is what this position contributes to account balances and
+		// net worth: market value, or EUR cost basis when no price is known
+		// (same fallback as holdingValueFromMap). PriceMissing flags the latter.
+		ValueEUR     float64 `json:"value_eur"`
+		PriceMissing bool    `json:"price_missing"`
 	}
 
 	// Batch-load all latest prices in one query (eliminates N+1)
@@ -159,6 +164,7 @@ func (h *PortfolioHandler) HandleHoldings(w http.ResponseWriter, r *http.Request
 			qty := qf.Float64
 			mvEUR := convertToEUR(r.Context(), h.queries, qty*price, priceRow.Currency)
 			hwp.MarketValue = &mvEUR
+			hwp.ValueEUR = mvEUR
 			totalValue += mvEUR
 
 			cf, _ := holding.AvgCostBasis.Float64Value()
@@ -170,7 +176,9 @@ func (h *PortfolioHandler) HandleHoldings(w http.ResponseWriter, r *http.Request
 			// Fallback to cost basis for weight calculation (also EUR).
 			qf, _ := holding.Quantity.Float64Value()
 			cf, _ := holding.AvgCostBasis.Float64Value()
-			totalValue += convertToEUR(r.Context(), h.queries, qf.Float64*cf.Float64, holding.Currency)
+			hwp.ValueEUR = convertToEUR(r.Context(), h.queries, qf.Float64*cf.Float64, holding.Currency)
+			hwp.PriceMissing = true
+			totalValue += hwp.ValueEUR
 		}
 
 		// Compute FX impact from country weights → currency mapping
@@ -225,15 +233,7 @@ func (h *PortfolioHandler) HandleHoldings(w http.ResponseWriter, r *http.Request
 	// Compute weight percentages
 	if totalValue > 0 {
 		for i := range result {
-			mv := 0.0
-			if result[i].MarketValue != nil {
-				mv = *result[i].MarketValue
-			} else {
-				qf, _ := result[i].Quantity.Float64Value()
-				cf, _ := result[i].AvgCostBasis.Float64Value()
-				mv = qf.Float64 * cf.Float64
-			}
-			w := (mv / totalValue) * 100
+			w := (result[i].ValueEUR / totalValue) * 100
 			result[i].WeightPct = &w
 		}
 	}
@@ -4865,6 +4865,13 @@ func computePostTaxRatio(ctx context.Context, q *db.Queries, accountID uuid.UUID
 	return net / gross, false
 }
 
+// vestIsPast reports whether a vest date (a DB date, i.e. UTC midnight) lies
+// before today's local calendar date. A vest dated today is still upcoming.
+func vestIsPast(vestDate, now time.Time) bool {
+	y, m, d := now.Date()
+	return vestDate.Before(time.Date(y, m, d, 0, 0, 0, 0, time.UTC))
+}
+
 func (h *PortfolioHandler) HandleUnvested(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	accounts, err := h.queries.ListAccounts(ctx)
@@ -4940,7 +4947,14 @@ func (h *PortfolioHandler) HandleUnvested(w http.ResponseWriter, r *http.Request
 			ByVest:               make([]UnvestedVest, 0, len(vests)),
 		}
 
+		now := time.Now()
 		for _, v := range vests {
+			// Rows stay vested=false until a Releases report flips them, but the
+			// vest itself has already landed as an in-kind transfer — counting
+			// it here would double it against holdings.
+			if vestIsPast(v.VestDate, now) {
+				continue
+			}
 			gross := numericToFloat(v.GrossQuantity)
 			if gross <= 0 {
 				continue
@@ -4966,6 +4980,9 @@ func (h *PortfolioHandler) HandleUnvested(w http.ResponseWriter, r *http.Request
 			})
 		}
 
+		if len(out.ByVest) == 0 {
+			continue
+		}
 		resp.Accounts = append(resp.Accounts, out)
 		resp.TotalValueEUR += out.TotalValueEUR
 		if priceCurrency != "" {

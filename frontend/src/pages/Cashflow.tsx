@@ -20,6 +20,7 @@ const CATEGORY_LABEL: Record<string, string> = {
   tax: 'Tax',
   investment: 'Investment',
   internal: 'Internal Transfer',
+  asset_purchase: 'Asset Purchase',
   other: 'Other',
 };
 

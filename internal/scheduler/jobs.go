@@ -17,6 +17,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"github.com/lnsp/wealth/internal/analytics"
+	"github.com/lnsp/wealth/internal/assets"
 	db "github.com/lnsp/wealth/internal/database/generated"
 	"github.com/lnsp/wealth/internal/market"
 )
@@ -804,17 +805,27 @@ func (s *Scheduler) updateNetWorthSnapshot() {
 		totalInvestment += convertToEURScheduler(ctx, s.queries, qty*numericToFloat(priceRow.Close), priceRow.Currency)
 	}
 
-	total := totalCash + totalInvestment
 	today := time.Now()
 	date := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, today.Location())
 
-	var totalNum, cashNum, investNum pgtype.Numeric
+	// Physical assets (cars) at their modelled depreciated value
+	var totalPhysical float64
+	if physical, err := assets.Load(ctx, s.queries); err != nil {
+		log.Printf("WARNING: net worth snapshot: load assets: %v", err)
+	} else {
+		totalPhysical = assets.TotalValueAt(physical, date)
+	}
+
+	total := totalCash + totalInvestment + totalPhysical
+
+	var totalNum, cashNum, investNum, physicalNum pgtype.Numeric
 	totalNum.Scan(fmt.Sprintf("%.4f", total))
 	cashNum.Scan(fmt.Sprintf("%.4f", totalCash))
 	investNum.Scan(fmt.Sprintf("%.4f", totalInvestment))
+	physicalNum.Scan(fmt.Sprintf("%.4f", totalPhysical))
 
 	if err := s.queries.UpsertNetWorthSnapshot(ctx, db.UpsertNetWorthSnapshotParams{
-		Date: date, Total: totalNum, CashComponent: cashNum, InvestmentComponent: investNum,
+		Date: date, Total: totalNum, CashComponent: cashNum, InvestmentComponent: investNum, PhysicalComponent: physicalNum,
 	}); err != nil {
 		log.Printf("ERROR: net worth snapshot: upsert: %v", err)
 		return
@@ -822,7 +833,7 @@ func (s *Scheduler) updateNetWorthSnapshot() {
 
 	// Also record an intraday data point (for 1D chart)
 	if err := s.queries.InsertNetWorthIntraday(ctx, db.InsertNetWorthIntradayParams{
-		RecordedAt: today, Total: totalNum, CashComponent: cashNum, InvestmentComponent: investNum,
+		RecordedAt: today, Total: totalNum, CashComponent: cashNum, InvestmentComponent: investNum, PhysicalComponent: physicalNum,
 	}); err != nil {
 		log.Printf("WARNING: net worth intraday insert: %v", err)
 	}
@@ -832,7 +843,7 @@ func (s *Scheduler) updateNetWorthSnapshot() {
 		log.Printf("WARNING: prune intraday data: %v", err)
 	}
 
-	msg := fmt.Sprintf("total=%.0f (cash=%.0f + invest=%.0f)", total, totalCash, totalInvestment)
+	msg := fmt.Sprintf("total=%.0f (cash=%.0f + invest=%.0f + physical=%.0f)", total, totalCash, totalInvestment, totalPhysical)
 	log.Printf("net worth snapshot: %s", msg)
 	s.setJobStatus("networth", "ok", msg)
 }
@@ -1059,6 +1070,11 @@ func (s *Scheduler) BackfillNetWorthSnapshots() {
 		return 0
 	}
 
+	physical, err := assets.Load(ctx, s.queries)
+	if err != nil {
+		log.Printf("WARNING: backfill snapshots: load assets: %v", err)
+	}
+
 	// Replay transactions to build running state
 	var cashBalance float64
 	type holdingState struct {
@@ -1250,15 +1266,17 @@ func (s *Scheduler) BackfillNetWorthSnapshots() {
 			}
 		}
 
-		total := cashBalance + investmentValue
+		physicalValue := assets.TotalValueAt(physical, d)
+		total := cashBalance + investmentValue + physicalValue
 
-		var totalNum, cashNum, investNum pgtype.Numeric
+		var totalNum, cashNum, investNum, physicalNum pgtype.Numeric
 		totalNum.Scan(fmt.Sprintf("%.4f", total))
 		cashNum.Scan(fmt.Sprintf("%.4f", cashBalance))
 		investNum.Scan(fmt.Sprintf("%.4f", investmentValue))
+		physicalNum.Scan(fmt.Sprintf("%.4f", physicalValue))
 
 		if err := s.queries.UpsertNetWorthSnapshot(ctx, db.UpsertNetWorthSnapshotParams{
-				Date: d, Total: totalNum, CashComponent: cashNum, InvestmentComponent: investNum,
+				Date: d, Total: totalNum, CashComponent: cashNum, InvestmentComponent: investNum, PhysicalComponent: physicalNum,
 			}); err != nil {
 			log.Printf("WARNING: backfill snapshot %s: %v", d.Format("2006-01-02"), err)
 		}

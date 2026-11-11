@@ -43,6 +43,9 @@ const (
 	CatTax           Category = "tax"
 	CatInvestment    Category = "investment"
 	CatInternal      Category = "internal"
+	// CatAssetPurchase marks the payment for a tracked physical asset (car):
+	// cash turned into an asset, so it is a transfer rather than spending.
+	CatAssetPurchase Category = "asset_purchase"
 	CatOther         Category = "other"
 )
 
@@ -53,7 +56,7 @@ func BucketOf(c Category) Bucket {
 		return BucketIncome
 	case CatHousing, CatUtilities, CatInsurance, CatSubscriptions:
 		return BucketFixed
-	case CatInvestment, CatInternal:
+	case CatInvestment, CatInternal, CatAssetPurchase:
 		return BucketTransfer
 	default:
 		return BucketVariable
@@ -133,7 +136,7 @@ func IsKnown(c Category) bool {
 		CatHousing, CatUtilities, CatInsurance, CatSubscriptions,
 		CatGroceries, CatDining, CatTransport, CatHealth,
 		CatEntertainment, CatShopping, CatTax, CatInvestment,
-		CatInternal, CatOther:
+		CatInternal, CatAssetPurchase, CatOther:
 		return true
 	}
 	return false
@@ -146,6 +149,6 @@ func AllCategories() []Category {
 		CatHousing, CatUtilities, CatInsurance, CatSubscriptions,
 		CatGroceries, CatDining, CatTransport, CatHealth,
 		CatEntertainment, CatShopping, CatTax,
-		CatInvestment, CatInternal, CatOther,
+		CatInvestment, CatInternal, CatAssetPurchase, CatOther,
 	}
 }

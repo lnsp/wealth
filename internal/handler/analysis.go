@@ -1321,6 +1321,9 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 			f, _ := txn.Amount.Float64Value()
 			amt = f.Float64
 		}
+		if isAssetPurchase(txn.Category) {
+			continue // cash → physical asset, not an expense
+		}
 		month := txn.Date.Format("2006-01")
 		if monthly[month] == nil {
 			monthly[month] = &monthFlow{Month: month}
@@ -3007,6 +3010,9 @@ func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request)
 	chargeFreq := make(map[chargeKey]int)
 
 	for _, txn := range txns {
+		if isAssetPurchase(txn.Category) {
+			continue // cash → physical asset, not an expense
+		}
 		cp := ""
 		if txn.Counterparty.Valid { cp = txn.Counterparty.String }
 		ref := ""

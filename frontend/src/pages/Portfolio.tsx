@@ -37,7 +37,7 @@ export default function Portfolio() {
   const [healthScore, setHealthScore] = useState<{ score: number; subscores: { name: string; score: number; weight: number; status: string; detail: string }[] } | null>(null);
   const [securityDetail, setSecurityDetail] = useState<Awaited<ReturnType<typeof api.getSecurityDetail>> | null>(null);
   const [tmDate, setTmDate] = useState('');
-  const [tmData, setTmData] = useState<{ date: string; holdings: { isin: string; name: string; quantity: number; value: number; weight_pct: number }[]; net_worth: number; current: { net_worth: number }; change: { net_worth_change: number; net_worth_pct: number; contributions: number; market_return: number; dividends: number } } | null>(null);
+  const [tmData, setTmData] = useState<{ date: string; holdings: { isin: string; name: string; quantity: number; value: number; weight_pct: number }[]; net_worth: number; current: { net_worth: number }; change: { net_worth_change: number; net_worth_pct: number; contributions: number; market_return: number; dividends: number; assets?: number } } | null>(null);
   const [tmLoading, setTmLoading] = useState(false);
   const [savingsPlans, setSavingsPlans] = useState<Awaited<ReturnType<typeof api.getSavingsPlans>> | null>(null);
   const [allocHistory, setAllocHistory] = useState<{ history: { date: string; weights: Record<string, number> }[]; holdings: string[] } | null>(null);
@@ -1199,6 +1199,10 @@ export default function Portfolio() {
                 <span className={`tabular-nums text-right ${tmData.change.market_return >= 0 ? 'text-sage' : 'text-claret'}`}>{fmt(tmData.change.market_return)}</span>
                 <span className="text-ink-muted">Dividends</span>
                 <span className="tabular-nums text-right">{fmt(tmData.change.dividends)}</span>
+                {Math.abs(tmData.change.assets ?? 0) >= 1 && (<>
+                  <span className="text-ink-muted">Vehicles</span>
+                  <span className={`tabular-nums text-right ${(tmData.change.assets ?? 0) >= 0 ? 'text-sage' : 'text-claret'}`}>{fmt(tmData.change.assets ?? 0)}</span>
+                </>)}
               </div>
             </div>
 

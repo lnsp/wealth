@@ -112,6 +112,60 @@ func (q *Queries) CreateAccount(ctx context.Context, arg CreateAccountParams) (A
 	return i, err
 }
 
+const createAsset = `-- name: CreateAsset :one
+INSERT INTO assets (kind, name, list_price, purchase_price, purchase_date, first_registration,
+    purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id, created_at
+`
+
+type CreateAssetParams struct {
+	Kind                  string         `json:"kind"`
+	Name                  string         `json:"name"`
+	ListPrice             pgtype.Numeric `json:"list_price"`
+	PurchasePrice         pgtype.Numeric `json:"purchase_price"`
+	PurchaseDate          time.Time      `json:"purchase_date"`
+	FirstRegistration     pgtype.Date    `json:"first_registration"`
+	PurchaseOdometerKm    int32          `json:"purchase_odometer_km"`
+	AnnualDepreciation    pgtype.Numeric `json:"annual_depreciation"`
+	KmDepreciation        pgtype.Numeric `json:"km_depreciation"`
+	ExpectedKmPerYear     int32          `json:"expected_km_per_year"`
+	PurchaseTransactionID *uuid.UUID     `json:"purchase_transaction_id"`
+}
+
+func (q *Queries) CreateAsset(ctx context.Context, arg CreateAssetParams) (Asset, error) {
+	row := q.db.QueryRow(ctx, createAsset,
+		arg.Kind,
+		arg.Name,
+		arg.ListPrice,
+		arg.PurchasePrice,
+		arg.PurchaseDate,
+		arg.FirstRegistration,
+		arg.PurchaseOdometerKm,
+		arg.AnnualDepreciation,
+		arg.KmDepreciation,
+		arg.ExpectedKmPerYear,
+		arg.PurchaseTransactionID,
+	)
+	var i Asset
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Name,
+		&i.ListPrice,
+		&i.PurchasePrice,
+		&i.PurchaseDate,
+		&i.FirstRegistration,
+		&i.PurchaseOdometerKm,
+		&i.AnnualDepreciation,
+		&i.KmDepreciation,
+		&i.ExpectedKmPerYear,
+		&i.PurchaseTransactionID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createFinancialGoal = `-- name: CreateFinancialGoal :one
 INSERT INTO financial_goals (name, target_amount, target_date, monthly_contribution, assumed_return_pct, funding_account_id, priority)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -321,6 +375,29 @@ func (q *Queries) DeleteAccountTransactions(ctx context.Context, accountID uuid.
 	return err
 }
 
+const deleteAsset = `-- name: DeleteAsset :exec
+DELETE FROM assets WHERE id = $1
+`
+
+func (q *Queries) DeleteAsset(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteAsset, id)
+	return err
+}
+
+const deleteAssetObservation = `-- name: DeleteAssetObservation :exec
+DELETE FROM asset_observations WHERE asset_id = $1 AND date = $2
+`
+
+type DeleteAssetObservationParams struct {
+	AssetID uuid.UUID `json:"asset_id"`
+	Date    time.Time `json:"date"`
+}
+
+func (q *Queries) DeleteAssetObservation(ctx context.Context, arg DeleteAssetObservationParams) error {
+	_, err := q.db.Exec(ctx, deleteAssetObservation, arg.AssetID, arg.Date)
+	return err
+}
+
 const deleteFinancialGoal = `-- name: DeleteFinancialGoal :exec
 DELETE FROM financial_goals WHERE id = $1
 `
@@ -455,6 +532,31 @@ func (q *Queries) GetAccountByInstitutionAndType(ctx context.Context, arg GetAcc
 	return i, err
 }
 
+const getAsset = `-- name: GetAsset :one
+SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id, created_at FROM assets WHERE id = $1
+`
+
+func (q *Queries) GetAsset(ctx context.Context, id uuid.UUID) (Asset, error) {
+	row := q.db.QueryRow(ctx, getAsset, id)
+	var i Asset
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Name,
+		&i.ListPrice,
+		&i.PurchasePrice,
+		&i.PurchaseDate,
+		&i.FirstRegistration,
+		&i.PurchaseOdometerKm,
+		&i.AnnualDepreciation,
+		&i.KmDepreciation,
+		&i.ExpectedKmPerYear,
+		&i.PurchaseTransactionID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getCashBalance = `-- name: GetCashBalance :one
 SELECT COALESCE(SUM(
     CASE
@@ -579,6 +681,33 @@ func (q *Queries) GetSecurity(ctx context.Context, isin string) (Security, error
 	return i, err
 }
 
+const getTransaction = `-- name: GetTransaction :one
+SELECT id, account_id, date, type, security_isin, quantity, price, amount, fee, tax, currency, counterparty, reference, category, import_hash FROM transactions WHERE id = $1
+`
+
+func (q *Queries) GetTransaction(ctx context.Context, id uuid.UUID) (Transaction, error) {
+	row := q.db.QueryRow(ctx, getTransaction, id)
+	var i Transaction
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.Date,
+		&i.Type,
+		&i.SecurityISIN,
+		&i.Quantity,
+		&i.Price,
+		&i.Amount,
+		&i.Fee,
+		&i.Tax,
+		&i.Currency,
+		&i.Counterparty,
+		&i.Reference,
+		&i.Category,
+		&i.ImportHash,
+	)
+	return i, err
+}
+
 const getTransactionIDByHash = `-- name: GetTransactionIDByHash :one
 SELECT id FROM transactions WHERE import_hash = $1
 `
@@ -679,8 +808,8 @@ func (q *Queries) InsertImportHistory(ctx context.Context, arg InsertImportHisto
 }
 
 const insertNetWorthIntraday = `-- name: InsertNetWorthIntraday :exec
-INSERT INTO net_worth_intraday (recorded_at, total, cash_component, investment_component)
-VALUES ($1, $2, $3, $4)
+INSERT INTO net_worth_intraday (recorded_at, total, cash_component, investment_component, physical_component)
+VALUES ($1, $2, $3, $4, $5)
 `
 
 type InsertNetWorthIntradayParams struct {
@@ -688,6 +817,7 @@ type InsertNetWorthIntradayParams struct {
 	Total               pgtype.Numeric `json:"total"`
 	CashComponent       pgtype.Numeric `json:"cash_component"`
 	InvestmentComponent pgtype.Numeric `json:"investment_component"`
+	PhysicalComponent   pgtype.Numeric `json:"physical_component"`
 }
 
 func (q *Queries) InsertNetWorthIntraday(ctx context.Context, arg InsertNetWorthIntradayParams) error {
@@ -696,6 +826,7 @@ func (q *Queries) InsertNetWorthIntraday(ctx context.Context, arg InsertNetWorth
 		arg.Total,
 		arg.CashComponent,
 		arg.InvestmentComponent,
+		arg.PhysicalComponent,
 	)
 	return err
 }
@@ -933,6 +1064,74 @@ func (q *Queries) ListAllAccounts(ctx context.Context) ([]Account, error) {
 			&i.TaxTreatment,
 			&i.EmployerMatchPct,
 			&i.ImportSecurityISIN,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAssetObservations = `-- name: ListAssetObservations :many
+SELECT asset_id, date, odometer_km, appraised_value, note FROM asset_observations ORDER BY asset_id, date
+`
+
+func (q *Queries) ListAssetObservations(ctx context.Context) ([]AssetObservation, error) {
+	rows, err := q.db.Query(ctx, listAssetObservations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AssetObservation{}
+	for rows.Next() {
+		var i AssetObservation
+		if err := rows.Scan(
+			&i.AssetID,
+			&i.Date,
+			&i.OdometerKm,
+			&i.AppraisedValue,
+			&i.Note,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAssets = `-- name: ListAssets :many
+SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id, created_at FROM assets ORDER BY purchase_date, created_at
+`
+
+func (q *Queries) ListAssets(ctx context.Context) ([]Asset, error) {
+	rows, err := q.db.Query(ctx, listAssets)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Asset{}
+	for rows.Next() {
+		var i Asset
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Name,
+			&i.ListPrice,
+			&i.PurchasePrice,
+			&i.PurchaseDate,
+			&i.FirstRegistration,
+			&i.PurchaseOdometerKm,
+			&i.AnnualDepreciation,
+			&i.KmDepreciation,
+			&i.ExpectedKmPerYear,
+			&i.PurchaseTransactionID,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1323,7 +1522,7 @@ func (q *Queries) ListLatestPrices(ctx context.Context) ([]ListLatestPricesRow, 
 }
 
 const listNetWorthIntraday = `-- name: ListNetWorthIntraday :many
-SELECT recorded_at, total, cash_component, investment_component FROM net_worth_intraday
+SELECT recorded_at, total, cash_component, investment_component, physical_component FROM net_worth_intraday
 WHERE recorded_at >= $1
 ORDER BY recorded_at ASC
 `
@@ -1342,6 +1541,7 @@ func (q *Queries) ListNetWorthIntraday(ctx context.Context, recordedAt time.Time
 			&i.Total,
 			&i.CashComponent,
 			&i.InvestmentComponent,
+			&i.PhysicalComponent,
 		); err != nil {
 			return nil, err
 		}
@@ -1354,7 +1554,7 @@ func (q *Queries) ListNetWorthIntraday(ctx context.Context, recordedAt time.Time
 }
 
 const listNetWorthSnapshots = `-- name: ListNetWorthSnapshots :many
-SELECT date, total, cash_component, investment_component FROM net_worth_snapshots ORDER BY date DESC LIMIT $1
+SELECT date, total, cash_component, investment_component, physical_component FROM net_worth_snapshots ORDER BY date DESC LIMIT $1
 `
 
 func (q *Queries) ListNetWorthSnapshots(ctx context.Context, limit int32) ([]NetWorthSnapshot, error) {
@@ -1371,6 +1571,7 @@ func (q *Queries) ListNetWorthSnapshots(ctx context.Context, limit int32) ([]Net
 			&i.Total,
 			&i.CashComponent,
 			&i.InvestmentComponent,
+			&i.PhysicalComponent,
 		); err != nil {
 			return nil, err
 		}
@@ -2106,6 +2307,61 @@ func (q *Queries) UpdateAccount(ctx context.Context, arg UpdateAccountParams) er
 	return err
 }
 
+const updateAsset = `-- name: UpdateAsset :one
+UPDATE assets SET name = $2, list_price = $3, purchase_price = $4, purchase_date = $5,
+    first_registration = $6, purchase_odometer_km = $7, annual_depreciation = $8,
+    km_depreciation = $9, expected_km_per_year = $10, purchase_transaction_id = $11
+WHERE id = $1
+RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id, created_at
+`
+
+type UpdateAssetParams struct {
+	ID                    uuid.UUID      `json:"id"`
+	Name                  string         `json:"name"`
+	ListPrice             pgtype.Numeric `json:"list_price"`
+	PurchasePrice         pgtype.Numeric `json:"purchase_price"`
+	PurchaseDate          time.Time      `json:"purchase_date"`
+	FirstRegistration     pgtype.Date    `json:"first_registration"`
+	PurchaseOdometerKm    int32          `json:"purchase_odometer_km"`
+	AnnualDepreciation    pgtype.Numeric `json:"annual_depreciation"`
+	KmDepreciation        pgtype.Numeric `json:"km_depreciation"`
+	ExpectedKmPerYear     int32          `json:"expected_km_per_year"`
+	PurchaseTransactionID *uuid.UUID     `json:"purchase_transaction_id"`
+}
+
+func (q *Queries) UpdateAsset(ctx context.Context, arg UpdateAssetParams) (Asset, error) {
+	row := q.db.QueryRow(ctx, updateAsset,
+		arg.ID,
+		arg.Name,
+		arg.ListPrice,
+		arg.PurchasePrice,
+		arg.PurchaseDate,
+		arg.FirstRegistration,
+		arg.PurchaseOdometerKm,
+		arg.AnnualDepreciation,
+		arg.KmDepreciation,
+		arg.ExpectedKmPerYear,
+		arg.PurchaseTransactionID,
+	)
+	var i Asset
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Name,
+		&i.ListPrice,
+		&i.PurchasePrice,
+		&i.PurchaseDate,
+		&i.FirstRegistration,
+		&i.PurchaseOdometerKm,
+		&i.AnnualDepreciation,
+		&i.KmDepreciation,
+		&i.ExpectedKmPerYear,
+		&i.PurchaseTransactionID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const updateFinancialGoal = `-- name: UpdateFinancialGoal :exec
 UPDATE financial_goals SET name = $2, target_amount = $3, target_date = $4,
     monthly_contribution = $5, assumed_return_pct = $6, funding_account_id = $7, priority = $8, updated_at = now()
@@ -2256,6 +2512,43 @@ func (q *Queries) UpdateUserActive(ctx context.Context, arg UpdateUserActivePara
 	return err
 }
 
+const upsertAssetObservation = `-- name: UpsertAssetObservation :one
+INSERT INTO asset_observations (asset_id, date, odometer_km, appraised_value, note)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (asset_id, date) DO UPDATE SET
+    odometer_km = EXCLUDED.odometer_km,
+    appraised_value = EXCLUDED.appraised_value,
+    note = EXCLUDED.note
+RETURNING asset_id, date, odometer_km, appraised_value, note
+`
+
+type UpsertAssetObservationParams struct {
+	AssetID        uuid.UUID      `json:"asset_id"`
+	Date           time.Time      `json:"date"`
+	OdometerKm     pgtype.Int4    `json:"odometer_km"`
+	AppraisedValue pgtype.Numeric `json:"appraised_value"`
+	Note           pgtype.Text    `json:"note"`
+}
+
+func (q *Queries) UpsertAssetObservation(ctx context.Context, arg UpsertAssetObservationParams) (AssetObservation, error) {
+	row := q.db.QueryRow(ctx, upsertAssetObservation,
+		arg.AssetID,
+		arg.Date,
+		arg.OdometerKm,
+		arg.AppraisedValue,
+		arg.Note,
+	)
+	var i AssetObservation
+	err := row.Scan(
+		&i.AssetID,
+		&i.Date,
+		&i.OdometerKm,
+		&i.AppraisedValue,
+		&i.Note,
+	)
+	return i, err
+}
+
 const upsertETFHolding = `-- name: UpsertETFHolding :exec
 INSERT INTO etf_holdings (etf_isin, holding_isin, holding_name, weight_pct, sector, country, as_of_date)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -2331,12 +2624,13 @@ func (q *Queries) UpsertMarketData(ctx context.Context, arg UpsertMarketDataPara
 }
 
 const upsertNetWorthSnapshot = `-- name: UpsertNetWorthSnapshot :exec
-INSERT INTO net_worth_snapshots (date, total, cash_component, investment_component)
-VALUES ($1, $2, $3, $4)
+INSERT INTO net_worth_snapshots (date, total, cash_component, investment_component, physical_component)
+VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (date) DO UPDATE SET
     total = EXCLUDED.total,
     cash_component = EXCLUDED.cash_component,
-    investment_component = EXCLUDED.investment_component
+    investment_component = EXCLUDED.investment_component,
+    physical_component = EXCLUDED.physical_component
 `
 
 type UpsertNetWorthSnapshotParams struct {
@@ -2344,6 +2638,7 @@ type UpsertNetWorthSnapshotParams struct {
 	Total               pgtype.Numeric `json:"total"`
 	CashComponent       pgtype.Numeric `json:"cash_component"`
 	InvestmentComponent pgtype.Numeric `json:"investment_component"`
+	PhysicalComponent   pgtype.Numeric `json:"physical_component"`
 }
 
 func (q *Queries) UpsertNetWorthSnapshot(ctx context.Context, arg UpsertNetWorthSnapshotParams) error {
@@ -2352,6 +2647,7 @@ func (q *Queries) UpsertNetWorthSnapshot(ctx context.Context, arg UpsertNetWorth
 		arg.Total,
 		arg.CashComponent,
 		arg.InvestmentComponent,
+		arg.PhysicalComponent,
 	)
 	return err
 }

@@ -282,6 +282,7 @@ func (h *PortfolioHandler) HandleNetWorthIntraday(w http.ResponseWriter, r *http
 		Total               float64   `json:"total"`
 		CashComponent       float64   `json:"cash_component"`
 		InvestmentComponent float64   `json:"investment_component"`
+		PhysicalComponent   float64   `json:"physical_component"`
 	}
 	points := make([]point, 0, len(rows))
 	for _, r := range rows {
@@ -290,6 +291,7 @@ func (h *PortfolioHandler) HandleNetWorthIntraday(w http.ResponseWriter, r *http
 			Total:               numericToFloat(r.Total),
 			CashComponent:       numericToFloat(r.CashComponent),
 			InvestmentComponent: numericToFloat(r.InvestmentComponent),
+			PhysicalComponent:   numericToFloat(r.PhysicalComponent),
 		})
 	}
 
@@ -585,11 +587,9 @@ func (h *PortfolioHandler) HandlePerformance(w http.ResponseWriter, r *http.Requ
 		if snapshots[i].Date.Before(oneYearAgo) {
 			continue
 		}
-		val := 0.0
-		if snapshots[i].Total.Valid {
-			f, _ := snapshots[i].Total.Float64Value()
-			val = f.Float64
-		}
+		// Physical assets are excluded: their purchase stays a withdrawal in
+		// twrCashflows, so depreciation must not read as a portfolio loss.
+		val := investableNetWorth(snapshots[i])
 		if val < 100 {
 			continue
 		}
@@ -791,11 +791,7 @@ func (h *PortfolioHandler) HandlePerformanceHistory(w http.ResponseWriter, r *ht
 			eventIdx++
 		}
 
-		total := 0.0
-		if snap.Total.Valid {
-			f, _ := snap.Total.Float64Value()
-			total = f.Float64
-		}
+		total := investableNetWorth(snap)
 
 		// Return is on total capital deployed (cash + in-kind at FMV) — RSU
 		// vests are real wealth the user received, not market gains.
@@ -1755,11 +1751,9 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 		})
 		return
 	}
-	currentValue := 0.0
-	if snaps[0].Total.Valid {
-		f, _ := snaps[0].Total.Float64Value()
-		currentValue = f.Float64
-	}
+	// Projections compound at a market return, which a depreciating car
+	// doesn't earn — project investable wealth only.
+	currentValue := investableNetWorth(snaps[0])
 
 	// Get historical net worth (yearly samples)
 	allSnaps, _ := h.queries.ListNetWorthSnapshots(ctx, 5000)
@@ -1772,11 +1766,7 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 	// Snapshots are newest-first; reverse for chronological
 	for i := len(allSnaps) - 1; i >= 0; i-- {
 		s := allSnaps[i]
-		val := 0.0
-		if s.Total.Valid {
-			f, _ := s.Total.Float64Value()
-			val = f.Float64
-		}
+		val := investableNetWorth(s)
 		month := s.Date.Format("2006-01")
 		if month != lastYear {
 			history = append(history, histPoint{Date: month, Value: math.Round(val)})
@@ -2269,6 +2259,11 @@ func (h *PortfolioHandler) HandleSavingsRate(w http.ResponseWriter, r *http.Requ
 		// Auto-wires from MS RSU sales are model artifacts (the cash never sat in
 		// the account); excluding them keeps the invested/savings metric honest.
 		if txn.Counterparty.Valid && strings.HasPrefix(txn.Counterparty.String, "Morgan Stanley (auto-wire of") {
+			continue
+		}
+		// Paying for a tracked asset (car) converts cash into an asset; it is
+		// not dissaving. The real cost shows up as depreciation instead.
+		if isAssetPurchase(txn.Category) {
 			continue
 		}
 		month := txn.Date.Format("2006-01")
@@ -3193,11 +3188,7 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusOK, map[string]any{"baseline": []any{}, "with_events": []any{}})
 		return
 	}
-	currentValue := 0.0
-	if snaps[0].Total.Valid {
-		f, _ := snaps[0].Total.Float64Value()
-		currentValue = f.Float64
-	}
+	currentValue := investableNetWorth(snaps[0])
 
 	// Defaults
 	monthlyContrib := req.Contribution
@@ -3700,9 +3691,8 @@ func (h *PortfolioHandler) HandlePensionGap(w http.ResponseWriter, r *http.Reque
 	portfolioMonthly := 0.0
 	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 1)
 	currentValue := 0.0
-	if len(snaps) > 0 && snaps[0].Total.Valid {
-		f, _ := snaps[0].Total.Float64Value()
-		currentValue = f.Float64
+	if len(snaps) > 0 {
+		currentValue = investableNetWorth(snaps[0])
 	}
 	// Project portfolio value to retirement
 	yearsToRetirement := req.RetirementAge - req.CurrentAge
@@ -3990,6 +3980,7 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 		})
 	}
 	washed := analytics.MatchInKindTransferPairs(inkind)
+	physical := h.loadAssetAttribution(ctx)
 
 	// Aggregate transaction components
 	deposits := 0.0
@@ -4023,6 +4014,9 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 		if _, isWash := washed[txn.ID]; isWash {
 			continue
 		}
+		if physical.linked[txn.ID] {
+			continue // cash → car swap; the car's value change is its own bar
+		}
 		switch analytics.ClassifyForAttribution(txn.Type, txn.SecurityISIN.Valid, analytics.ScopePortfolio) {
 		case analytics.BucketContribution:
 			deposits += amt
@@ -4043,13 +4037,21 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 	// market-return bar is now derived from explicit holdings price-deltas).
 	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 1)
 	currentNW := 0.0
+	currentPhysical := 0.0
 	if len(snaps) > 0 && snaps[0].Total.Valid {
 		f, _ := snaps[0].Total.Float64Value()
 		currentNW = f.Float64
+		currentPhysical = numericToFloat(snaps[0].PhysicalComponent)
 	}
 
-	// Net contributions = deposits - withdrawals
-	netContributions := deposits - withdrawals
+	// Net contributions = deposits - withdrawals (+ assets bought with money
+	// the tracker never saw, which enter net worth in kind).
+	now := time.Now()
+	allPurchases, unlinkedPurchases := physical.purchasesIn(time.Time{}, now)
+	netContributions := deposits - withdrawals + unlinkedPurchases
+	// Physical assets: modelled value minus what was paid, i.e. accumulated
+	// depreciation (or appreciation via appraisals).
+	assetValueChange := currentPhysical - allPurchases
 
 	// Build monthly NW + classifier-based contribution / dividend / interest
 	// maps. NW is the LATEST snapshot inside each month (ListNetWorthSnapshots
@@ -4058,6 +4060,7 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 	// upward on intra-month peaks, breaking the reconciliation identity.
 	allSnaps, _ := h.queries.ListNetWorthSnapshots(ctx, 5000)
 	monthNW := make(map[string]float64)
+	monthPhysical := make(map[string]float64)
 	for _, s := range allSnaps {
 		m := s.Date.Format("2006-01")
 		val := 0.0
@@ -4067,14 +4070,29 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 		}
 		if _, exists := monthNW[m]; !exists {
 			monthNW[m] = val
+			monthPhysical[m] = numericToFloat(s.PhysicalComponent)
 		}
 	}
 
 	monthContrib := make(map[string]float64)
 	monthDiv := make(map[string]float64)
 	monthInt := make(map[string]float64)
+	monthPurchases := make(map[string]float64)
+	for _, a := range physical.assets {
+		if a.PurchaseDate.After(now) {
+			continue
+		}
+		m := a.PurchaseDate.Format("2006-01")
+		monthPurchases[m] += a.Model.PurchasePrice
+		if a.PurchaseTransactionID == nil {
+			monthContrib[m] += a.Model.PurchasePrice
+		}
+	}
 	for _, txn := range txns {
 		if _, isWash := washed[txn.ID]; isWash {
+			continue
+		}
+		if physical.linked[txn.ID] {
 			continue
 		}
 		m := txn.Date.Format("2006-01")
@@ -4117,7 +4135,7 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 	// market returns mirroring the contribution amount). The residual is
 	// robust by construction: the time-series stacked area always sums to the
 	// actual NW snapshot at month-end.
-	marketReturns := currentNW - netContributions - dividends - interest + math.Abs(fees) + math.Abs(taxes)
+	marketReturns := currentNW - netContributions - dividends - interest + math.Abs(fees) + math.Abs(taxes) - assetValueChange
 
 	// Waterfall bars
 	type waterfallBar struct {
@@ -4136,12 +4154,21 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 	waterfall := []waterfallBar{
 		{"Contributions", math.Round(netContributions), "positive"},
 		{"Market Returns", math.Round(marketReturns), mrType},
-		{"Dividends", math.Round(dividends), "positive"},
-		{"Interest", math.Round(interest), "positive"},
-		{"Fees", math.Round(feeVal), feeType},
-		{"Taxes", math.Round(taxVal), taxType},
-		{"Net Worth", math.Round(currentNW), "total"},
 	}
+	if len(physical.assets) > 0 {
+		vType := "negative"
+		if assetValueChange >= 0 {
+			vType = "positive"
+		}
+		waterfall = append(waterfall, waterfallBar{"Vehicles", math.Round(assetValueChange), vType})
+	}
+	waterfall = append(waterfall,
+		waterfallBar{"Dividends", math.Round(dividends), "positive"},
+		waterfallBar{"Interest", math.Round(interest), "positive"},
+		waterfallBar{"Fees", math.Round(feeVal), feeType},
+		waterfallBar{"Taxes", math.Round(taxVal), taxType},
+		waterfallBar{"Net Worth", math.Round(currentNW), "total"},
+	)
 
 	// Attribution over time — monthly stacked area
 	type monthAttrib struct {
@@ -4150,6 +4177,7 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 		MarketReturn  float64 `json:"market_return"`
 		Dividends     float64 `json:"dividends"`
 		Interest      float64 `json:"interest"`
+		Assets        float64 `json:"assets"` // physical asset value change (depreciation)
 		Total         float64 `json:"total"`
 	}
 
@@ -4157,25 +4185,28 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 	cumContrib := 0.0
 	cumDiv := 0.0
 	cumInt := 0.0
+	cumPurchases := 0.0
 	crossoverMonth := ""
 	for _, m := range months {
 		cumContrib += monthContrib[m]
 		cumDiv += monthDiv[m]
 		cumInt += monthInt[m]
+		cumPurchases += monthPurchases[m]
 		nw := monthNW[m]
 		if nw == 0 {
 			continue
 		}
+		cumAssets := monthPhysical[m] - cumPurchases
 		// Market return is the residual that closes the identity: whatever
 		// portion of NW isn't explained by contributions/dividends/interest is
 		// market+fees+taxes (folded together because fees/taxes aren't broken
 		// out per month here). This guarantees the stacked area sums to the
 		// actual NW snapshot, instead of drifting due to missing price data.
-		cumMR := nw - cumContrib - cumDiv - cumInt
+		cumMR := nw - cumContrib - cumDiv - cumInt - cumAssets
 		timeSeries = append(timeSeries, monthAttrib{
 			Month: m, Contributions: math.Round(cumContrib),
 			MarketReturn: math.Round(cumMR), Dividends: math.Round(cumDiv),
-			Interest: math.Round(cumInt), Total: math.Round(nw),
+			Interest: math.Round(cumInt), Assets: math.Round(cumAssets), Total: math.Round(nw),
 		})
 		// Crossover: cumulative returns surpass cumulative contributions
 		// (gate on >10k contributed to avoid early-month artifacts).
@@ -4194,6 +4225,7 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 		"interest":         math.Round(interest),
 		"fees":             math.Round(fees),
 		"taxes":            math.Round(taxes),
+		"asset_value_change": math.Round(assetValueChange),
 		"current_nw":       math.Round(currentNW),
 		// Reconciliation: the identity is NW = contrib + market + div + int -
 		// fees - taxes. expected_nw is what the components sum to; the gap is
@@ -4201,8 +4233,8 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 		// usually means a stale snapshot, an FX swing on idle cash, or a fee/
 		// tax-at-source the classifier doesn't see — surfaced here so the
 		// frontend (or QA) can flag drift that exceeds the EUR 1 tolerance.
-		"expected_nw":        math.Round(netContributions + marketReturns + dividends + interest - math.Abs(fees) - math.Abs(taxes)),
-		"reconciliation_gap": math.Round(currentNW - (netContributions + marketReturns + dividends + interest - math.Abs(fees) - math.Abs(taxes))),
+		"expected_nw":        math.Round(netContributions + marketReturns + assetValueChange + dividends + interest - math.Abs(fees) - math.Abs(taxes)),
+		"reconciliation_gap": math.Round(currentNW - (netContributions + marketReturns + assetValueChange + dividends + interest - math.Abs(fees) - math.Abs(taxes))),
 	})
 }
 
@@ -4361,10 +4393,12 @@ func (h *PortfolioHandler) HandleTimeMachine(w http.ResponseWriter, r *http.Requ
 	// Get net worth snapshot closest to target date
 	allSnaps, _ := h.queries.ListNetWorthSnapshots(ctx, 5000)
 	historicalNW := totalValue
+	historicalPhysical := 0.0
 	for _, s := range allSnaps {
 		if !s.Date.After(targetDate) && s.Total.Valid {
 			f, _ := s.Total.Float64Value()
 			historicalNW = f.Float64
+			historicalPhysical = numericToFloat(s.PhysicalComponent)
 			break // newest first, so first match is closest
 		}
 	}
@@ -4382,9 +4416,11 @@ func (h *PortfolioHandler) HandleTimeMachine(w http.ResponseWriter, r *http.Requ
 	}
 	currentSnaps, _ := h.queries.ListNetWorthSnapshots(ctx, 1)
 	currentNW := currentValue
+	currentPhysical := 0.0
 	if len(currentSnaps) > 0 && currentSnaps[0].Total.Valid {
 		f, _ := currentSnaps[0].Total.Float64Value()
 		currentNW = f.Float64
+		currentPhysical = numericToFloat(currentSnaps[0].PhysicalComponent)
 	}
 
 	// Attribution of change (target_date → now) via the same classifier
@@ -4410,7 +4446,14 @@ func (h *PortfolioHandler) HandleTimeMachine(w http.ResponseWriter, r *http.Requ
 	}
 	washed := analytics.MatchInKindTransferPairs(inkind)
 
-	netContribSince := 0.0
+	// Physical assets: linked purchase payments are swaps, unlinked
+	// purchases are in-kind contributions, and the rest of the physical
+	// component's change is depreciation.
+	physical := h.loadAssetAttribution(ctx)
+	purchasedSince, unlinkedSince := physical.purchasesIn(targetDate, time.Now())
+	assetChangeSince := currentPhysical - historicalPhysical - purchasedSince
+
+	netContribSince := unlinkedSince
 	dividendsSince := 0.0
 	interestSince := 0.0
 	feesSince := 0.0
@@ -4440,6 +4483,9 @@ func (h *PortfolioHandler) HandleTimeMachine(w http.ResponseWriter, r *http.Requ
 		if _, isWash := washed[txn.ID]; isWash {
 			continue
 		}
+		if physical.linked[txn.ID] {
+			continue
+		}
 		switch analytics.ClassifyForAttribution(txn.Type, txn.SecurityISIN.Valid, analytics.ScopePortfolio) {
 		case analytics.BucketContribution:
 			netContribSince += amt
@@ -4459,7 +4505,7 @@ func (h *PortfolioHandler) HandleTimeMachine(w http.ResponseWriter, r *http.Requ
 	// Identity: nwChange = contrib + market + div + int - |fees| - |taxes|.
 	// market_return is the residual; locked to satisfy this identity within
 	// FP tolerance so the response self-reconciles.
-	marketReturn := nwChange - netContribSince - dividendsSince - interestSince + math.Abs(feesSince) + math.Abs(taxesSince)
+	marketReturn := nwChange - netContribSince - dividendsSince - interestSince + math.Abs(feesSince) + math.Abs(taxesSince) - assetChangeSince
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"date":             dateStr,
@@ -4477,6 +4523,7 @@ func (h *PortfolioHandler) HandleTimeMachine(w http.ResponseWriter, r *http.Requ
 			"net_worth_pct":    math.Round(nwChange/math.Max(historicalNW, 1)*10000) / 100,
 			"contributions":    math.Round(netContribSince),
 			"market_return":    math.Round(marketReturn),
+			"assets":           math.Round(assetChangeSince),
 			"dividends":        math.Round(dividendsSince),
 			"interest":         math.Round(interestSince),
 			"fees":             math.Round(feesSince),

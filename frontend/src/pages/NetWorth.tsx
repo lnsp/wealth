@@ -6,6 +6,7 @@ import { TabBar } from '../components/ui';
 import { useThemeColors } from '../hooks/useThemeColors';
 import { useMarketRefresh } from '../hooks/useMarketRefresh';
 import UnvestedPanel from '../components/UnvestedPanel';
+import AssetsPanel from '../components/AssetsPanel';
 
 type Period = '1D' | '1W' | '1M' | '3M' | '6M' | 'YTD' | '1Y' | 'All';
 const PERIODS: Period[] = ['1D', '1W', '1M', '3M', '6M', 'YTD', '1Y', 'All'];
@@ -87,8 +88,8 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
   const [attributionTotal, setAttributionTotal] = useState<number | null>(null);
   const [showAttribution, setShowAttribution] = useState(false);
   const [activeTab, setActiveTab] = useState<NWTab>(defaultTab || 'overview');
-  const [wfData, setWfData] = useState<{ waterfall: { label: string; value: number; type: string }[]; time_series: { month: string; contributions: number; market_return: number; dividends: number; interest: number; total: number }[]; crossover_month: string; net_contributions: number; market_returns: number; dividends: number; current_nw: number } | null>(null);
-  const [intradayPoints, setIntradayPoints] = useState<{ recorded_at: string; total: number; cash_component: number; investment_component: number }[]>([]);
+  const [wfData, setWfData] = useState<{ waterfall: { label: string; value: number; type: string }[]; time_series: { month: string; contributions: number; market_return: number; dividends: number; interest: number; assets?: number; total: number }[]; crossover_month: string; net_contributions: number; market_returns: number; dividends: number; current_nw: number } | null>(null);
+  const [intradayPoints, setIntradayPoints] = useState<{ recorded_at: string; total: number; cash_component: number; investment_component: number; physical_component: number }[]>([]);
 
   const [holdings, setHoldings] = useState<HoldingRow[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -188,14 +189,17 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
   }, [allSnapshots, period]);
 
   const totalNetWorth = allSnapshots.length > 0 ? allSnapshots[0].total : 0;
+  // Vehicles at their modelled depreciated value (part of the snapshot total)
+  const physicalValue = allSnapshots.length > 0 ? (allSnapshots[0].physical_component ?? 0) : 0;
 
-  // Liquid net worth: exclude illiquid asset types (real estate, pension)
+  // Liquid net worth: exclude illiquid asset types (real estate, pension).
+  // Vehicles aren't accounts, so they're already outside this sum.
   const illiquidTypes = new Set(['real_estate', 'pension', 'liability']);
   const liquidNetWorth = accounts.reduce((sum, acc) => {
     if (illiquidTypes.has(acc.type)) return sum;
     return sum + (acc.balance ?? 0);
   }, 0);
-  const hasIlliquid = accounts.some(acc => illiquidTypes.has(acc.type));
+  const hasIlliquid = accounts.some(acc => illiquidTypes.has(acc.type)) || physicalValue > 0;
 
   // Period change: compare newest vs oldest in filtered range
   const periodStart = snapshots.length > 1 ? snapshots[snapshots.length - 1].total : totalNetWorth;
@@ -223,6 +227,7 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
         total: p.total,
         cash_component: p.cash_component,
         investment_component: p.investment_component,
+        physical_component: p.physical_component ?? 0,
       }));
     }
     const isWeekday = (d: string) => { const day = new Date(d).getDay(); return day !== 0 && day !== 6; };
@@ -302,6 +307,16 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
         showSymbol: false,
         lineStyle: { width: 2 },
       },
+      ...(chartSnapshots.some(s => (s.physical_component ?? 0) > 0) ? [{
+        name: 'Vehicles',
+        type: 'line' as const,
+        stack: 'total',
+        areaStyle: { opacity: 0.3 },
+        data: chartSnapshots.map((s) => s.physical_component ?? 0),
+        smooth: 0.4,
+        showSymbol: false,
+        lineStyle: { width: 2 },
+      }] : []),
     ],
     grid: { left: 55, right: 16, top: 16, bottom: 36 },
   };
@@ -641,9 +656,11 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
       {wfData && wfData.time_series && wfData.time_series.length > 1 && (() => {
         const hasDiv = wfData.time_series.some(t => Math.abs(t.dividends) >= 1);
         const hasInt = wfData.time_series.some(t => Math.abs(t.interest) >= 1);
+        const hasAssets = wfData.time_series.some(t => Math.abs(t.assets ?? 0) >= 1);
         const legendData = ['Contributions', 'Market Returns'];
         if (hasDiv) legendData.push('Dividends');
         if (hasInt) legendData.push('Interest');
+        if (hasAssets) legendData.push('Vehicles');
         return (
           <div className="border-t border-divider pt-6 py-3 md:py-5">
             <h3 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Growth Over Time</h3>
@@ -664,6 +681,9 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
                 { name: 'Market Returns', type: 'line' as const, stack: 'attr', areaStyle: { opacity: 0.45, color: tc.sage }, data: wfData.time_series.map(t => t.market_return), itemStyle: { color: tc.sage }, showSymbol: false, lineStyle: { width: 1, color: tc.sage } },
                 ...(hasDiv ? [{ name: 'Dividends', type: 'line' as const, stack: 'attr', areaStyle: { opacity: 0.45, color: tc.gold }, data: wfData.time_series.map(t => t.dividends), itemStyle: { color: tc.gold }, showSymbol: false, lineStyle: { width: 1, color: tc.gold } }] : []),
                 ...(hasInt ? [{ name: 'Interest', type: 'line' as const, stack: 'attr', areaStyle: { opacity: 0.45, color: tc.walnut }, data: wfData.time_series.map(t => t.interest), itemStyle: { color: tc.walnut }, showSymbol: false, lineStyle: { width: 1, color: tc.walnut } }] : []),
+                // Vehicle value change is usually negative (depreciation), so
+                // it sits on its own stack below the zero line.
+                ...(hasAssets ? [{ name: 'Vehicles', type: 'line' as const, stack: 'assets', areaStyle: { opacity: 0.45, color: tc.claret }, data: wfData.time_series.map(t => t.assets ?? 0), itemStyle: { color: tc.claret }, showSymbol: false, lineStyle: { width: 1, color: tc.claret } }] : []),
               ],
             }} height="220px" />
             {wfData.crossover_month && (
@@ -710,6 +730,7 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
         for (const h of holdings) {
           add(assetClassLabels[h.asset_class] || 'Other', h.value_eur ?? h.market_value ?? 0);
         }
+        add('Vehicles', physicalValue);
         const entries = Object.entries(byClass).filter(([, v]) => v !== 0).sort(([, a], [, b]) => Math.abs(b) - Math.abs(a));
         if (entries.length < 2) return null;
         return (
@@ -1380,6 +1401,8 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
           <EChartWrapper option={chartOption} height="280px" />
         </div>
       )}
+
+      <AssetsPanel onChanged={loadData} />
 
       {/* Counterparty Exposure */}
       {accounts.length > 0 && (

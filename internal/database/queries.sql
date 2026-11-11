@@ -167,19 +167,20 @@ ON CONFLICT (etf_isin, holding_isin) DO UPDATE SET
 SELECT * FROM etf_holdings WHERE etf_isin = $1 ORDER BY weight_pct DESC;
 
 -- name: UpsertNetWorthSnapshot :exec
-INSERT INTO net_worth_snapshots (date, total, cash_component, investment_component)
-VALUES ($1, $2, $3, $4)
+INSERT INTO net_worth_snapshots (date, total, cash_component, investment_component, physical_component)
+VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (date) DO UPDATE SET
     total = EXCLUDED.total,
     cash_component = EXCLUDED.cash_component,
-    investment_component = EXCLUDED.investment_component;
+    investment_component = EXCLUDED.investment_component,
+    physical_component = EXCLUDED.physical_component;
 
 -- name: ListNetWorthSnapshots :many
 SELECT * FROM net_worth_snapshots ORDER BY date DESC LIMIT $1;
 
 -- name: InsertNetWorthIntraday :exec
-INSERT INTO net_worth_intraday (recorded_at, total, cash_component, investment_component)
-VALUES ($1, $2, $3, $4);
+INSERT INTO net_worth_intraday (recorded_at, total, cash_component, investment_component, physical_component)
+VALUES ($1, $2, $3, $4, $5);
 
 -- name: ListNetWorthIntraday :many
 SELECT * FROM net_worth_intraday
@@ -411,3 +412,43 @@ ORDER BY t.date DESC;
 
 -- name: UpdateTransactionCategory :exec
 UPDATE transactions SET category = $2 WHERE id = $1;
+
+-- name: ListAssets :many
+SELECT * FROM assets ORDER BY purchase_date, created_at;
+
+-- name: GetAsset :one
+SELECT * FROM assets WHERE id = $1;
+
+-- name: CreateAsset :one
+INSERT INTO assets (kind, name, list_price, purchase_price, purchase_date, first_registration,
+    purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING *;
+
+-- name: UpdateAsset :one
+UPDATE assets SET name = $2, list_price = $3, purchase_price = $4, purchase_date = $5,
+    first_registration = $6, purchase_odometer_km = $7, annual_depreciation = $8,
+    km_depreciation = $9, expected_km_per_year = $10, purchase_transaction_id = $11
+WHERE id = $1
+RETURNING *;
+
+-- name: DeleteAsset :exec
+DELETE FROM assets WHERE id = $1;
+
+-- name: ListAssetObservations :many
+SELECT * FROM asset_observations ORDER BY asset_id, date;
+
+-- name: UpsertAssetObservation :one
+INSERT INTO asset_observations (asset_id, date, odometer_km, appraised_value, note)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (asset_id, date) DO UPDATE SET
+    odometer_km = EXCLUDED.odometer_km,
+    appraised_value = EXCLUDED.appraised_value,
+    note = EXCLUDED.note
+RETURNING *;
+
+-- name: DeleteAssetObservation :exec
+DELETE FROM asset_observations WHERE asset_id = $1 AND date = $2;
+
+-- name: GetTransaction :one
+SELECT * FROM transactions WHERE id = $1;

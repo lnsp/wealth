@@ -140,6 +140,7 @@ func main() {
 	settingsH := handler.NewSettingsHandler(queries)
 	alertsH := handler.NewAlertsHandler(queries)
 	reportsH := handler.NewReportsHandler(queries)
+	assetsH := handler.NewAssetsHandler(queries, sched)
 	usersH := handler.NewUsersHandler(queries, authInstance, cfg.SessionSecret)
 
 	// WebAuthn (passkey) handler — derive RP ID and origin from BASE_URL
@@ -222,6 +223,13 @@ func main() {
 			r.Get("/portfolio/time-machine", portfolioH.HandleTimeMachine)
 			r.Post("/portfolio/pension-gap", portfolioH.HandlePensionGap)
 			r.Get("/portfolio/unvested", portfolioH.HandleUnvested)
+
+			r.Get("/assets", assetsH.HandleList)
+			r.Post("/assets", assetsH.HandleCreate)
+			r.Put("/assets/{id}", assetsH.HandleUpdate)
+			r.Delete("/assets/{id}", assetsH.HandleDelete)
+			r.Put("/assets/{id}/observations", assetsH.HandleUpsertObservation)
+			r.Delete("/assets/{id}/observations/{date}", assetsH.HandleDeleteObservation)
 
 			r.Get("/analysis/summary", analysisH.HandleAllocationSummary)
 			r.Get("/analysis/sectors", analysisH.HandleSectors)

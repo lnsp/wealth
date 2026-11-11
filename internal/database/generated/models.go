@@ -27,6 +27,30 @@ type Account struct {
 	ImportSecurityISIN pgtype.Text    `json:"import_security_isin"`
 }
 
+type Asset struct {
+	ID                    uuid.UUID      `json:"id"`
+	Kind                  string         `json:"kind"`
+	Name                  string         `json:"name"`
+	ListPrice             pgtype.Numeric `json:"list_price"`
+	PurchasePrice         pgtype.Numeric `json:"purchase_price"`
+	PurchaseDate          time.Time      `json:"purchase_date"`
+	FirstRegistration     pgtype.Date    `json:"first_registration"`
+	PurchaseOdometerKm    int32          `json:"purchase_odometer_km"`
+	AnnualDepreciation    pgtype.Numeric `json:"annual_depreciation"`
+	KmDepreciation        pgtype.Numeric `json:"km_depreciation"`
+	ExpectedKmPerYear     int32          `json:"expected_km_per_year"`
+	PurchaseTransactionID *uuid.UUID     `json:"purchase_transaction_id"`
+	CreatedAt             time.Time      `json:"created_at"`
+}
+
+type AssetObservation struct {
+	AssetID        uuid.UUID      `json:"asset_id"`
+	Date           time.Time      `json:"date"`
+	OdometerKm     pgtype.Int4    `json:"odometer_km"`
+	AppraisedValue pgtype.Numeric `json:"appraised_value"`
+	Note           pgtype.Text    `json:"note"`
+}
+
 type BackfillJob struct {
 	Name        string             `json:"name"`
 	Status      string             `json:"status"`
@@ -110,6 +134,7 @@ type NetWorthIntraday struct {
 	Total               pgtype.Numeric `json:"total"`
 	CashComponent       pgtype.Numeric `json:"cash_component"`
 	InvestmentComponent pgtype.Numeric `json:"investment_component"`
+	PhysicalComponent   pgtype.Numeric `json:"physical_component"`
 }
 
 type NetWorthSnapshot struct {
@@ -117,6 +142,7 @@ type NetWorthSnapshot struct {
 	Total               pgtype.Numeric `json:"total"`
 	CashComponent       pgtype.Numeric `json:"cash_component"`
 	InvestmentComponent pgtype.Numeric `json:"investment_component"`
+	PhysicalComponent   pgtype.Numeric `json:"physical_component"`
 }
 
 type Notification struct {

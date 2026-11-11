@@ -105,6 +105,51 @@ export interface NetWorthSnapshot {
   total: number;
   cash_component: number;
   investment_component: number;
+  physical_component: number;
+}
+
+export interface AssetObservation {
+  date: string;
+  odometer_km: number | null;
+  appraised_value: number | null;
+  note: string;
+}
+
+export interface PhysicalAsset {
+  id: string;
+  kind: 'car';
+  name: string;
+  list_price: number | null;
+  purchase_price: number;
+  purchase_date: string;
+  first_registration: string | null;
+  purchase_odometer_km: number;
+  annual_depreciation: number;
+  km_depreciation: number;
+  expected_km_per_year: number;
+  purchase_transaction_id: string | null;
+  current_value: number;
+  value_change: number;
+  value_change_pct: number;
+  pct_of_list: number | null;
+  odometer_estimate_km: number;
+  effective_annual_rate: number;
+  monthly_depreciation: number;
+  observations: AssetObservation[];
+  curve: { date: string; value: number; projected: boolean }[];
+}
+
+export interface AssetInput {
+  name: string;
+  list_price?: number | null;
+  purchase_price: number;
+  purchase_date: string;
+  first_registration?: string;
+  purchase_odometer_km: number;
+  annual_depreciation?: number;
+  km_depreciation?: number;
+  expected_km_per_year?: number;
+  purchase_transaction_id?: string;
 }
 
 export interface ImportResult {
@@ -573,7 +618,19 @@ export const api = {
       `/portfolio/holdings${accountId ? `?account_id=${accountId}` : ''}`
     ),
   getNetWorth: (days = 365) => request<{ snapshots: NetWorthSnapshot[] }>(`/portfolio/networth?days=${days}`),
-  getNetWorthIntraday: () => request<{ points: { recorded_at: string; total: number; cash_component: number; investment_component: number }[] }>('/portfolio/networth/intraday'),
+  getNetWorthIntraday: () => request<{ points: { recorded_at: string; total: number; cash_component: number; investment_component: number; physical_component: number }[] }>('/portfolio/networth/intraday'),
+
+  // Physical assets (cars)
+  listAssets: () => request<{ assets: PhysicalAsset[]; total_value: number; defaults: { annual_depreciation: number; km_depreciation: number; expected_km_per_year: number } }>('/assets'),
+  createAsset: (input: AssetInput) =>
+    request<PhysicalAsset>('/assets', { method: 'POST', body: JSON.stringify(input) }),
+  updateAsset: (id: string, input: AssetInput) =>
+    request<PhysicalAsset>(`/assets/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
+  deleteAsset: (id: string) => request<{ status: string }>(`/assets/${id}`, { method: 'DELETE' }),
+  upsertAssetObservation: (id: string, obs: { date: string; odometer_km?: number; appraised_value?: number; note?: string }) =>
+    request<PhysicalAsset>(`/assets/${id}/observations`, { method: 'PUT', body: JSON.stringify(obs) }),
+  deleteAssetObservation: (id: string, date: string) =>
+    request<PhysicalAsset>(`/assets/${id}/observations/${date}`, { method: 'DELETE' }),
   getPerformance: (accountId?: string) =>
     request<PerformanceData>(`/portfolio/performance${accountId ? `?account_id=${accountId}` : ''}`),
   getPerformanceHistory: () => request<{ history: PerformanceHistoryPoint[] }>('/portfolio/performance-history'),

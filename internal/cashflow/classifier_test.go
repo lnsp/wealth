@@ -64,6 +64,7 @@ func TestBucketOf(t *testing.T) {
 		CatShopping:      BucketVariable,
 		CatInternal:      BucketTransfer,
 		CatInvestment:    BucketTransfer,
+		CatAssetPurchase: BucketTransfer,
 		CatOther:         BucketVariable,
 	}
 	for cat, want := range cases {

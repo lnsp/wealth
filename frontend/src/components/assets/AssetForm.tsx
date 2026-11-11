@@ -38,6 +38,7 @@ interface State {
   self_used: boolean;
   land_value: string;
   drift_pct: string;
+  price_index: string;
   useful_life_years: string;
   transaction_ids: string[];
 }
@@ -65,6 +66,7 @@ function stateFrom(a: PhysicalAsset | null, kind: AssetKind, d: AssetsOverview['
     self_used: a?.self_used ?? true,
     land_value: a?.land_value != null ? String(a.land_value) : '',
     drift_pct: String(+((a ? a.price_drift : propertyLike ? d.property_drift : 0) * 100).toFixed(2)),
+    price_index: a ? a.price_index : isProperty(kind) ? d.price_index : '',
     useful_life_years: String(a?.useful_life_years ?? d.useful_life_years),
     transaction_ids: a ? a.linked_transactions.filter(t => t.purpose === 'purchase').map(t => t.id) : [],
   };
@@ -91,6 +93,7 @@ function toInput(s: State): AssetInput {
     self_used: s.self_used,
     land_value: opt(s.land_value),
     price_drift: num(s.drift_pct) / 100,
+    price_index: isProperty(s.kind) ? s.price_index : '',
     useful_life_years: Math.round(num(s.useful_life_years)),
     transaction_ids: s.transaction_ids,
   };
@@ -128,9 +131,10 @@ function Section({ id, title, hint, children }: { id: string; title: string; hin
 
 const grid = { gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 190px), 1fr))' };
 
-export default function AssetForm({ asset, defaults, onSaved, onCancel }: {
+export default function AssetForm({ asset, defaults, indexes, onSaved, onCancel }: {
   asset: PhysicalAsset | null; // null = create
   defaults: AssetsOverview['defaults'];
+  indexes: AssetsOverview['price_indexes'];
   onSaved: (a: PhysicalAsset) => void;
   onCancel: () => void;
 }) {
@@ -376,8 +380,34 @@ export default function AssetForm({ asset, defaults, onSaved, onCancel }: {
                 </label>
               </div>
             ) : (
+              <>
+              {property && (
+                <fieldset className="flex flex-col gap-2 mb-3.5">
+                  <legend className="text-[12px] text-ink-muted mb-1">How prices move</legend>
+                  {indexes.map(ix => (
+                    <label key={ix.id} className="flex items-start gap-2 text-[14px] text-ink">
+                      <input type="radio" name="price-model" className="mt-1" checked={s.price_index === ix.id} onChange={() => setS({ ...s, price_index: ix.id })} />
+                      <span>
+                        Follow the {ix.label.charAt(0).toLowerCase() + ix.label.slice(1)}
+                        <span className="block text-[12px] text-ink-muted">
+                          Quarterly, latest {ix.latest_quarter}: {ix.latest_value.toLocaleString('de-DE', { minimumFractionDigits: 1 })}
+                          {ix.year_over_year != null && ` (${ix.year_over_year >= 0 ? '+' : ''}${fmtPct(ix.year_over_year * 100)} in a year)`}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
+                  {indexes.length === 0 && s.price_index !== '' && (
+                    <p className="text-[12px] text-amber">The house price index hasn't been loaded yet; the fixed change below applies until it is.</p>
+                  )}
+                  <label className="flex items-start gap-2 text-[14px] text-ink">
+                    <input type="radio" name="price-model" className="mt-1" checked={s.price_index === ''} onChange={() => setS({ ...s, price_index: '' })} />
+                    <span>Fixed yearly change<span className="block text-[12px] text-ink-muted">0 % = value only changes with appraisals and building age</span></span>
+                  </label>
+                </fieldset>
+              )}
               <div className="grid gap-x-5 gap-y-3.5" style={grid}>
-                <label className={labelCls} htmlFor="f-drift">Price change per year (%) — 0 = appraisals only
+                <label className={labelCls} htmlFor="f-drift">
+                  {property && s.price_index ? 'After the last published quarter (%/yr)' : 'Price change per year (%) — 0 = appraisals only'}
                   <input id="f-drift" className={fieldCls} type="number" min="-49" max="49" step="0.1" value={s.drift_pct} onChange={set('drift_pct')} />
                 </label>
                 {property && (
@@ -386,12 +416,13 @@ export default function AssetForm({ asset, defaults, onSaved, onCancel }: {
                   </label>
                 )}
               </div>
+              </>
             )}
             <p className="text-[12px] text-ink-muted mt-2.5">
               {kind === 'car'
                 ? 'Defaults come from 296 used ID.3 Pro S listings (AutoScout24, Nov 2026).'
                 : property
-                  ? 'The building loses value in a straight line over its useful life (80 years is standard for houses and apartments); both parts follow the price change. Appraisals re-anchor the value.'
+                  ? `The building loses value in a straight line over its useful life (80 years is standard for houses and apartments); land and building follow ${s.price_index ? 'the index (it holds building age constant, so the two don’t double-count)' : 'the yearly change'}. Appraisals re-anchor the value.`
                   : 'Appraisals re-anchor the value.'}
             </p>
           </Section>

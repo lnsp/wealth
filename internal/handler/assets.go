@@ -71,6 +71,35 @@ type carView struct {
 	EffectiveAnnualRate float64 `json:"effective_annual_rate"`
 }
 
+type indexInfoView struct {
+	ID            string   `json:"id"`
+	Label         string   `json:"label"`
+	LatestQuarter string   `json:"latest_quarter"`
+	LatestValue   float64  `json:"latest_value"`
+	YearOverYear  *float64 `json:"year_over_year"`
+}
+
+// indexInfo describes a stored index series, nil when it has no data yet.
+func indexInfo(id string, ix *analytics.PriceIndex) *indexInfoView {
+	last, ok := ix.Latest()
+	if !ok {
+		return nil
+	}
+	v := &indexInfoView{ID: id, LatestValue: last.Value}
+	for _, s := range assets.IndexSeriesList {
+		if s.ID == id {
+			v.Label = s.Label
+		}
+	}
+	q := last.Date.AddDate(0, -1, -15) // midpoint back to quarter start
+	v.LatestQuarter = fmt.Sprintf("%d-Q%d", q.Year(), (int(q.Month())+2)/3)
+	if yoy, ok := ix.YearOverYear(); ok {
+		y := math.Round(yoy*10000) / 10000
+		v.YearOverYear = &y
+	}
+	return v
+}
+
 type propertyView struct {
 	LandValueNow     float64 `json:"land_value_now"`
 	BuildingValueNow float64 `json:"building_value_now"`
@@ -100,6 +129,7 @@ type assetView struct {
 	YearBuilt          *int32   `json:"year_built"`
 	UsefulLifeYears    int32    `json:"useful_life_years"`
 	PriceDrift         float64  `json:"price_drift"`
+	PriceIndex         string   `json:"price_index"`
 	SelfUsed           bool     `json:"self_used"`
 	LivingAreaM2       *float64 `json:"living_area_m2"`
 
@@ -118,6 +148,7 @@ type assetView struct {
 
 	Car                *carView                `json:"car"`
 	Property           *propertyView           `json:"property"`
+	Index              *indexInfoView          `json:"index"` // set when following a price index
 	Observations       []assetObservationView  `json:"observations"`
 	Improvements       []assetImprovementView  `json:"improvements"`
 	LinkedTransactions []linkedTransactionView `json:"linked_transactions"`
@@ -202,7 +233,7 @@ func buildAssetView(a assets.Asset, loans []assets.Loan, now time.Time) assetVie
 		PurchaseOdometerKm: a.PurchaseOdometerKm, AnnualDepreciation: numericToFloat(a.AnnualDepreciation),
 		KmDepreciation: numericToFloat(a.KmDepreciation), ExpectedKmPerYear: a.ExpectedKmPerYear,
 		LandValue: optionalNumeric(a.LandValue), UsefulLifeYears: a.UsefulLifeYears,
-		PriceDrift: numericToFloat(a.PriceDrift), SelfUsed: a.SelfUsed, LivingAreaM2: optionalNumeric(a.LivingAreaM2),
+		PriceDrift: numericToFloat(a.PriceDrift), PriceIndex: a.Asset.PriceIndex, SelfUsed: a.SelfUsed, LivingAreaM2: optionalNumeric(a.LivingAreaM2),
 		CurrentValue: round2(cur), ValueChange: round2(cur - price), VsCostBasis: round2(cur - a.CostBasis()),
 		Owed: round2(owed), Yours: round2(cur - owed), LoanIDs: loanIDs,
 		Observations: make([]assetObservationView, 0, len(a.Observations)),
@@ -233,7 +264,7 @@ func buildAssetView(a assets.Asset, loans []assets.Loan, now time.Time) assetVie
 	if a.Property != nil && owned {
 		land, building := a.Property.Components(today)
 		next := a.ValueOn(today.AddDate(1, 0, 0)) - cur
-		prices := (land + building) * a.Property.Drift
+		prices := (land + building) * (a.Property.PriceGrowth(today, today.AddDate(1, 0, 0)) - 1)
 		pv := &propertyView{
 			LandValueNow: round2(land), BuildingValueNow: round2(building),
 			HasBuildingAging: a.Property.BuildingEnd > 0,
@@ -244,6 +275,9 @@ func buildAssetView(a assets.Asset, loans []assets.Loan, now time.Time) assetVie
 			pv.RemainingLife = math.Round(math.Max(0, remaining)*10) / 10
 		}
 		v.Property = pv
+		if a.Property.Index != nil {
+			v.Index = indexInfo(a.Asset.PriceIndex, a.Property.Index)
+		}
 	}
 	for _, o := range a.Observations {
 		ov := assetObservationView{Date: o.Date.Format("2006-01-02"), Note: o.Note.String}
@@ -332,8 +366,21 @@ func (h *AssetsHandler) HandleList(w http.ResponseWriter, r *http.Request) {
 			"expected_km_per_year": analytics.DefaultCarKmPerYear,
 			"property_drift":       analytics.DefaultPropertyDrift,
 			"useful_life_years":    analytics.DefaultBuildingUsefulLife,
+			"price_index":          assets.IndexEurostatDE,
 		},
+		"price_indexes": availableIndexes(holdings),
 	})
+}
+
+// availableIndexes lists index series with data, for the asset form.
+func availableIndexes(h assets.Holdings) []indexInfoView {
+	out := []indexInfoView{}
+	for _, s := range assets.IndexSeriesList {
+		if info := indexInfo(s.ID, h.Indexes[s.ID]); info != nil {
+			out = append(out, *info)
+		}
+	}
+	return out
 }
 
 func assetName(h assets.Holdings, id uuid.UUID) string {
@@ -363,6 +410,7 @@ type assetRequest struct {
 	YearBuilt          *int32       `json:"year_built"`
 	UsefulLifeYears    *int32       `json:"useful_life_years"`
 	PriceDrift         *float64     `json:"price_drift"`
+	PriceIndex         *string      `json:"price_index"` // nil = default for the kind, "" = fixed drift
 	SelfUsed           *bool        `json:"self_used"`
 	LivingAreaM2       *float64     `json:"living_area_m2"`
 	TransactionIDs     []string     `json:"transaction_ids"` // payments for the purchase
@@ -474,6 +522,14 @@ func (req assetRequest) validate() (assetParams, error) {
 	}
 	if req.LivingAreaM2 != nil && *req.LivingAreaM2 > 0 {
 		p.LivingAreaM2 = numericOf(*req.LivingAreaM2, "%.2f")
+	}
+	if req.PriceIndex != nil {
+		p.PriceIndex = *req.PriceIndex
+	} else if assets.IsProperty(kind) {
+		p.PriceIndex = assets.IndexEurostatDE
+	}
+	if p.PriceIndex != "" && (!assets.IsProperty(kind) || !assets.KnownIndex(p.PriceIndex)) {
+		return p, errors.New("price_index is only supported for apartments and houses")
 	}
 	if assets.IsProperty(kind) {
 		if req.YearBuilt == nil || *req.YearBuilt < 1000 || *req.YearBuilt > 2200 {
@@ -716,7 +772,7 @@ func (h *AssetsHandler) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 		AnnualDepreciation: c.AnnualDepreciation, KmDepreciation: c.KmDepreciation, ExpectedKmPerYear: c.ExpectedKmPerYear,
 		PurchaseCosts: c.PurchaseCosts, NotarizedDate: c.NotarizedDate, LandValue: c.LandValue, YearBuilt: c.YearBuilt,
 		UsefulLifeYears: c.UsefulLifeYears, PriceDrift: c.PriceDrift, SelfUsed: c.SelfUsed,
-		LivingAreaM2: c.LivingAreaM2, Details: c.Details,
+		LivingAreaM2: c.LivingAreaM2, Details: c.Details, PriceIndex: c.PriceIndex,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "update asset: "+err.Error())
 		return

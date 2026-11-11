@@ -424,8 +424,8 @@ SELECT * FROM assets WHERE id = $1;
 INSERT INTO assets (kind, name, list_price, purchase_price, purchase_date, first_registration,
     purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year,
     purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift,
-    self_used, living_area_m2, details)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+    self_used, living_area_m2, details, price_index)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 RETURNING *;
 
 -- name: UpdateAsset :one
@@ -433,7 +433,7 @@ UPDATE assets SET name = $2, list_price = $3, purchase_price = $4, purchase_date
     first_registration = $6, purchase_odometer_km = $7, annual_depreciation = $8,
     km_depreciation = $9, expected_km_per_year = $10, purchase_costs = $11,
     notarized_date = $12, land_value = $13, year_built = $14, useful_life_years = $15,
-    price_drift = $16, self_used = $17, living_area_m2 = $18, details = $19
+    price_drift = $16, self_used = $17, living_area_m2 = $18, details = $19, price_index = $20
 WHERE id = $1
 RETURNING *;
 
@@ -522,3 +522,13 @@ ON CONFLICT DO NOTHING;
 -- name: DeleteLoanPaymentLinksForLoan :many
 DELETE FROM loan_payment_links WHERE loan_id = $1
 RETURNING transaction_id;
+
+-- name: ListPriceIndexPoints :many
+SELECT * FROM price_index_points ORDER BY series, period;
+
+-- name: UpsertPriceIndexPoint :one
+-- Returns whether the row is new or its value changed (Eurostat revises).
+INSERT INTO price_index_points (series, period, value) VALUES ($1, $2, $3)
+ON CONFLICT (series, period) DO UPDATE SET value = EXCLUDED.value
+    WHERE price_index_points.value IS DISTINCT FROM EXCLUDED.value
+RETURNING series;

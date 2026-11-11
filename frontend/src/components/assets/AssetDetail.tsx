@@ -129,6 +129,10 @@ export default function AssetDetail({ asset: a, loans, onBack, onEdit, onOpenLoa
         <Kpi label="Yours" value={fmt(a.yours)} sub={hasLoan ? `${fmtPct(a.yours_pct, 0)} · ${fmt(a.owed)} owed` : 'nothing owed'} tone="brand" />
         <Kpi label="Value change" value={`${fmtSigned(a.monthly_change)}/month`} tone={a.monthly_change >= 0 ? 'good' : 'bad'}
           sub={a.property ? `prices ${fmtSigned(a.property.price_effect_per_year)}/yr${a.property.has_building_aging ? `, aging ${fmtSigned(a.property.aging_effect_per_year)}/yr` : ''}` : a.car ? `${fmtPct(a.car.effective_annual_rate * 100)}/yr at ${fmtKm(a.expected_km_per_year)}/yr` : undefined} />
+        {a.index && (
+          <Kpi label="House price index" value={`${a.index.latest_value.toLocaleString('de-DE', { minimumFractionDigits: 1 })} (${a.index.latest_quarter})`}
+            sub={a.index.year_over_year != null ? `${a.index.year_over_year >= 0 ? '+' : ''}${fmtPct(a.index.year_over_year * 100)} in a year · Destatis via Eurostat` : 'Destatis via Eurostat'} />
+        )}
         {a.car && <Kpi label="Odometer (est.)" value={fmtKm(a.car.odometer_estimate_km)} sub={a.pct_of_list != null ? `${fmtPct(a.pct_of_list, 0)} of list price` : undefined} />}
         {hasLoan && a.current_value > 0 && <Kpi label="Loan-to-value" value={fmtPct((a.owed / a.current_value) * 100, 0)} />}
         <Kpi label="Tax on a sale" value={a.tax_free_from ? (a.tax_free_from <= today() ? 'None' : `Until ${fmtDate(a.tax_free_from)}`) : 'None'} sub={a.tax_note} />
@@ -138,7 +142,11 @@ export default function AssetDetail({ asset: a, loans, onBack, onEdit, onOpenLoa
         <h3 id="d-chart" className="font-serif text-[21px] text-ink">{hasLoan ? 'Worth, owed and yours' : 'Value over time'}</h3>
         <EChartWrapper option={chart} height="260px" />
         <p className="text-[12px] text-ink-muted mt-1">
-          {a.car ? `Forecast at ${fmtKm(a.expected_km_per_year)}/yr.` : `Forecast: prices ${fmtPct(a.price_drift * 100)}/yr${a.property?.has_building_aging ? ', building ages in a straight line' : ''}${hasLoan ? ', loan continues as agreed' : ''}.`}
+          {a.car
+            ? `Forecast at ${fmtKm(a.expected_km_per_year)}/yr.`
+            : a.index
+              ? `Prices follow the house price index (Destatis via Eurostat) up to ${a.index.latest_quarter}, then ${fmtPct(a.price_drift * 100)}/yr${a.property?.has_building_aging ? '; the building ages in a straight line' : ''}${hasLoan ? '; the loan continues as agreed' : ''}.`
+              : `Forecast: prices ${fmtPct(a.price_drift * 100)}/yr${a.property?.has_building_aging ? ', building ages in a straight line' : ''}${hasLoan ? ', loan continues as agreed' : ''}.`}
           {last && <> In {new Date(last.date).getFullYear()}: worth {fmt(last.value)}{hasLoan ? `, owed ${fmt(last.owed)}` : ''}.</>}
         </p>
       </section>

@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/lnsp/wealth/internal/analytics"
 	"github.com/lnsp/wealth/internal/assets"
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
@@ -87,11 +88,20 @@ func TestAssetRequestValidate_Defaults(t *testing.T) {
 	if numericToFloat(p.PriceDrift) != 0.02 || p.UsefulLifeYears != 80 || numericToFloat(p.LandValue) != 80000 {
 		t.Errorf("property defaults: drift=%v life=%d land=%v", numericToFloat(p.PriceDrift), p.UsefulLifeYears, numericToFloat(p.LandValue))
 	}
+	if p.PriceIndex != assets.IndexEurostatDE {
+		t.Errorf("apartments should follow the Eurostat index by default, got %q", p.PriceIndex)
+	}
+	fixed := ""
+	p, _ = assetRequest{Kind: "house", Name: "Haus", PurchasePrice: 500000, PurchaseDate: "2025-04-01", YearBuilt: &year, PriceIndex: &fixed}.validate()
+	if p.PriceIndex != "" {
+		t.Errorf("explicit fixed drift ignored: %q", p.PriceIndex)
+	}
 }
 
 func TestAssetRequestValidate_Rejects(t *testing.T) {
 	one, neg := 1.0, int32(-1)
 	tooMuchLand, year := 400000.0, int32(1998)
+	idx, unknown := assets.IndexEurostatDE, "acme-index"
 	cases := map[string]assetRequest{
 		"missing name":      {PurchasePrice: 1, PurchaseDate: "2026-08-01"},
 		"zero price":        {Name: "x", PurchaseDate: "2026-08-01"},
@@ -105,6 +115,8 @@ func TestAssetRequestValidate_Rejects(t *testing.T) {
 		"apartment no year": {Kind: "apartment", Name: "x", PurchasePrice: 320000, PurchaseDate: "2025-04-01"},
 		"land above price":  {Kind: "house", Name: "x", PurchasePrice: 320000, PurchaseDate: "2025-04-01", YearBuilt: &year, LandValue: &tooMuchLand},
 		"drift of 100 %":    {Kind: "land", Name: "x", PurchasePrice: 1, PurchaseDate: "2025-04-01", PriceDrift: &one},
+		"index on land":     {Kind: "land", Name: "x", PurchasePrice: 1, PurchaseDate: "2025-04-01", PriceIndex: &idx},
+		"unknown index":     {Kind: "house", Name: "x", PurchasePrice: 1, PurchaseDate: "2025-04-01", YearBuilt: &year, PriceIndex: &unknown},
 	}
 	for name, req := range cases {
 		if _, err := req.validate(); err == nil {
@@ -315,5 +327,24 @@ func TestInvestableNetWorth(t *testing.T) {
 	}
 	if !isLoanPayment(pgtype.Text{String: "loan_payment", Valid: true}) {
 		t.Error("isLoanPayment misclassifies")
+	}
+}
+
+func TestBuildAssetView_FollowsIndex(t *testing.T) {
+	row := testApartmentRow()
+	row.PriceIndex = assets.IndexEurostatDE
+	ix := analytics.NewQuarterlyIndex(
+		[]time.Time{day("2025-01-01"), day("2025-04-01"), day("2025-07-01"), day("2025-10-01"), day("2026-01-01"), day("2026-04-01")},
+		[]float64{151.5, 153.0, 154.4, 153.2, 153.3, 153.7},
+	)
+	v := buildAssetView(assets.FromRowsWithIndex(row, nil, nil, nil, ix), nil, day("2026-11-11"))
+	if v.Index == nil || v.Index.LatestQuarter != "2026-Q2" || v.Index.LatestValue != 153.7 || v.Index.YearOverYear == nil {
+		t.Fatalf("index info = %+v", v.Index)
+	}
+	// The index rose much less than 2 %/yr since purchase, so the value is
+	// below the fixed-drift model's.
+	drift := buildAssetView(assets.FromRows(testApartmentRow(), nil, nil, nil), nil, day("2026-11-11"))
+	if v.CurrentValue >= drift.CurrentValue {
+		t.Errorf("index-based %.0f should be below drift-based %.0f", v.CurrentValue, drift.CurrentValue)
 	}
 }

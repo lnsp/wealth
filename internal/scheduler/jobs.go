@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/robfig/cron/v3"
 
@@ -58,6 +60,7 @@ type Scheduler struct {
 	yahoo      *market.YahooClient
 	ecb        *market.ECBClient
 	justETF    *market.JustETFClient
+	eurostat   *market.EurostatClient
 	backupPath     string
 	ageRecipient   string
 	jobs           map[string]*JobStatus
@@ -70,6 +73,7 @@ func New(q *db.Queries, yahoo *market.YahooClient, ecb *market.ECBClient, justET
 		yahoo:        yahoo,
 		ecb:          ecb,
 		justETF:      justETF,
+		eurostat:     market.NewEurostatClient(),
 		backupPath:   backupPath,
 		ageRecipient: ageRecipient,
 		jobs: map[string]*JobStatus{
@@ -78,6 +82,7 @@ func New(q *db.Queries, yahoo *market.YahooClient, ecb *market.ECBClient, justET
 			"fx":           {Name: "FX Rates", Schedule: "Weekdays 16:00", Status: "never"},
 			"etf":          {Name: "ETF Metadata", Schedule: "Sundays 03:00", Status: "never"},
 			"networth":     {Name: "Net Worth Snapshot", Schedule: "Daily 19:00", Status: "never"},
+			"price-index":  {Name: "House Price Index", Schedule: "Mondays 06:30", Status: "never"},
 			"backup":       {Name: "Database Backup", Schedule: "Daily 02:00", Status: "never"},
 			"alerts":       {Name: "Price Alerts", Schedule: "Daily 19:05", Status: "never"},
 			"report":       {Name: "Wealth Reports", Schedule: "1st of month 06:00", Status: "never"},
@@ -179,6 +184,11 @@ func (s *Scheduler) Start() error {
 		return fmt.Errorf("add tax calendar job: %w", err)
 	}
 
+	// Monday 06:30: house price index (Eurostat publishes quarterly)
+	if _, err := s.cron.AddFunc("0 30 6 * * 1", s.updatePriceIndexes); err != nil {
+		return fmt.Errorf("add price index job: %w", err)
+	}
+
 	// Monday 09:00: weekly data health digest
 	if _, err := s.cron.AddFunc("0 0 9 * * 1", s.weeklyDataHealthDigest); err != nil {
 		return fmt.Errorf("add data health job: %w", err)
@@ -277,6 +287,8 @@ func (s *Scheduler) runInitialFetch() {
 	s.updatePrices()
 	log.Println("initial fetch: running FX rate update")
 	s.updateFXRates()
+	log.Println("initial fetch: running house price index update")
+	s.updatePriceIndexes()
 
 	// Backfills: only run if not already completed
 	if s.backfillNeeded(ctx, "historical_prices") {
@@ -736,6 +748,63 @@ func (s *Scheduler) RunFXUpdate() {
 // RunETFUpdate triggers an immediate ETF metadata update.
 func (s *Scheduler) RunETFUpdate() {
 	s.updateETFHoldings()
+}
+
+// updatePriceIndexes refreshes the published house price indices that
+// properties can follow. A new or revised quarter changes past property
+// values, so net-worth history is rebuilt when an asset follows the index.
+func (s *Scheduler) updatePriceIndexes() {
+	s.setJobStatus("price-index", "running", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	changed, latest := 0, ""
+	for _, series := range assets.IndexSeriesList {
+		points, err := s.eurostat.FetchHousePriceIndex(ctx, series.Geo, series.Purchase)
+		if err != nil {
+			log.Printf("ERROR: price index %s: %v", series.ID, err)
+			s.setJobStatus("price-index", "error", err.Error())
+			return
+		}
+		for _, p := range points {
+			var v pgtype.Numeric
+			v.Scan(fmt.Sprintf("%.4f", p.Value))
+			_, err := s.queries.UpsertPriceIndexPoint(ctx, db.UpsertPriceIndexPointParams{Series: series.ID, Period: p.Period, Value: v})
+			switch {
+			case err == nil:
+				changed++
+			case !errors.Is(err, pgx.ErrNoRows): // ErrNoRows = unchanged
+				log.Printf("WARNING: price index %s %s: %v", series.ID, p.Period.Format("2006-01"), err)
+			}
+		}
+		if len(points) > 0 {
+			last := points[len(points)-1]
+			latest = fmt.Sprintf("%d-Q%d = %.1f", last.Period.Year(), (int(last.Period.Month())+2)/3, last.Value)
+		}
+	}
+	msg := fmt.Sprintf("%d new or revised quarters, latest %s", changed, latest)
+	log.Printf("price index update: %s", msg)
+	s.setJobStatus("price-index", "ok", msg)
+
+	if changed > 0 && s.anyAssetFollowsIndex(ctx) {
+		go func() {
+			s.BackfillNetWorthSnapshots()
+			s.updateNetWorthSnapshot()
+		}()
+	}
+}
+
+func (s *Scheduler) anyAssetFollowsIndex(ctx context.Context) bool {
+	rows, err := s.queries.ListAssets(ctx)
+	if err != nil {
+		return false
+	}
+	for _, a := range rows {
+		if a.PriceIndex != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // RunNetWorthSnapshot triggers an immediate net worth snapshot.

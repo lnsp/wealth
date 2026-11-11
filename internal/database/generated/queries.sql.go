@@ -116,9 +116,9 @@ const createAsset = `-- name: CreateAsset :one
 INSERT INTO assets (kind, name, list_price, purchase_price, purchase_date, first_registration,
     purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year,
     purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift,
-    self_used, living_area_m2, details)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details
+    self_used, living_area_m2, details, price_index)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details, price_index
 `
 
 type CreateAssetParams struct {
@@ -141,6 +141,7 @@ type CreateAssetParams struct {
 	SelfUsed           bool           `json:"self_used"`
 	LivingAreaM2       pgtype.Numeric `json:"living_area_m2"`
 	Details            string         `json:"details"`
+	PriceIndex         string         `json:"price_index"`
 }
 
 func (q *Queries) CreateAsset(ctx context.Context, arg CreateAssetParams) (Asset, error) {
@@ -164,6 +165,7 @@ func (q *Queries) CreateAsset(ctx context.Context, arg CreateAssetParams) (Asset
 		arg.SelfUsed,
 		arg.LivingAreaM2,
 		arg.Details,
+		arg.PriceIndex,
 	)
 	var i Asset
 	err := row.Scan(
@@ -188,6 +190,7 @@ func (q *Queries) CreateAsset(ctx context.Context, arg CreateAssetParams) (Asset
 		&i.SelfUsed,
 		&i.LivingAreaM2,
 		&i.Details,
+		&i.PriceIndex,
 	)
 	return i, err
 }
@@ -752,7 +755,7 @@ func (q *Queries) GetAccountByInstitutionAndType(ctx context.Context, arg GetAcc
 }
 
 const getAsset = `-- name: GetAsset :one
-SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details FROM assets WHERE id = $1
+SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details, price_index FROM assets WHERE id = $1
 `
 
 func (q *Queries) GetAsset(ctx context.Context, id uuid.UUID) (Asset, error) {
@@ -780,6 +783,7 @@ func (q *Queries) GetAsset(ctx context.Context, id uuid.UUID) (Asset, error) {
 		&i.SelfUsed,
 		&i.LivingAreaM2,
 		&i.Details,
+		&i.PriceIndex,
 	)
 	return i, err
 }
@@ -1446,7 +1450,7 @@ func (q *Queries) ListAssetTransactions(ctx context.Context) ([]AssetTransaction
 }
 
 const listAssets = `-- name: ListAssets :many
-SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details FROM assets ORDER BY purchase_date, created_at
+SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details, price_index FROM assets ORDER BY purchase_date, created_at
 `
 
 func (q *Queries) ListAssets(ctx context.Context) ([]Asset, error) {
@@ -1480,6 +1484,7 @@ func (q *Queries) ListAssets(ctx context.Context) ([]Asset, error) {
 			&i.SelfUsed,
 			&i.LivingAreaM2,
 			&i.Details,
+			&i.PriceIndex,
 		); err != nil {
 			return nil, err
 		}
@@ -2185,6 +2190,30 @@ func (q *Queries) ListPriceHistory(ctx context.Context, securityIsin string) ([]
 	return items, nil
 }
 
+const listPriceIndexPoints = `-- name: ListPriceIndexPoints :many
+SELECT series, period, value FROM price_index_points ORDER BY series, period
+`
+
+func (q *Queries) ListPriceIndexPoints(ctx context.Context) ([]PriceIndexPoint, error) {
+	rows, err := q.db.Query(ctx, listPriceIndexPoints)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PriceIndexPoint{}
+	for rows.Next() {
+		var i PriceIndexPoint
+		if err := rows.Scan(&i.Series, &i.Period, &i.Value); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSecurities = `-- name: ListSecurities :many
 SELECT isin, wkn, symbol, name, asset_class, currency, ter, sector_weights, country_weights, metadata_updated_at FROM securities ORDER BY name
 `
@@ -2755,9 +2784,9 @@ UPDATE assets SET name = $2, list_price = $3, purchase_price = $4, purchase_date
     first_registration = $6, purchase_odometer_km = $7, annual_depreciation = $8,
     km_depreciation = $9, expected_km_per_year = $10, purchase_costs = $11,
     notarized_date = $12, land_value = $13, year_built = $14, useful_life_years = $15,
-    price_drift = $16, self_used = $17, living_area_m2 = $18, details = $19
+    price_drift = $16, self_used = $17, living_area_m2 = $18, details = $19, price_index = $20
 WHERE id = $1
-RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details
+RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details, price_index
 `
 
 type UpdateAssetParams struct {
@@ -2780,6 +2809,7 @@ type UpdateAssetParams struct {
 	SelfUsed           bool           `json:"self_used"`
 	LivingAreaM2       pgtype.Numeric `json:"living_area_m2"`
 	Details            string         `json:"details"`
+	PriceIndex         string         `json:"price_index"`
 }
 
 func (q *Queries) UpdateAsset(ctx context.Context, arg UpdateAssetParams) (Asset, error) {
@@ -2803,6 +2833,7 @@ func (q *Queries) UpdateAsset(ctx context.Context, arg UpdateAssetParams) (Asset
 		arg.SelfUsed,
 		arg.LivingAreaM2,
 		arg.Details,
+		arg.PriceIndex,
 	)
 	var i Asset
 	err := row.Scan(
@@ -2827,6 +2858,7 @@ func (q *Queries) UpdateAsset(ctx context.Context, arg UpdateAssetParams) (Asset
 		&i.SelfUsed,
 		&i.LivingAreaM2,
 		&i.Details,
+		&i.PriceIndex,
 	)
 	return i, err
 }
@@ -3180,6 +3212,27 @@ func (q *Queries) UpsertNetWorthSnapshot(ctx context.Context, arg UpsertNetWorth
 		arg.DebtComponent,
 	)
 	return err
+}
+
+const upsertPriceIndexPoint = `-- name: UpsertPriceIndexPoint :one
+INSERT INTO price_index_points (series, period, value) VALUES ($1, $2, $3)
+ON CONFLICT (series, period) DO UPDATE SET value = EXCLUDED.value
+    WHERE price_index_points.value IS DISTINCT FROM EXCLUDED.value
+RETURNING series
+`
+
+type UpsertPriceIndexPointParams struct {
+	Series string         `json:"series"`
+	Period time.Time      `json:"period"`
+	Value  pgtype.Numeric `json:"value"`
+}
+
+// Returns whether the row is new or its value changed (Eurostat revises).
+func (q *Queries) UpsertPriceIndexPoint(ctx context.Context, arg UpsertPriceIndexPointParams) (string, error) {
+	row := q.db.QueryRow(ctx, upsertPriceIndexPoint, arg.Series, arg.Period, arg.Value)
+	var series string
+	err := row.Scan(&series)
+	return series, err
 }
 
 const upsertSecurity = `-- name: UpsertSecurity :exec

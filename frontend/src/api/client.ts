@@ -138,6 +138,7 @@ export interface PhysicalAsset {
   year_built: number | null;
   useful_life_years: number;
   price_drift: number;
+  price_index: string;
   self_used: boolean;
   living_area_m2: number | null;
   current_value: number;
@@ -161,6 +162,7 @@ export interface PhysicalAsset {
     aging_effect_per_year: number;
     has_building_aging: boolean;
   } | null;
+  index: PriceIndexInfo | null;
   observations: AssetObservation[];
   improvements: { id: string; date: string; amount: number; description: string }[];
   linked_transactions: { id: string; date: string; amount: number; counterparty: string; purpose: string }[];
@@ -201,6 +203,7 @@ export interface AssetInput {
   year_built?: number;
   useful_life_years?: number;
   price_drift?: number;
+  price_index?: string;
   self_used?: boolean;
   living_area_m2?: number;
   transaction_ids?: string[];
@@ -247,7 +250,16 @@ export interface LoanScenarioResult {
   interest_after_fixed: number;
 }
 
+export interface PriceIndexInfo {
+  id: string;
+  label: string;
+  latest_quarter: string;
+  latest_value: number;
+  year_over_year: number | null;
+}
+
 export interface AssetsOverview {
+  price_indexes: PriceIndexInfo[];
   assets: PhysicalAsset[];
   loans: Loan[];
   totals: { worth: number; owed: number; yours: number };
@@ -258,6 +270,7 @@ export interface AssetsOverview {
     expected_km_per_year: number;
     property_drift: number;
     useful_life_years: number;
+    price_index: string;
   };
 }
 

@@ -49,6 +49,7 @@ type Asset struct {
 	SelfUsed           bool           `json:"self_used"`
 	LivingAreaM2       pgtype.Numeric `json:"living_area_m2"`
 	Details            string         `json:"details"`
+	PriceIndex         string         `json:"price_index"`
 }
 
 type AssetImprovement struct {
@@ -228,6 +229,12 @@ type PriceAlert struct {
 	IsActive     bool           `json:"is_active"`
 	CreatedAt    time.Time      `json:"created_at"`
 	UserID       *uuid.UUID     `json:"user_id"`
+}
+
+type PriceIndexPoint struct {
+	Series string         `json:"series"`
+	Period time.Time      `json:"period"`
+	Value  pgtype.Numeric `json:"value"`
 }
 
 type RsuVest struct {

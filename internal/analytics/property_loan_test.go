@@ -3,6 +3,7 @@ package analytics
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 func testApartment() PropertyValuation {
@@ -130,4 +131,40 @@ func TestLoan_Scenario(t *testing.T) {
 		t.Error("a higher follow-up rate must take longer and cost more")
 	}
 	approx(t, "same rate keeps remaining", higher.RemainingAtFixedEnd, base.RemainingAtFixedEnd, 0.01)
+}
+
+func TestPriceIndex_FollowsIndexThenDrift(t *testing.T) {
+	ix := NewQuarterlyIndex(
+		[]time.Time{day("2025-01-01"), day("2025-04-01"), day("2025-07-01"), day("2025-10-01"), day("2026-01-01"), day("2026-04-01")},
+		[]float64{151.5, 153.0, 154.4, 153.2, 153.3, 153.7},
+	)
+	land := PropertyValuation{PurchaseDate: day("2025-05-16"), PurchasePrice: 100000, Drift: 0.02, Index: ix}
+
+	// Purchase at the Q2-2025 midpoint (153.0); 2026-Q2 midpoint is 153.7.
+	approx(t, "index ratio", land.ValueAt(day("2026-05-16")), 100000*153.7/153.0, 0.5)
+	// Halfway between the Q3 and Q4 midpoints the level is interpolated.
+	mid := day("2025-08-16").Add(day("2025-11-16").Sub(day("2025-08-16")) / 2)
+	approx(t, "interpolated", land.ValueAt(mid), 100000*((154.4+153.2)/2)/153.0, 1)
+	// Beyond the last quarter the drift takes over.
+	approx(t, "extrapolated", land.ValueAt(day("2027-05-16")), 100000*153.7/153.0*math.Pow(1.02, 365.0/365.25), 2)
+
+	yoy, ok := ix.YearOverYear()
+	approx(t, "year over year", yoy, 153.7/153.0-1, 0.0001)
+	if !ok {
+		t.Error("year-over-year should be available")
+	}
+	if last, _ := ix.Latest(); last.Value != 153.7 || last.Date.Format("2006-01-02") != "2026-05-16" {
+		t.Errorf("latest = %+v", last)
+	}
+}
+
+func TestPriceIndex_BuildingStillAges(t *testing.T) {
+	flat := NewQuarterlyIndex([]time.Time{day("2025-01-01"), day("2030-01-01")}, []float64{100, 100})
+	p := testApartment()
+	p.Index, p.Drift = flat, 0
+	land, building := p.Components(day("2026-04-01"))
+	approx(t, "land flat with a flat index", land, 75000, 0.01)
+	if building >= 245000 || building < 240000 {
+		t.Errorf("building should age under a flat index, got %.0f", building)
+	}
 }

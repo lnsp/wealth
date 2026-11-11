@@ -33,6 +33,33 @@ const (
 	KindOther     = "other"
 )
 
+// IndexSeries is a published price index a property can follow.
+type IndexSeries struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Geo      string `json:"-"` // Eurostat geo code
+	Purchase string `json:"-"` // Eurostat purchase type
+}
+
+// IndexEurostatDE is Destatis' Häuserpreisindex for existing dwellings as
+// republished by Eurostat (prc_hpi_q), quarterly, no registration needed.
+const IndexEurostatDE = "eurostat-hpi-de-existing"
+
+// IndexSeriesList lists the indices the scheduler keeps up to date.
+var IndexSeriesList = []IndexSeries{
+	{ID: IndexEurostatDE, Label: "House price index, Germany, existing dwellings (Destatis via Eurostat)", Geo: "DE", Purchase: "DW_EXST"},
+}
+
+// KnownIndex reports whether id is a supported index series.
+func KnownIndex(id string) bool {
+	for _, s := range IndexSeriesList {
+		if s.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // IsProperty reports whether a kind has a building that ages.
 func IsProperty(kind string) bool { return kind == KindApartment || kind == KindHouse }
 
@@ -82,6 +109,12 @@ func observationModels(obs []db.AssetObservation) []analytics.AssetObservation {
 // FromRows builds the valuation model for one asset. The other rows must
 // belong to it.
 func FromRows(row db.Asset, obs []db.AssetObservation, improvements []db.AssetImprovement, links []db.AssetTransaction) Asset {
+	return FromRowsWithIndex(row, obs, improvements, links, nil)
+}
+
+// FromRowsWithIndex is FromRows for a property that follows a price index
+// (used when row.PriceIndex is set).
+func FromRowsWithIndex(row db.Asset, obs []db.AssetObservation, improvements []db.AssetImprovement, links []db.AssetTransaction, index *analytics.PriceIndex) Asset {
 	a := Asset{Asset: row, Observations: obs, Improvements: improvements, Links: links}
 	if row.Kind == KindCar || row.Kind == "" {
 		car := analytics.DepreciatingAsset{
@@ -108,6 +141,9 @@ func FromRows(row db.Asset, obs []db.AssetObservation, improvements []db.AssetIm
 	}
 	for _, im := range improvements {
 		prop.Improvements = append(prop.Improvements, analytics.Improvement{Date: im.Date, Amount: Numeric(im.Amount)})
+	}
+	if row.PriceIndex != "" && index != nil && len(index.Points) > 0 {
+		prop.Index = index
 	}
 	a.Property, a.Model = &prop, prop
 	return a
@@ -184,8 +220,28 @@ func (l Loan) BalanceOn(t time.Time) float64 {
 
 // Holdings is everything physical: assets and the loans on them.
 type Holdings struct {
-	Assets []Asset
-	Loans  []Loan
+	Assets  []Asset
+	Loans   []Loan
+	Indexes map[string]*analytics.PriceIndex
+}
+
+// LoadIndexes returns the stored price index series.
+func LoadIndexes(ctx context.Context, q *db.Queries) (map[string]*analytics.PriceIndex, error) {
+	pts, err := q.ListPriceIndexPoints(ctx)
+	if err != nil {
+		return nil, err
+	}
+	periods := map[string][]time.Time{}
+	values := map[string][]float64{}
+	for _, p := range pts {
+		periods[p.Series] = append(periods[p.Series], p.Period)
+		values[p.Series] = append(values[p.Series], Numeric(p.Value))
+	}
+	out := make(map[string]*analytics.PriceIndex, len(periods))
+	for series := range periods {
+		out[series] = analytics.NewQuarterlyIndex(periods[series], values[series])
+	}
+	return out, nil
 }
 
 // Load returns all assets and loans with their related rows.
@@ -218,9 +274,13 @@ func Load(ctx context.Context, q *db.Queries) (Holdings, error) {
 	for _, l := range allLinks {
 		linkBy[l.AssetID] = append(linkBy[l.AssetID], l)
 	}
-	var h Holdings
+	indexes, err := LoadIndexes(ctx, q)
+	if err != nil {
+		return Holdings{}, err
+	}
+	h := Holdings{Indexes: indexes}
 	for _, r := range rows {
-		h.Assets = append(h.Assets, FromRows(r, obsBy[r.ID], imprBy[r.ID], linkBy[r.ID]))
+		h.Assets = append(h.Assets, FromRowsWithIndex(r, obsBy[r.ID], imprBy[r.ID], linkBy[r.ID], indexes[r.PriceIndex]))
 	}
 
 	loanRows, err := q.ListLoans(ctx)

@@ -51,12 +51,12 @@ export default function AssetsTab({ onNetWorthChanged }: { onNetWorthChanged?: (
   const editId = params.get('edit');
 
   if (params.get('add')) {
-    return <AssetForm asset={null} defaults={data.defaults} onCancel={() => go(null)} onSaved={a => { changed(); go({ asset: a.id }); }} />;
+    return <AssetForm asset={null} defaults={data.defaults} indexes={data.price_indexes} onCancel={() => go(null)} onSaved={a => { changed(); go({ asset: a.id }); }} />;
   }
   if (editId) {
     const asset = data.assets.find(a => a.id === editId);
     if (asset) {
-      return <AssetForm asset={asset} defaults={data.defaults} onCancel={() => go({ asset: asset.id })} onSaved={a => { changed(); go({ asset: a.id }); }} />;
+      return <AssetForm asset={asset} defaults={data.defaults} indexes={data.price_indexes} onCancel={() => go({ asset: asset.id })} onSaved={a => { changed(); go({ asset: a.id }); }} />;
     }
   }
   if (loanId) {

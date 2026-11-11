@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/lnsp/wealth/internal/assets"
 	"github.com/lnsp/wealth/internal/cashflow"
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
@@ -90,25 +92,17 @@ func (h *CashflowHandler) HandleCashflow(w http.ResponseWriter, r *http.Request)
 	}
 	agg := map[key]*monthlyBucket{}
 	totals := map[string]*monthlyTotals{}
+	// Matched loan instalments are split into interest (a cost) and
+	// principal (saving: it lowers the debt).
+	holdings, err := assets.Load(r.Context(), h.queries)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load loans: "+err.Error())
+		return
+	}
 
-	for _, row := range rows {
-		amount := numericToFloat(row.Amount)
-		ref := ""
-		if row.Reference.Valid {
-			ref = row.Reference.String
-		}
-		cp := ""
-		if row.Counterparty.Valid {
-			cp = row.Counterparty.String
-		}
-		override := ""
-		if row.Category.Valid {
-			override = row.Category.String
-		}
-		cat := cashflow.ResolveCategory(override, row.Type, cp, ref)
+	add := func(date time.Time, cat cashflow.Category, amount float64) {
 		bucket := cashflow.BucketOf(cat)
-
-		month := row.Date.Format("2006-01")
+		month := date.Format("2006-01")
 		k := key{month: month, category: cat}
 		if agg[k] == nil {
 			agg[k] = &monthlyBucket{Month: month, Category: string(cat), Bucket: string(bucket)}
@@ -133,6 +127,33 @@ func (h *CashflowHandler) HandleCashflow(w http.ResponseWriter, r *http.Request)
 		case cashflow.BucketTransfer:
 			t.Transfer += amount
 		}
+	}
+
+	for _, row := range rows {
+		amount := numericToFloat(row.Amount)
+		if interest, _, kind, ok := holdings.PaymentSplit(row.ID); ok {
+			interestCat := cashflow.CatHousing
+			if kind == assets.KindCar {
+				interestCat = cashflow.CatTransport
+			}
+			interestPart := math.Copysign(interest, amount)
+			add(row.Date, interestCat, interestPart)
+			add(row.Date, cashflow.CatLoanPrincipal, amount-interestPart)
+			continue
+		}
+		ref := ""
+		if row.Reference.Valid {
+			ref = row.Reference.String
+		}
+		cp := ""
+		if row.Counterparty.Valid {
+			cp = row.Counterparty.String
+		}
+		override := ""
+		if row.Category.Valid {
+			override = row.Category.String
+		}
+		add(row.Date, cashflow.ResolveCategory(override, row.Type, cp, ref), amount)
 	}
 
 	// Build month list, newest first, including months with zero activity.

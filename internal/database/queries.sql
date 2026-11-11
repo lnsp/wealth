@@ -167,20 +167,21 @@ ON CONFLICT (etf_isin, holding_isin) DO UPDATE SET
 SELECT * FROM etf_holdings WHERE etf_isin = $1 ORDER BY weight_pct DESC;
 
 -- name: UpsertNetWorthSnapshot :exec
-INSERT INTO net_worth_snapshots (date, total, cash_component, investment_component, physical_component)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO net_worth_snapshots (date, total, cash_component, investment_component, physical_component, debt_component)
+VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (date) DO UPDATE SET
     total = EXCLUDED.total,
     cash_component = EXCLUDED.cash_component,
     investment_component = EXCLUDED.investment_component,
-    physical_component = EXCLUDED.physical_component;
+    physical_component = EXCLUDED.physical_component,
+    debt_component = EXCLUDED.debt_component;
 
 -- name: ListNetWorthSnapshots :many
 SELECT * FROM net_worth_snapshots ORDER BY date DESC LIMIT $1;
 
 -- name: InsertNetWorthIntraday :exec
-INSERT INTO net_worth_intraday (recorded_at, total, cash_component, investment_component, physical_component)
-VALUES ($1, $2, $3, $4, $5);
+INSERT INTO net_worth_intraday (recorded_at, total, cash_component, investment_component, physical_component, debt_component)
+VALUES ($1, $2, $3, $4, $5, $6);
 
 -- name: ListNetWorthIntraday :many
 SELECT * FROM net_worth_intraday
@@ -421,14 +422,18 @@ SELECT * FROM assets WHERE id = $1;
 
 -- name: CreateAsset :one
 INSERT INTO assets (kind, name, list_price, purchase_price, purchase_date, first_registration,
-    purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year,
+    purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift,
+    self_used, living_area_m2, details)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 RETURNING *;
 
 -- name: UpdateAsset :one
 UPDATE assets SET name = $2, list_price = $3, purchase_price = $4, purchase_date = $5,
     first_registration = $6, purchase_odometer_km = $7, annual_depreciation = $8,
-    km_depreciation = $9, expected_km_per_year = $10, purchase_transaction_id = $11
+    km_depreciation = $9, expected_km_per_year = $10, purchase_costs = $11,
+    notarized_date = $12, land_value = $13, year_built = $14, useful_life_years = $15,
+    price_drift = $16, self_used = $17, living_area_m2 = $18, details = $19
 WHERE id = $1
 RETURNING *;
 
@@ -452,3 +457,68 @@ DELETE FROM asset_observations WHERE asset_id = $1 AND date = $2;
 
 -- name: GetTransaction :one
 SELECT * FROM transactions WHERE id = $1;
+
+-- name: ListAssetTransactions :many
+SELECT * FROM asset_transactions;
+
+-- name: InsertAssetTransaction :exec
+INSERT INTO asset_transactions (transaction_id, asset_id, purpose) VALUES ($1, $2, $3);
+
+-- name: DeleteAssetTransaction :exec
+DELETE FROM asset_transactions WHERE transaction_id = $1;
+
+-- name: ListAssetImprovements :many
+SELECT * FROM asset_improvements ORDER BY asset_id, date;
+
+-- name: CreateAssetImprovement :one
+INSERT INTO asset_improvements (asset_id, date, amount, description)
+VALUES ($1, $2, $3, $4)
+RETURNING *;
+
+-- name: DeleteAssetImprovement :exec
+DELETE FROM asset_improvements WHERE id = $1 AND asset_id = $2;
+
+-- name: ListLoans :many
+SELECT * FROM loans ORDER BY payout_date, created_at;
+
+-- name: GetLoan :one
+SELECT * FROM loans WHERE id = $1;
+
+-- name: CreateLoan :one
+INSERT INTO loans (asset_id, name, lender, principal, payout_date, first_payment_date, nominal_rate,
+    monthly_payment, fixed_until, followup_rate, extra_allowance_pct, payment_account_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+RETURNING *;
+
+-- name: UpdateLoan :one
+UPDATE loans SET name = $2, lender = $3, principal = $4, payout_date = $5, first_payment_date = $6,
+    nominal_rate = $7, monthly_payment = $8, fixed_until = $9, followup_rate = $10,
+    extra_allowance_pct = $11, payment_account_id = $12
+WHERE id = $1
+RETURNING *;
+
+-- name: DeleteLoan :exec
+DELETE FROM loans WHERE id = $1;
+
+-- name: ListLoanExtraRepayments :many
+SELECT * FROM loan_extra_repayments ORDER BY loan_id, date;
+
+-- name: CreateLoanExtraRepayment :one
+INSERT INTO loan_extra_repayments (loan_id, date, amount, transaction_id)
+VALUES ($1, $2, $3, $4)
+RETURNING *;
+
+-- name: DeleteLoanExtraRepayment :one
+DELETE FROM loan_extra_repayments WHERE id = $1 AND loan_id = $2
+RETURNING transaction_id;
+
+-- name: ListLoanPaymentLinks :many
+SELECT * FROM loan_payment_links;
+
+-- name: InsertLoanPaymentLink :exec
+INSERT INTO loan_payment_links (transaction_id, loan_id, due_date) VALUES ($1, $2, $3)
+ON CONFLICT DO NOTHING;
+
+-- name: DeleteLoanPaymentLinksForLoan :many
+DELETE FROM loan_payment_links WHERE loan_id = $1
+RETURNING transaction_id;

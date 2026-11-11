@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/lnsp/wealth/internal/assets"
 	db "github.com/lnsp/wealth/internal/database/generated"
 	"github.com/lnsp/wealth/internal/parser"
 )
@@ -162,6 +163,13 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 	// Refresh materialized view
 	if err := h.queries.RefreshCurrentHoldings(r.Context()); err != nil {
 		log.Printf("WARNING: refresh materialized view: %v", err)
+	}
+
+	// Newly imported bank rows may be loan instalments.
+	if n, err := assets.MatchAllLoanPayments(r.Context(), h.queries); err != nil {
+		log.Printf("WARNING: match loan payments: %v", err)
+	} else if n > 0 {
+		log.Printf("import: matched %d loan payments", n)
 	}
 
 	// Backfill historical net worth snapshots and create today's snapshot

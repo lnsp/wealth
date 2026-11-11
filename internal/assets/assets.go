@@ -1,6 +1,7 @@
-// Package assets loads physical assets (cars) from the database and values
-// them with the depreciation model in internal/analytics. It is shared by the
-// net-worth scheduler and the HTTP handlers so both compute identical values.
+// Package assets loads physical assets (cars, property, land, other) and the
+// loans that finance them, and values them with the models in
+// internal/analytics. It is shared by the net-worth scheduler and the HTTP
+// handlers so both compute identical values.
 package assets
 
 import (
@@ -14,19 +15,46 @@ import (
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
 
-// CategoryPurchase tags the cash transaction that paid for an asset. Cashflow
-// treats it as a transfer (not spending); net-worth attribution treats it as
+// CategoryPurchase tags cash transactions that paid for an asset (purchase or
+// improvement). Cashflow treats them as a transfer, net-worth attribution as
 // an asset swap because the cash reappears as the asset's value.
 const CategoryPurchase = "asset_purchase"
 
-// Asset is a stored asset with its observations and valuation model.
+// CategoryLoanPayment tags matched loan payments. Cashflow splits them into
+// interest (a cost) and principal (saving).
+const CategoryLoanPayment = "loan_payment"
+
+// Kinds of physical assets.
+const (
+	KindCar       = "car"
+	KindApartment = "apartment"
+	KindHouse     = "house"
+	KindLand      = "land"
+	KindOther     = "other"
+)
+
+// IsProperty reports whether a kind has a building that ages.
+func IsProperty(kind string) bool { return kind == KindApartment || kind == KindHouse }
+
+// Valuer is a valuation model.
+type Valuer interface {
+	ValueAt(t time.Time) float64
+}
+
+// Asset is a stored asset with its observations, improvements, linked
+// payments and valuation model.
 type Asset struct {
 	db.Asset
 	Observations []db.AssetObservation
-	Model        analytics.DepreciatingAsset
+	Improvements []db.AssetImprovement
+	Links        []db.AssetTransaction
+	Model        Valuer
+	Car          *analytics.DepreciatingAsset // set for cars
+	Property     *analytics.PropertyValuation // set for everything else
 }
 
-func numeric(n pgtype.Numeric) float64 {
+// Numeric converts a nullable numeric to float64 (0 when NULL).
+func Numeric(n pgtype.Numeric) float64 {
 	if !n.Valid {
 		return 0
 	}
@@ -34,16 +62,8 @@ func numeric(n pgtype.Numeric) float64 {
 	return f.Float64
 }
 
-// FromRows builds the valuation model for one asset. obs must belong to row.
-func FromRows(row db.Asset, obs []db.AssetObservation) Asset {
-	model := analytics.DepreciatingAsset{
-		PurchaseDate:       row.PurchaseDate,
-		PurchasePrice:      numeric(row.PurchasePrice),
-		PurchaseOdometerKm: float64(row.PurchaseOdometerKm),
-		AnnualRate:         numeric(row.AnnualDepreciation),
-		KmRate:             numeric(row.KmDepreciation),
-		ExpectedKmPerYear:  float64(row.ExpectedKmPerYear),
-	}
+func observationModels(obs []db.AssetObservation) []analytics.AssetObservation {
+	var out []analytics.AssetObservation
 	for _, o := range obs {
 		mo := analytics.AssetObservation{Date: o.Date}
 		if o.OdometerKm.Valid {
@@ -51,33 +71,46 @@ func FromRows(row db.Asset, obs []db.AssetObservation) Asset {
 			mo.OdometerKm = &km
 		}
 		if o.AppraisedValue.Valid {
-			v := numeric(o.AppraisedValue)
+			v := Numeric(o.AppraisedValue)
 			mo.AppraisedValue = &v
 		}
-		model.Observations = append(model.Observations, mo)
+		out = append(out, mo)
 	}
-	return Asset{Asset: row, Observations: obs, Model: model}
+	return out
 }
 
-// Load returns all assets with their observations.
-func Load(ctx context.Context, q *db.Queries) ([]Asset, error) {
-	rows, err := q.ListAssets(ctx)
-	if err != nil {
-		return nil, err
+// FromRows builds the valuation model for one asset. The other rows must
+// belong to it.
+func FromRows(row db.Asset, obs []db.AssetObservation, improvements []db.AssetImprovement, links []db.AssetTransaction) Asset {
+	a := Asset{Asset: row, Observations: obs, Improvements: improvements, Links: links}
+	if row.Kind == KindCar || row.Kind == "" {
+		car := analytics.DepreciatingAsset{
+			PurchaseDate:       row.PurchaseDate,
+			PurchasePrice:      Numeric(row.PurchasePrice),
+			PurchaseOdometerKm: float64(row.PurchaseOdometerKm),
+			AnnualRate:         Numeric(row.AnnualDepreciation),
+			KmRate:             Numeric(row.KmDepreciation),
+			ExpectedKmPerYear:  float64(row.ExpectedKmPerYear),
+			Observations:       observationModels(obs),
+		}
+		a.Car, a.Model = &car, car
+		return a
 	}
-	allObs, err := q.ListAssetObservations(ctx)
-	if err != nil {
-		return nil, err
+	prop := analytics.PropertyValuation{
+		PurchaseDate:  row.PurchaseDate,
+		PurchasePrice: Numeric(row.PurchasePrice),
+		Drift:         Numeric(row.PriceDrift),
+		Appraisals:    observationModels(obs),
 	}
-	byAsset := make(map[uuid.UUID][]db.AssetObservation)
-	for _, o := range allObs {
-		byAsset[o.AssetID] = append(byAsset[o.AssetID], o)
+	if IsProperty(row.Kind) && row.YearBuilt.Valid {
+		prop.BuildingEnd = float64(row.YearBuilt.Int32 + row.UsefulLifeYears)
+		prop.LandValue = Numeric(row.LandValue)
 	}
-	out := make([]Asset, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, FromRows(r, byAsset[r.ID]))
+	for _, im := range improvements {
+		prop.Improvements = append(prop.Improvements, analytics.Improvement{Date: im.Date, Amount: Numeric(im.Amount)})
 	}
-	return out, nil
+	a.Property, a.Model = &prop, prop
+	return a
 }
 
 // CivilDate maps t to midnight UTC of its calendar day, matching how DATE
@@ -92,22 +125,215 @@ func (a Asset) ValueOn(t time.Time) float64 {
 	return a.Model.ValueAt(CivilDate(t))
 }
 
-// TotalValueAt sums the modelled value of all assets on t's calendar day.
-func TotalValueAt(as []Asset, t time.Time) float64 {
+// PurchasePrice is the market value paid (excluding purchase costs).
+func (a Asset) PurchasePrice() float64 { return Numeric(a.Asset.PurchasePrice) }
+
+// PurchaseCosts are transfer tax, notary, broker etc.
+func (a Asset) PurchaseCosts() float64 { return Numeric(a.Asset.PurchaseCosts) }
+
+// ImprovementsTotal sums capital spent after purchase.
+func (a Asset) ImprovementsTotal() float64 {
 	total := 0.0
-	for _, a := range as {
+	for _, im := range a.Improvements {
+		total += Numeric(im.Amount)
+	}
+	return total
+}
+
+// CostBasis is everything paid for the asset: price, purchase costs and
+// improvements.
+func (a Asset) CostBasis() float64 {
+	return a.PurchasePrice() + a.PurchaseCosts() + a.ImprovementsTotal()
+}
+
+// Loan is a stored loan with its extra repayments, matched payments and model.
+type Loan struct {
+	db.Loan
+	Extras   []db.LoanExtraRepayment
+	Links    []db.LoanPaymentLink
+	Model    analytics.Loan
+	Schedule []analytics.LoanPayment
+}
+
+// LoanFromRows builds the loan model. The other rows must belong to it.
+func LoanFromRows(row db.Loan, extras []db.LoanExtraRepayment, links []db.LoanPaymentLink) Loan {
+	m := analytics.Loan{
+		Principal:        Numeric(row.Principal),
+		PayoutDate:       row.PayoutDate,
+		FirstPaymentDate: row.FirstPaymentDate,
+		Rate:             Numeric(row.NominalRate),
+		MonthlyPayment:   Numeric(row.MonthlyPayment),
+		FollowupRate:     -1,
+	}
+	if row.FixedUntil.Valid {
+		m.FixedUntil = row.FixedUntil.Time
+	}
+	if row.FollowupRate.Valid {
+		m.FollowupRate = Numeric(row.FollowupRate)
+	}
+	for _, e := range extras {
+		m.Extras = append(m.Extras, analytics.ExtraRepayment{Date: e.Date, Amount: Numeric(e.Amount)})
+	}
+	return Loan{Loan: row, Extras: extras, Links: links, Model: m, Schedule: m.Schedule()}
+}
+
+// BalanceOn returns what is owed at the end of t's calendar day.
+func (l Loan) BalanceOn(t time.Time) float64 {
+	return l.Model.BalanceAt(CivilDate(t))
+}
+
+// Holdings is everything physical: assets and the loans on them.
+type Holdings struct {
+	Assets []Asset
+	Loans  []Loan
+}
+
+// Load returns all assets and loans with their related rows.
+func Load(ctx context.Context, q *db.Queries) (Holdings, error) {
+	rows, err := q.ListAssets(ctx)
+	if err != nil {
+		return Holdings{}, err
+	}
+	allObs, err := q.ListAssetObservations(ctx)
+	if err != nil {
+		return Holdings{}, err
+	}
+	allImpr, err := q.ListAssetImprovements(ctx)
+	if err != nil {
+		return Holdings{}, err
+	}
+	allLinks, err := q.ListAssetTransactions(ctx)
+	if err != nil {
+		return Holdings{}, err
+	}
+	obsBy := make(map[uuid.UUID][]db.AssetObservation)
+	for _, o := range allObs {
+		obsBy[o.AssetID] = append(obsBy[o.AssetID], o)
+	}
+	imprBy := make(map[uuid.UUID][]db.AssetImprovement)
+	for _, im := range allImpr {
+		imprBy[im.AssetID] = append(imprBy[im.AssetID], im)
+	}
+	linkBy := make(map[uuid.UUID][]db.AssetTransaction)
+	for _, l := range allLinks {
+		linkBy[l.AssetID] = append(linkBy[l.AssetID], l)
+	}
+	var h Holdings
+	for _, r := range rows {
+		h.Assets = append(h.Assets, FromRows(r, obsBy[r.ID], imprBy[r.ID], linkBy[r.ID]))
+	}
+
+	loanRows, err := q.ListLoans(ctx)
+	if err != nil {
+		return Holdings{}, err
+	}
+	allExtras, err := q.ListLoanExtraRepayments(ctx)
+	if err != nil {
+		return Holdings{}, err
+	}
+	allPayLinks, err := q.ListLoanPaymentLinks(ctx)
+	if err != nil {
+		return Holdings{}, err
+	}
+	extrasBy := make(map[uuid.UUID][]db.LoanExtraRepayment)
+	for _, e := range allExtras {
+		extrasBy[e.LoanID] = append(extrasBy[e.LoanID], e)
+	}
+	payBy := make(map[uuid.UUID][]db.LoanPaymentLink)
+	for _, p := range allPayLinks {
+		payBy[p.LoanID] = append(payBy[p.LoanID], p)
+	}
+	for _, r := range loanRows {
+		h.Loans = append(h.Loans, LoanFromRows(r, extrasBy[r.ID], payBy[r.ID]))
+	}
+	return h, nil
+}
+
+// PhysicalAt sums the modelled value of all assets on t's calendar day.
+func (h Holdings) PhysicalAt(t time.Time) float64 {
+	total := 0.0
+	for _, a := range h.Assets {
 		total += a.ValueOn(t)
 	}
 	return total
 }
 
-// PurchaseTransactionIDs returns the IDs of linked purchase payments.
-func PurchaseTransactionIDs(as []Asset) map[uuid.UUID]bool {
+// DebtAt sums what is owed on all loans at the end of t's calendar day.
+func (h Holdings) DebtAt(t time.Time) float64 {
+	total := 0.0
+	for _, l := range h.Loans {
+		total += l.BalanceOn(t)
+	}
+	return total
+}
+
+// LoansFor returns the loans financing an asset.
+func (h Holdings) LoansFor(assetID uuid.UUID) []Loan {
+	var out []Loan
+	for _, l := range h.Loans {
+		if l.AssetID == assetID {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// AssetLinkedIDs returns transactions that paid for assets (asset swaps).
+func (h Holdings) AssetLinkedIDs() map[uuid.UUID]bool {
 	ids := make(map[uuid.UUID]bool)
-	for _, a := range as {
-		if a.PurchaseTransactionID != nil {
-			ids[*a.PurchaseTransactionID] = true
+	for _, a := range h.Assets {
+		for _, l := range a.Links {
+			ids[l.TransactionID] = true
 		}
 	}
 	return ids
+}
+
+// LoanLinkedIDs returns transactions that paid loan instalments or extra
+// repayments.
+func (h Holdings) LoanLinkedIDs() map[uuid.UUID]bool {
+	ids := make(map[uuid.UUID]bool)
+	for _, l := range h.Loans {
+		for _, p := range l.Links {
+			ids[p.TransactionID] = true
+		}
+		for _, e := range l.Extras {
+			if e.TransactionID != nil {
+				ids[*e.TransactionID] = true
+			}
+		}
+	}
+	return ids
+}
+
+// LinkedIDs is the union of asset and loan payment links.
+func (h Holdings) LinkedIDs() map[uuid.UUID]bool {
+	ids := h.AssetLinkedIDs()
+	for id := range h.LoanLinkedIDs() {
+		ids[id] = true
+	}
+	return ids
+}
+
+// PaymentSplit returns the scheduled interest and principal for a matched
+// loan payment transaction.
+func (h Holdings) PaymentSplit(txnID uuid.UUID) (interest, principal float64, kind string, ok bool) {
+	for _, l := range h.Loans {
+		for _, link := range l.Links {
+			if link.TransactionID != txnID {
+				continue
+			}
+			for _, p := range l.Schedule {
+				if p.Due.Equal(link.DueDate) {
+					for _, a := range h.Assets {
+						if a.ID == l.AssetID {
+							kind = a.Kind
+						}
+					}
+					return p.Interest, p.Principal, kind, true
+				}
+			}
+		}
+	}
+	return 0, 0, "", false
 }

@@ -11,7 +11,7 @@ const CASHFLOW_CATEGORIES = [
   'housing', 'utilities', 'insurance', 'subscriptions',
   'groceries', 'dining', 'transport', 'health',
   'entertainment', 'shopping', 'tax',
-  'investment', 'internal', 'asset_purchase', 'other',
+  'investment', 'internal', 'asset_purchase', 'loan_payment', 'loan_principal', 'other',
 ];
 
 // Cash-transaction types — only these get the category override dropdown.

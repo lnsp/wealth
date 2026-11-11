@@ -28,19 +28,35 @@ type Account struct {
 }
 
 type Asset struct {
-	ID                    uuid.UUID      `json:"id"`
-	Kind                  string         `json:"kind"`
-	Name                  string         `json:"name"`
-	ListPrice             pgtype.Numeric `json:"list_price"`
-	PurchasePrice         pgtype.Numeric `json:"purchase_price"`
-	PurchaseDate          time.Time      `json:"purchase_date"`
-	FirstRegistration     pgtype.Date    `json:"first_registration"`
-	PurchaseOdometerKm    int32          `json:"purchase_odometer_km"`
-	AnnualDepreciation    pgtype.Numeric `json:"annual_depreciation"`
-	KmDepreciation        pgtype.Numeric `json:"km_depreciation"`
-	ExpectedKmPerYear     int32          `json:"expected_km_per_year"`
-	PurchaseTransactionID *uuid.UUID     `json:"purchase_transaction_id"`
-	CreatedAt             time.Time      `json:"created_at"`
+	ID                 uuid.UUID      `json:"id"`
+	Kind               string         `json:"kind"`
+	Name               string         `json:"name"`
+	ListPrice          pgtype.Numeric `json:"list_price"`
+	PurchasePrice      pgtype.Numeric `json:"purchase_price"`
+	PurchaseDate       time.Time      `json:"purchase_date"`
+	FirstRegistration  pgtype.Date    `json:"first_registration"`
+	PurchaseOdometerKm int32          `json:"purchase_odometer_km"`
+	AnnualDepreciation pgtype.Numeric `json:"annual_depreciation"`
+	KmDepreciation     pgtype.Numeric `json:"km_depreciation"`
+	ExpectedKmPerYear  int32          `json:"expected_km_per_year"`
+	CreatedAt          time.Time      `json:"created_at"`
+	PurchaseCosts      pgtype.Numeric `json:"purchase_costs"`
+	NotarizedDate      pgtype.Date    `json:"notarized_date"`
+	LandValue          pgtype.Numeric `json:"land_value"`
+	YearBuilt          pgtype.Int4    `json:"year_built"`
+	UsefulLifeYears    int32          `json:"useful_life_years"`
+	PriceDrift         pgtype.Numeric `json:"price_drift"`
+	SelfUsed           bool           `json:"self_used"`
+	LivingAreaM2       pgtype.Numeric `json:"living_area_m2"`
+	Details            string         `json:"details"`
+}
+
+type AssetImprovement struct {
+	ID          uuid.UUID      `json:"id"`
+	AssetID     uuid.UUID      `json:"asset_id"`
+	Date        time.Time      `json:"date"`
+	Amount      pgtype.Numeric `json:"amount"`
+	Description string         `json:"description"`
 }
 
 type AssetObservation struct {
@@ -49,6 +65,12 @@ type AssetObservation struct {
 	OdometerKm     pgtype.Int4    `json:"odometer_km"`
 	AppraisedValue pgtype.Numeric `json:"appraised_value"`
 	Note           pgtype.Text    `json:"note"`
+}
+
+type AssetTransaction struct {
+	TransactionID uuid.UUID `json:"transaction_id"`
+	AssetID       uuid.UUID `json:"asset_id"`
+	Purpose       string    `json:"purpose"`
 }
 
 type BackfillJob struct {
@@ -122,6 +144,37 @@ type ImportHistory struct {
 	NewSecurities []string  `json:"new_securities"`
 }
 
+type Loan struct {
+	ID                uuid.UUID      `json:"id"`
+	AssetID           uuid.UUID      `json:"asset_id"`
+	Name              string         `json:"name"`
+	Lender            string         `json:"lender"`
+	Principal         pgtype.Numeric `json:"principal"`
+	PayoutDate        time.Time      `json:"payout_date"`
+	FirstPaymentDate  time.Time      `json:"first_payment_date"`
+	NominalRate       pgtype.Numeric `json:"nominal_rate"`
+	MonthlyPayment    pgtype.Numeric `json:"monthly_payment"`
+	FixedUntil        pgtype.Date    `json:"fixed_until"`
+	FollowupRate      pgtype.Numeric `json:"followup_rate"`
+	ExtraAllowancePct pgtype.Numeric `json:"extra_allowance_pct"`
+	PaymentAccountID  *uuid.UUID     `json:"payment_account_id"`
+	CreatedAt         time.Time      `json:"created_at"`
+}
+
+type LoanExtraRepayment struct {
+	ID            uuid.UUID      `json:"id"`
+	LoanID        uuid.UUID      `json:"loan_id"`
+	Date          time.Time      `json:"date"`
+	Amount        pgtype.Numeric `json:"amount"`
+	TransactionID *uuid.UUID     `json:"transaction_id"`
+}
+
+type LoanPaymentLink struct {
+	TransactionID uuid.UUID `json:"transaction_id"`
+	LoanID        uuid.UUID `json:"loan_id"`
+	DueDate       time.Time `json:"due_date"`
+}
+
 type MarketDatum struct {
 	SecurityISIN string         `json:"security_isin"`
 	Date         time.Time      `json:"date"`
@@ -135,6 +188,7 @@ type NetWorthIntraday struct {
 	CashComponent       pgtype.Numeric `json:"cash_component"`
 	InvestmentComponent pgtype.Numeric `json:"investment_component"`
 	PhysicalComponent   pgtype.Numeric `json:"physical_component"`
+	DebtComponent       pgtype.Numeric `json:"debt_component"`
 }
 
 type NetWorthSnapshot struct {
@@ -143,6 +197,7 @@ type NetWorthSnapshot struct {
 	CashComponent       pgtype.Numeric `json:"cash_component"`
 	InvestmentComponent pgtype.Numeric `json:"investment_component"`
 	PhysicalComponent   pgtype.Numeric `json:"physical_component"`
+	DebtComponent       pgtype.Numeric `json:"debt_component"`
 }
 
 type Notification struct {

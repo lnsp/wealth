@@ -114,23 +114,33 @@ func (q *Queries) CreateAccount(ctx context.Context, arg CreateAccountParams) (A
 
 const createAsset = `-- name: CreateAsset :one
 INSERT INTO assets (kind, name, list_price, purchase_price, purchase_date, first_registration,
-    purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id, created_at
+    purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year,
+    purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift,
+    self_used, living_area_m2, details)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details
 `
 
 type CreateAssetParams struct {
-	Kind                  string         `json:"kind"`
-	Name                  string         `json:"name"`
-	ListPrice             pgtype.Numeric `json:"list_price"`
-	PurchasePrice         pgtype.Numeric `json:"purchase_price"`
-	PurchaseDate          time.Time      `json:"purchase_date"`
-	FirstRegistration     pgtype.Date    `json:"first_registration"`
-	PurchaseOdometerKm    int32          `json:"purchase_odometer_km"`
-	AnnualDepreciation    pgtype.Numeric `json:"annual_depreciation"`
-	KmDepreciation        pgtype.Numeric `json:"km_depreciation"`
-	ExpectedKmPerYear     int32          `json:"expected_km_per_year"`
-	PurchaseTransactionID *uuid.UUID     `json:"purchase_transaction_id"`
+	Kind               string         `json:"kind"`
+	Name               string         `json:"name"`
+	ListPrice          pgtype.Numeric `json:"list_price"`
+	PurchasePrice      pgtype.Numeric `json:"purchase_price"`
+	PurchaseDate       time.Time      `json:"purchase_date"`
+	FirstRegistration  pgtype.Date    `json:"first_registration"`
+	PurchaseOdometerKm int32          `json:"purchase_odometer_km"`
+	AnnualDepreciation pgtype.Numeric `json:"annual_depreciation"`
+	KmDepreciation     pgtype.Numeric `json:"km_depreciation"`
+	ExpectedKmPerYear  int32          `json:"expected_km_per_year"`
+	PurchaseCosts      pgtype.Numeric `json:"purchase_costs"`
+	NotarizedDate      pgtype.Date    `json:"notarized_date"`
+	LandValue          pgtype.Numeric `json:"land_value"`
+	YearBuilt          pgtype.Int4    `json:"year_built"`
+	UsefulLifeYears    int32          `json:"useful_life_years"`
+	PriceDrift         pgtype.Numeric `json:"price_drift"`
+	SelfUsed           bool           `json:"self_used"`
+	LivingAreaM2       pgtype.Numeric `json:"living_area_m2"`
+	Details            string         `json:"details"`
 }
 
 func (q *Queries) CreateAsset(ctx context.Context, arg CreateAssetParams) (Asset, error) {
@@ -145,7 +155,15 @@ func (q *Queries) CreateAsset(ctx context.Context, arg CreateAssetParams) (Asset
 		arg.AnnualDepreciation,
 		arg.KmDepreciation,
 		arg.ExpectedKmPerYear,
-		arg.PurchaseTransactionID,
+		arg.PurchaseCosts,
+		arg.NotarizedDate,
+		arg.LandValue,
+		arg.YearBuilt,
+		arg.UsefulLifeYears,
+		arg.PriceDrift,
+		arg.SelfUsed,
+		arg.LivingAreaM2,
+		arg.Details,
 	)
 	var i Asset
 	err := row.Scan(
@@ -160,8 +178,47 @@ func (q *Queries) CreateAsset(ctx context.Context, arg CreateAssetParams) (Asset
 		&i.AnnualDepreciation,
 		&i.KmDepreciation,
 		&i.ExpectedKmPerYear,
-		&i.PurchaseTransactionID,
 		&i.CreatedAt,
+		&i.PurchaseCosts,
+		&i.NotarizedDate,
+		&i.LandValue,
+		&i.YearBuilt,
+		&i.UsefulLifeYears,
+		&i.PriceDrift,
+		&i.SelfUsed,
+		&i.LivingAreaM2,
+		&i.Details,
+	)
+	return i, err
+}
+
+const createAssetImprovement = `-- name: CreateAssetImprovement :one
+INSERT INTO asset_improvements (asset_id, date, amount, description)
+VALUES ($1, $2, $3, $4)
+RETURNING id, asset_id, date, amount, description
+`
+
+type CreateAssetImprovementParams struct {
+	AssetID     uuid.UUID      `json:"asset_id"`
+	Date        time.Time      `json:"date"`
+	Amount      pgtype.Numeric `json:"amount"`
+	Description string         `json:"description"`
+}
+
+func (q *Queries) CreateAssetImprovement(ctx context.Context, arg CreateAssetImprovementParams) (AssetImprovement, error) {
+	row := q.db.QueryRow(ctx, createAssetImprovement,
+		arg.AssetID,
+		arg.Date,
+		arg.Amount,
+		arg.Description,
+	)
+	var i AssetImprovement
+	err := row.Scan(
+		&i.ID,
+		&i.AssetID,
+		&i.Date,
+		&i.Amount,
+		&i.Description,
 	)
 	return i, err
 }
@@ -240,6 +297,94 @@ func (q *Queries) CreateJournalEntry(ctx context.Context, arg CreateJournalEntry
 		&i.Outcome,
 		&i.OutcomeDate,
 		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createLoan = `-- name: CreateLoan :one
+INSERT INTO loans (asset_id, name, lender, principal, payout_date, first_payment_date, nominal_rate,
+    monthly_payment, fixed_until, followup_rate, extra_allowance_pct, payment_account_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+RETURNING id, asset_id, name, lender, principal, payout_date, first_payment_date, nominal_rate, monthly_payment, fixed_until, followup_rate, extra_allowance_pct, payment_account_id, created_at
+`
+
+type CreateLoanParams struct {
+	AssetID           uuid.UUID      `json:"asset_id"`
+	Name              string         `json:"name"`
+	Lender            string         `json:"lender"`
+	Principal         pgtype.Numeric `json:"principal"`
+	PayoutDate        time.Time      `json:"payout_date"`
+	FirstPaymentDate  time.Time      `json:"first_payment_date"`
+	NominalRate       pgtype.Numeric `json:"nominal_rate"`
+	MonthlyPayment    pgtype.Numeric `json:"monthly_payment"`
+	FixedUntil        pgtype.Date    `json:"fixed_until"`
+	FollowupRate      pgtype.Numeric `json:"followup_rate"`
+	ExtraAllowancePct pgtype.Numeric `json:"extra_allowance_pct"`
+	PaymentAccountID  *uuid.UUID     `json:"payment_account_id"`
+}
+
+func (q *Queries) CreateLoan(ctx context.Context, arg CreateLoanParams) (Loan, error) {
+	row := q.db.QueryRow(ctx, createLoan,
+		arg.AssetID,
+		arg.Name,
+		arg.Lender,
+		arg.Principal,
+		arg.PayoutDate,
+		arg.FirstPaymentDate,
+		arg.NominalRate,
+		arg.MonthlyPayment,
+		arg.FixedUntil,
+		arg.FollowupRate,
+		arg.ExtraAllowancePct,
+		arg.PaymentAccountID,
+	)
+	var i Loan
+	err := row.Scan(
+		&i.ID,
+		&i.AssetID,
+		&i.Name,
+		&i.Lender,
+		&i.Principal,
+		&i.PayoutDate,
+		&i.FirstPaymentDate,
+		&i.NominalRate,
+		&i.MonthlyPayment,
+		&i.FixedUntil,
+		&i.FollowupRate,
+		&i.ExtraAllowancePct,
+		&i.PaymentAccountID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createLoanExtraRepayment = `-- name: CreateLoanExtraRepayment :one
+INSERT INTO loan_extra_repayments (loan_id, date, amount, transaction_id)
+VALUES ($1, $2, $3, $4)
+RETURNING id, loan_id, date, amount, transaction_id
+`
+
+type CreateLoanExtraRepaymentParams struct {
+	LoanID        uuid.UUID      `json:"loan_id"`
+	Date          time.Time      `json:"date"`
+	Amount        pgtype.Numeric `json:"amount"`
+	TransactionID *uuid.UUID     `json:"transaction_id"`
+}
+
+func (q *Queries) CreateLoanExtraRepayment(ctx context.Context, arg CreateLoanExtraRepaymentParams) (LoanExtraRepayment, error) {
+	row := q.db.QueryRow(ctx, createLoanExtraRepayment,
+		arg.LoanID,
+		arg.Date,
+		arg.Amount,
+		arg.TransactionID,
+	)
+	var i LoanExtraRepayment
+	err := row.Scan(
+		&i.ID,
+		&i.LoanID,
+		&i.Date,
+		&i.Amount,
+		&i.TransactionID,
 	)
 	return i, err
 }
@@ -384,6 +529,20 @@ func (q *Queries) DeleteAsset(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
+const deleteAssetImprovement = `-- name: DeleteAssetImprovement :exec
+DELETE FROM asset_improvements WHERE id = $1 AND asset_id = $2
+`
+
+type DeleteAssetImprovementParams struct {
+	ID      uuid.UUID `json:"id"`
+	AssetID uuid.UUID `json:"asset_id"`
+}
+
+func (q *Queries) DeleteAssetImprovement(ctx context.Context, arg DeleteAssetImprovementParams) error {
+	_, err := q.db.Exec(ctx, deleteAssetImprovement, arg.ID, arg.AssetID)
+	return err
+}
+
 const deleteAssetObservation = `-- name: DeleteAssetObservation :exec
 DELETE FROM asset_observations WHERE asset_id = $1 AND date = $2
 `
@@ -395,6 +554,15 @@ type DeleteAssetObservationParams struct {
 
 func (q *Queries) DeleteAssetObservation(ctx context.Context, arg DeleteAssetObservationParams) error {
 	_, err := q.db.Exec(ctx, deleteAssetObservation, arg.AssetID, arg.Date)
+	return err
+}
+
+const deleteAssetTransaction = `-- name: DeleteAssetTransaction :exec
+DELETE FROM asset_transactions WHERE transaction_id = $1
+`
+
+func (q *Queries) DeleteAssetTransaction(ctx context.Context, transactionID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteAssetTransaction, transactionID)
 	return err
 }
 
@@ -414,6 +582,57 @@ DELETE FROM decision_journal WHERE id = $1
 func (q *Queries) DeleteJournalEntry(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteJournalEntry, id)
 	return err
+}
+
+const deleteLoan = `-- name: DeleteLoan :exec
+DELETE FROM loans WHERE id = $1
+`
+
+func (q *Queries) DeleteLoan(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteLoan, id)
+	return err
+}
+
+const deleteLoanExtraRepayment = `-- name: DeleteLoanExtraRepayment :one
+DELETE FROM loan_extra_repayments WHERE id = $1 AND loan_id = $2
+RETURNING transaction_id
+`
+
+type DeleteLoanExtraRepaymentParams struct {
+	ID     uuid.UUID `json:"id"`
+	LoanID uuid.UUID `json:"loan_id"`
+}
+
+func (q *Queries) DeleteLoanExtraRepayment(ctx context.Context, arg DeleteLoanExtraRepaymentParams) (*uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, deleteLoanExtraRepayment, arg.ID, arg.LoanID)
+	var transaction_id *uuid.UUID
+	err := row.Scan(&transaction_id)
+	return transaction_id, err
+}
+
+const deleteLoanPaymentLinksForLoan = `-- name: DeleteLoanPaymentLinksForLoan :many
+DELETE FROM loan_payment_links WHERE loan_id = $1
+RETURNING transaction_id
+`
+
+func (q *Queries) DeleteLoanPaymentLinksForLoan(ctx context.Context, loanID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, deleteLoanPaymentLinksForLoan, loanID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var transaction_id uuid.UUID
+		if err := rows.Scan(&transaction_id); err != nil {
+			return nil, err
+		}
+		items = append(items, transaction_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const deleteNotificationChannel = `-- name: DeleteNotificationChannel :exec
@@ -533,7 +752,7 @@ func (q *Queries) GetAccountByInstitutionAndType(ctx context.Context, arg GetAcc
 }
 
 const getAsset = `-- name: GetAsset :one
-SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id, created_at FROM assets WHERE id = $1
+SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details FROM assets WHERE id = $1
 `
 
 func (q *Queries) GetAsset(ctx context.Context, id uuid.UUID) (Asset, error) {
@@ -551,8 +770,16 @@ func (q *Queries) GetAsset(ctx context.Context, id uuid.UUID) (Asset, error) {
 		&i.AnnualDepreciation,
 		&i.KmDepreciation,
 		&i.ExpectedKmPerYear,
-		&i.PurchaseTransactionID,
 		&i.CreatedAt,
+		&i.PurchaseCosts,
+		&i.NotarizedDate,
+		&i.LandValue,
+		&i.YearBuilt,
+		&i.UsefulLifeYears,
+		&i.PriceDrift,
+		&i.SelfUsed,
+		&i.LivingAreaM2,
+		&i.Details,
 	)
 	return i, err
 }
@@ -612,6 +839,32 @@ func (q *Queries) GetLatestPrice(ctx context.Context, securityIsin string) (GetL
 	row := q.db.QueryRow(ctx, getLatestPrice, securityIsin)
 	var i GetLatestPriceRow
 	err := row.Scan(&i.Close, &i.Date, &i.Currency)
+	return i, err
+}
+
+const getLoan = `-- name: GetLoan :one
+SELECT id, asset_id, name, lender, principal, payout_date, first_payment_date, nominal_rate, monthly_payment, fixed_until, followup_rate, extra_allowance_pct, payment_account_id, created_at FROM loans WHERE id = $1
+`
+
+func (q *Queries) GetLoan(ctx context.Context, id uuid.UUID) (Loan, error) {
+	row := q.db.QueryRow(ctx, getLoan, id)
+	var i Loan
+	err := row.Scan(
+		&i.ID,
+		&i.AssetID,
+		&i.Name,
+		&i.Lender,
+		&i.Principal,
+		&i.PayoutDate,
+		&i.FirstPaymentDate,
+		&i.NominalRate,
+		&i.MonthlyPayment,
+		&i.FixedUntil,
+		&i.FollowupRate,
+		&i.ExtraAllowancePct,
+		&i.PaymentAccountID,
+		&i.CreatedAt,
+	)
 	return i, err
 }
 
@@ -779,6 +1032,21 @@ func (q *Queries) GetWealthReport(ctx context.Context, id uuid.UUID) (WealthRepo
 	return i, err
 }
 
+const insertAssetTransaction = `-- name: InsertAssetTransaction :exec
+INSERT INTO asset_transactions (transaction_id, asset_id, purpose) VALUES ($1, $2, $3)
+`
+
+type InsertAssetTransactionParams struct {
+	TransactionID uuid.UUID `json:"transaction_id"`
+	AssetID       uuid.UUID `json:"asset_id"`
+	Purpose       string    `json:"purpose"`
+}
+
+func (q *Queries) InsertAssetTransaction(ctx context.Context, arg InsertAssetTransactionParams) error {
+	_, err := q.db.Exec(ctx, insertAssetTransaction, arg.TransactionID, arg.AssetID, arg.Purpose)
+	return err
+}
+
 const insertImportHistory = `-- name: InsertImportHistory :exec
 INSERT INTO import_history (account_id, institution, filename, total_rows, imported, skipped, new_securities)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -807,9 +1075,25 @@ func (q *Queries) InsertImportHistory(ctx context.Context, arg InsertImportHisto
 	return err
 }
 
+const insertLoanPaymentLink = `-- name: InsertLoanPaymentLink :exec
+INSERT INTO loan_payment_links (transaction_id, loan_id, due_date) VALUES ($1, $2, $3)
+ON CONFLICT DO NOTHING
+`
+
+type InsertLoanPaymentLinkParams struct {
+	TransactionID uuid.UUID `json:"transaction_id"`
+	LoanID        uuid.UUID `json:"loan_id"`
+	DueDate       time.Time `json:"due_date"`
+}
+
+func (q *Queries) InsertLoanPaymentLink(ctx context.Context, arg InsertLoanPaymentLinkParams) error {
+	_, err := q.db.Exec(ctx, insertLoanPaymentLink, arg.TransactionID, arg.LoanID, arg.DueDate)
+	return err
+}
+
 const insertNetWorthIntraday = `-- name: InsertNetWorthIntraday :exec
-INSERT INTO net_worth_intraday (recorded_at, total, cash_component, investment_component, physical_component)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO net_worth_intraday (recorded_at, total, cash_component, investment_component, physical_component, debt_component)
+VALUES ($1, $2, $3, $4, $5, $6)
 `
 
 type InsertNetWorthIntradayParams struct {
@@ -818,6 +1102,7 @@ type InsertNetWorthIntradayParams struct {
 	CashComponent       pgtype.Numeric `json:"cash_component"`
 	InvestmentComponent pgtype.Numeric `json:"investment_component"`
 	PhysicalComponent   pgtype.Numeric `json:"physical_component"`
+	DebtComponent       pgtype.Numeric `json:"debt_component"`
 }
 
 func (q *Queries) InsertNetWorthIntraday(ctx context.Context, arg InsertNetWorthIntradayParams) error {
@@ -827,6 +1112,7 @@ func (q *Queries) InsertNetWorthIntraday(ctx context.Context, arg InsertNetWorth
 		arg.CashComponent,
 		arg.InvestmentComponent,
 		arg.PhysicalComponent,
+		arg.DebtComponent,
 	)
 	return err
 }
@@ -1075,6 +1361,36 @@ func (q *Queries) ListAllAccounts(ctx context.Context) ([]Account, error) {
 	return items, nil
 }
 
+const listAssetImprovements = `-- name: ListAssetImprovements :many
+SELECT id, asset_id, date, amount, description FROM asset_improvements ORDER BY asset_id, date
+`
+
+func (q *Queries) ListAssetImprovements(ctx context.Context) ([]AssetImprovement, error) {
+	rows, err := q.db.Query(ctx, listAssetImprovements)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AssetImprovement{}
+	for rows.Next() {
+		var i AssetImprovement
+		if err := rows.Scan(
+			&i.ID,
+			&i.AssetID,
+			&i.Date,
+			&i.Amount,
+			&i.Description,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAssetObservations = `-- name: ListAssetObservations :many
 SELECT asset_id, date, odometer_km, appraised_value, note FROM asset_observations ORDER BY asset_id, date
 `
@@ -1105,8 +1421,32 @@ func (q *Queries) ListAssetObservations(ctx context.Context) ([]AssetObservation
 	return items, nil
 }
 
+const listAssetTransactions = `-- name: ListAssetTransactions :many
+SELECT transaction_id, asset_id, purpose FROM asset_transactions
+`
+
+func (q *Queries) ListAssetTransactions(ctx context.Context) ([]AssetTransaction, error) {
+	rows, err := q.db.Query(ctx, listAssetTransactions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AssetTransaction{}
+	for rows.Next() {
+		var i AssetTransaction
+		if err := rows.Scan(&i.TransactionID, &i.AssetID, &i.Purpose); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAssets = `-- name: ListAssets :many
-SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id, created_at FROM assets ORDER BY purchase_date, created_at
+SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details FROM assets ORDER BY purchase_date, created_at
 `
 
 func (q *Queries) ListAssets(ctx context.Context) ([]Asset, error) {
@@ -1130,8 +1470,16 @@ func (q *Queries) ListAssets(ctx context.Context) ([]Asset, error) {
 			&i.AnnualDepreciation,
 			&i.KmDepreciation,
 			&i.ExpectedKmPerYear,
-			&i.PurchaseTransactionID,
 			&i.CreatedAt,
+			&i.PurchaseCosts,
+			&i.NotarizedDate,
+			&i.LandValue,
+			&i.YearBuilt,
+			&i.UsefulLifeYears,
+			&i.PriceDrift,
+			&i.SelfUsed,
+			&i.LivingAreaM2,
+			&i.Details,
 		); err != nil {
 			return nil, err
 		}
@@ -1521,8 +1869,101 @@ func (q *Queries) ListLatestPrices(ctx context.Context) ([]ListLatestPricesRow, 
 	return items, nil
 }
 
+const listLoanExtraRepayments = `-- name: ListLoanExtraRepayments :many
+SELECT id, loan_id, date, amount, transaction_id FROM loan_extra_repayments ORDER BY loan_id, date
+`
+
+func (q *Queries) ListLoanExtraRepayments(ctx context.Context) ([]LoanExtraRepayment, error) {
+	rows, err := q.db.Query(ctx, listLoanExtraRepayments)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LoanExtraRepayment{}
+	for rows.Next() {
+		var i LoanExtraRepayment
+		if err := rows.Scan(
+			&i.ID,
+			&i.LoanID,
+			&i.Date,
+			&i.Amount,
+			&i.TransactionID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLoanPaymentLinks = `-- name: ListLoanPaymentLinks :many
+SELECT transaction_id, loan_id, due_date FROM loan_payment_links
+`
+
+func (q *Queries) ListLoanPaymentLinks(ctx context.Context) ([]LoanPaymentLink, error) {
+	rows, err := q.db.Query(ctx, listLoanPaymentLinks)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LoanPaymentLink{}
+	for rows.Next() {
+		var i LoanPaymentLink
+		if err := rows.Scan(&i.TransactionID, &i.LoanID, &i.DueDate); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLoans = `-- name: ListLoans :many
+SELECT id, asset_id, name, lender, principal, payout_date, first_payment_date, nominal_rate, monthly_payment, fixed_until, followup_rate, extra_allowance_pct, payment_account_id, created_at FROM loans ORDER BY payout_date, created_at
+`
+
+func (q *Queries) ListLoans(ctx context.Context) ([]Loan, error) {
+	rows, err := q.db.Query(ctx, listLoans)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Loan{}
+	for rows.Next() {
+		var i Loan
+		if err := rows.Scan(
+			&i.ID,
+			&i.AssetID,
+			&i.Name,
+			&i.Lender,
+			&i.Principal,
+			&i.PayoutDate,
+			&i.FirstPaymentDate,
+			&i.NominalRate,
+			&i.MonthlyPayment,
+			&i.FixedUntil,
+			&i.FollowupRate,
+			&i.ExtraAllowancePct,
+			&i.PaymentAccountID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listNetWorthIntraday = `-- name: ListNetWorthIntraday :many
-SELECT recorded_at, total, cash_component, investment_component, physical_component FROM net_worth_intraday
+SELECT recorded_at, total, cash_component, investment_component, physical_component, debt_component FROM net_worth_intraday
 WHERE recorded_at >= $1
 ORDER BY recorded_at ASC
 `
@@ -1542,6 +1983,7 @@ func (q *Queries) ListNetWorthIntraday(ctx context.Context, recordedAt time.Time
 			&i.CashComponent,
 			&i.InvestmentComponent,
 			&i.PhysicalComponent,
+			&i.DebtComponent,
 		); err != nil {
 			return nil, err
 		}
@@ -1554,7 +1996,7 @@ func (q *Queries) ListNetWorthIntraday(ctx context.Context, recordedAt time.Time
 }
 
 const listNetWorthSnapshots = `-- name: ListNetWorthSnapshots :many
-SELECT date, total, cash_component, investment_component, physical_component FROM net_worth_snapshots ORDER BY date DESC LIMIT $1
+SELECT date, total, cash_component, investment_component, physical_component, debt_component FROM net_worth_snapshots ORDER BY date DESC LIMIT $1
 `
 
 func (q *Queries) ListNetWorthSnapshots(ctx context.Context, limit int32) ([]NetWorthSnapshot, error) {
@@ -1572,6 +2014,7 @@ func (q *Queries) ListNetWorthSnapshots(ctx context.Context, limit int32) ([]Net
 			&i.CashComponent,
 			&i.InvestmentComponent,
 			&i.PhysicalComponent,
+			&i.DebtComponent,
 		); err != nil {
 			return nil, err
 		}
@@ -2310,23 +2753,33 @@ func (q *Queries) UpdateAccount(ctx context.Context, arg UpdateAccountParams) er
 const updateAsset = `-- name: UpdateAsset :one
 UPDATE assets SET name = $2, list_price = $3, purchase_price = $4, purchase_date = $5,
     first_registration = $6, purchase_odometer_km = $7, annual_depreciation = $8,
-    km_depreciation = $9, expected_km_per_year = $10, purchase_transaction_id = $11
+    km_depreciation = $9, expected_km_per_year = $10, purchase_costs = $11,
+    notarized_date = $12, land_value = $13, year_built = $14, useful_life_years = $15,
+    price_drift = $16, self_used = $17, living_area_m2 = $18, details = $19
 WHERE id = $1
-RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, purchase_transaction_id, created_at
+RETURNING id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details
 `
 
 type UpdateAssetParams struct {
-	ID                    uuid.UUID      `json:"id"`
-	Name                  string         `json:"name"`
-	ListPrice             pgtype.Numeric `json:"list_price"`
-	PurchasePrice         pgtype.Numeric `json:"purchase_price"`
-	PurchaseDate          time.Time      `json:"purchase_date"`
-	FirstRegistration     pgtype.Date    `json:"first_registration"`
-	PurchaseOdometerKm    int32          `json:"purchase_odometer_km"`
-	AnnualDepreciation    pgtype.Numeric `json:"annual_depreciation"`
-	KmDepreciation        pgtype.Numeric `json:"km_depreciation"`
-	ExpectedKmPerYear     int32          `json:"expected_km_per_year"`
-	PurchaseTransactionID *uuid.UUID     `json:"purchase_transaction_id"`
+	ID                 uuid.UUID      `json:"id"`
+	Name               string         `json:"name"`
+	ListPrice          pgtype.Numeric `json:"list_price"`
+	PurchasePrice      pgtype.Numeric `json:"purchase_price"`
+	PurchaseDate       time.Time      `json:"purchase_date"`
+	FirstRegistration  pgtype.Date    `json:"first_registration"`
+	PurchaseOdometerKm int32          `json:"purchase_odometer_km"`
+	AnnualDepreciation pgtype.Numeric `json:"annual_depreciation"`
+	KmDepreciation     pgtype.Numeric `json:"km_depreciation"`
+	ExpectedKmPerYear  int32          `json:"expected_km_per_year"`
+	PurchaseCosts      pgtype.Numeric `json:"purchase_costs"`
+	NotarizedDate      pgtype.Date    `json:"notarized_date"`
+	LandValue          pgtype.Numeric `json:"land_value"`
+	YearBuilt          pgtype.Int4    `json:"year_built"`
+	UsefulLifeYears    int32          `json:"useful_life_years"`
+	PriceDrift         pgtype.Numeric `json:"price_drift"`
+	SelfUsed           bool           `json:"self_used"`
+	LivingAreaM2       pgtype.Numeric `json:"living_area_m2"`
+	Details            string         `json:"details"`
 }
 
 func (q *Queries) UpdateAsset(ctx context.Context, arg UpdateAssetParams) (Asset, error) {
@@ -2341,7 +2794,15 @@ func (q *Queries) UpdateAsset(ctx context.Context, arg UpdateAssetParams) (Asset
 		arg.AnnualDepreciation,
 		arg.KmDepreciation,
 		arg.ExpectedKmPerYear,
-		arg.PurchaseTransactionID,
+		arg.PurchaseCosts,
+		arg.NotarizedDate,
+		arg.LandValue,
+		arg.YearBuilt,
+		arg.UsefulLifeYears,
+		arg.PriceDrift,
+		arg.SelfUsed,
+		arg.LivingAreaM2,
+		arg.Details,
 	)
 	var i Asset
 	err := row.Scan(
@@ -2356,8 +2817,16 @@ func (q *Queries) UpdateAsset(ctx context.Context, arg UpdateAssetParams) (Asset
 		&i.AnnualDepreciation,
 		&i.KmDepreciation,
 		&i.ExpectedKmPerYear,
-		&i.PurchaseTransactionID,
 		&i.CreatedAt,
+		&i.PurchaseCosts,
+		&i.NotarizedDate,
+		&i.LandValue,
+		&i.YearBuilt,
+		&i.UsefulLifeYears,
+		&i.PriceDrift,
+		&i.SelfUsed,
+		&i.LivingAreaM2,
+		&i.Details,
 	)
 	return i, err
 }
@@ -2405,6 +2874,64 @@ type UpdateJournalOutcomeParams struct {
 func (q *Queries) UpdateJournalOutcome(ctx context.Context, arg UpdateJournalOutcomeParams) error {
 	_, err := q.db.Exec(ctx, updateJournalOutcome, arg.ID, arg.Outcome)
 	return err
+}
+
+const updateLoan = `-- name: UpdateLoan :one
+UPDATE loans SET name = $2, lender = $3, principal = $4, payout_date = $5, first_payment_date = $6,
+    nominal_rate = $7, monthly_payment = $8, fixed_until = $9, followup_rate = $10,
+    extra_allowance_pct = $11, payment_account_id = $12
+WHERE id = $1
+RETURNING id, asset_id, name, lender, principal, payout_date, first_payment_date, nominal_rate, monthly_payment, fixed_until, followup_rate, extra_allowance_pct, payment_account_id, created_at
+`
+
+type UpdateLoanParams struct {
+	ID                uuid.UUID      `json:"id"`
+	Name              string         `json:"name"`
+	Lender            string         `json:"lender"`
+	Principal         pgtype.Numeric `json:"principal"`
+	PayoutDate        time.Time      `json:"payout_date"`
+	FirstPaymentDate  time.Time      `json:"first_payment_date"`
+	NominalRate       pgtype.Numeric `json:"nominal_rate"`
+	MonthlyPayment    pgtype.Numeric `json:"monthly_payment"`
+	FixedUntil        pgtype.Date    `json:"fixed_until"`
+	FollowupRate      pgtype.Numeric `json:"followup_rate"`
+	ExtraAllowancePct pgtype.Numeric `json:"extra_allowance_pct"`
+	PaymentAccountID  *uuid.UUID     `json:"payment_account_id"`
+}
+
+func (q *Queries) UpdateLoan(ctx context.Context, arg UpdateLoanParams) (Loan, error) {
+	row := q.db.QueryRow(ctx, updateLoan,
+		arg.ID,
+		arg.Name,
+		arg.Lender,
+		arg.Principal,
+		arg.PayoutDate,
+		arg.FirstPaymentDate,
+		arg.NominalRate,
+		arg.MonthlyPayment,
+		arg.FixedUntil,
+		arg.FollowupRate,
+		arg.ExtraAllowancePct,
+		arg.PaymentAccountID,
+	)
+	var i Loan
+	err := row.Scan(
+		&i.ID,
+		&i.AssetID,
+		&i.Name,
+		&i.Lender,
+		&i.Principal,
+		&i.PayoutDate,
+		&i.FirstPaymentDate,
+		&i.NominalRate,
+		&i.MonthlyPayment,
+		&i.FixedUntil,
+		&i.FollowupRate,
+		&i.ExtraAllowancePct,
+		&i.PaymentAccountID,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const updateNotificationChannel = `-- name: UpdateNotificationChannel :exec
@@ -2624,13 +3151,14 @@ func (q *Queries) UpsertMarketData(ctx context.Context, arg UpsertMarketDataPara
 }
 
 const upsertNetWorthSnapshot = `-- name: UpsertNetWorthSnapshot :exec
-INSERT INTO net_worth_snapshots (date, total, cash_component, investment_component, physical_component)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO net_worth_snapshots (date, total, cash_component, investment_component, physical_component, debt_component)
+VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (date) DO UPDATE SET
     total = EXCLUDED.total,
     cash_component = EXCLUDED.cash_component,
     investment_component = EXCLUDED.investment_component,
-    physical_component = EXCLUDED.physical_component
+    physical_component = EXCLUDED.physical_component,
+    debt_component = EXCLUDED.debt_component
 `
 
 type UpsertNetWorthSnapshotParams struct {
@@ -2639,6 +3167,7 @@ type UpsertNetWorthSnapshotParams struct {
 	CashComponent       pgtype.Numeric `json:"cash_component"`
 	InvestmentComponent pgtype.Numeric `json:"investment_component"`
 	PhysicalComponent   pgtype.Numeric `json:"physical_component"`
+	DebtComponent       pgtype.Numeric `json:"debt_component"`
 }
 
 func (q *Queries) UpsertNetWorthSnapshot(ctx context.Context, arg UpsertNetWorthSnapshotParams) error {
@@ -2648,6 +3177,7 @@ func (q *Queries) UpsertNetWorthSnapshot(ctx context.Context, arg UpsertNetWorth
 		arg.CashComponent,
 		arg.InvestmentComponent,
 		arg.PhysicalComponent,
+		arg.DebtComponent,
 	)
 	return err
 }

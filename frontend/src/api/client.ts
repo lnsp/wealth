@@ -106,6 +106,7 @@ export interface NetWorthSnapshot {
   cash_component: number;
   investment_component: number;
   physical_component: number;
+  debt_component: number;
 }
 
 export interface AssetObservation {
@@ -115,41 +116,149 @@ export interface AssetObservation {
   note: string;
 }
 
+export type AssetKind = 'car' | 'apartment' | 'house' | 'land' | 'other';
+
 export interface PhysicalAsset {
   id: string;
-  kind: 'car';
+  kind: AssetKind;
   name: string;
+  details: string;
   list_price: number | null;
   purchase_price: number;
+  purchase_costs: number;
+  cost_basis: number;
   purchase_date: string;
+  notarized_date: string | null;
   first_registration: string | null;
   purchase_odometer_km: number;
   annual_depreciation: number;
   km_depreciation: number;
   expected_km_per_year: number;
-  purchase_transaction_id: string | null;
+  land_value: number | null;
+  year_built: number | null;
+  useful_life_years: number;
+  price_drift: number;
+  self_used: boolean;
+  living_area_m2: number | null;
   current_value: number;
   value_change: number;
   value_change_pct: number;
+  vs_cost_basis: number;
+  monthly_change: number;
   pct_of_list: number | null;
-  odometer_estimate_km: number;
-  effective_annual_rate: number;
-  monthly_depreciation: number;
+  owed: number;
+  yours: number;
+  yours_pct: number;
+  loan_ids: string[];
+  tax_free_from: string | null;
+  tax_note: string;
+  car: { odometer_estimate_km: number; effective_annual_rate: number } | null;
+  property: {
+    land_value_now: number;
+    building_value_now: number;
+    remaining_life_years: number;
+    price_effect_per_year: number;
+    aging_effect_per_year: number;
+    has_building_aging: boolean;
+  } | null;
   observations: AssetObservation[];
-  curve: { date: string; value: number; projected: boolean }[];
+  improvements: { id: string; date: string; amount: number; description: string }[];
+  linked_transactions: { id: string; date: string; amount: number; counterparty: string; purpose: string }[];
+  curve: { date: string; value: number; owed: number; projected: boolean }[];
+}
+
+export interface LoanInput {
+  asset_id?: string;
+  name: string;
+  lender: string;
+  principal: number;
+  payout_date: string;
+  first_payment_date?: string;
+  nominal_rate: number;
+  monthly_payment?: number;
+  initial_repayment?: number;
+  fixed_until?: string;
+  followup_rate?: number;
+  extra_allowance_pct: number;
+  payment_account_id?: string;
 }
 
 export interface AssetInput {
+  kind: AssetKind;
   name: string;
+  details?: string;
   list_price?: number | null;
   purchase_price: number;
+  purchase_costs?: number;
   purchase_date: string;
+  notarized_date?: string;
   first_registration?: string;
-  purchase_odometer_km: number;
+  purchase_odometer_km?: number;
   annual_depreciation?: number;
   km_depreciation?: number;
   expected_km_per_year?: number;
-  purchase_transaction_id?: string;
+  land_value?: number;
+  year_built?: number;
+  useful_life_years?: number;
+  price_drift?: number;
+  self_used?: boolean;
+  living_area_m2?: number;
+  transaction_ids?: string[];
+  loan?: LoanInput;
+}
+
+export interface Loan {
+  id: string;
+  asset_id: string;
+  asset_name: string;
+  name: string;
+  lender: string;
+  principal: number;
+  payout_date: string;
+  first_payment_date: string;
+  nominal_rate: number;
+  initial_repayment: number;
+  monthly_payment: number;
+  fixed_until: string | null;
+  followup_rate: number | null;
+  extra_allowance_pct: number;
+  payment_account_id: string | null;
+  balance: number;
+  repaid: number;
+  repaid_pct: number;
+  next_payment: { due: string; interest: number; principal: number } | null;
+  remaining_at_fixed_end: number | null;
+  months_left_fixed: number | null;
+  interest_paid: number;
+  interest_fixed_period: number;
+  payoff_date: string;
+  due_count: number;
+  matched_count: number;
+  extra_used_this_year: number;
+  yearly?: { year: number; interest: number; principal: number; balance: number }[];
+  payments?: { transaction_id: string; date: string; due: string; amount: number; interest: number; principal: number }[];
+  extras?: { id: string; date: string; amount: number; transaction_id: string | null }[];
+}
+
+export interface LoanScenarioResult {
+  remaining_at_fixed_end: number;
+  payoff_date: string;
+  total_interest: number;
+  interest_after_fixed: number;
+}
+
+export interface AssetsOverview {
+  assets: PhysicalAsset[];
+  loans: Loan[];
+  totals: { worth: number; owed: number; yours: number };
+  composition: { investments: number; cash: number; as_of?: string };
+  defaults: {
+    annual_depreciation: number;
+    km_depreciation: number;
+    expected_km_per_year: number;
+    property_drift: number;
+    useful_life_years: number;
+  };
 }
 
 export interface ImportResult {
@@ -618,10 +727,10 @@ export const api = {
       `/portfolio/holdings${accountId ? `?account_id=${accountId}` : ''}`
     ),
   getNetWorth: (days = 365) => request<{ snapshots: NetWorthSnapshot[] }>(`/portfolio/networth?days=${days}`),
-  getNetWorthIntraday: () => request<{ points: { recorded_at: string; total: number; cash_component: number; investment_component: number; physical_component: number }[] }>('/portfolio/networth/intraday'),
+  getNetWorthIntraday: () => request<{ points: { recorded_at: string; total: number; cash_component: number; investment_component: number; physical_component: number; debt_component: number }[] }>('/portfolio/networth/intraday'),
 
-  // Physical assets (cars)
-  listAssets: () => request<{ assets: PhysicalAsset[]; total_value: number; defaults: { annual_depreciation: number; km_depreciation: number; expected_km_per_year: number } }>('/assets'),
+  // Physical assets and the loans financing them
+  listAssets: () => request<AssetsOverview>('/assets'),
   createAsset: (input: AssetInput) =>
     request<PhysicalAsset>('/assets', { method: 'POST', body: JSON.stringify(input) }),
   updateAsset: (id: string, input: AssetInput) =>
@@ -631,6 +740,24 @@ export const api = {
     request<PhysicalAsset>(`/assets/${id}/observations`, { method: 'PUT', body: JSON.stringify(obs) }),
   deleteAssetObservation: (id: string, date: string) =>
     request<PhysicalAsset>(`/assets/${id}/observations/${date}`, { method: 'DELETE' }),
+  createAssetImprovement: (id: string, imp: { date: string; amount: number; description: string; transaction_id?: string }) =>
+    request<PhysicalAsset>(`/assets/${id}/improvements`, { method: 'POST', body: JSON.stringify(imp) }),
+  deleteAssetImprovement: (id: string, improvementId: string) =>
+    request<PhysicalAsset>(`/assets/${id}/improvements/${improvementId}`, { method: 'DELETE' }),
+  getLoan: (id: string) => request<Loan>(`/loans/${id}`),
+  createLoan: (input: LoanInput) => request<Loan>('/loans', { method: 'POST', body: JSON.stringify(input) }),
+  updateLoan: (id: string, input: LoanInput) =>
+    request<Loan>(`/loans/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
+  deleteLoan: (id: string) => request<{ status: string }>(`/loans/${id}`, { method: 'DELETE' }),
+  getLoanScenario: (id: string, extraPerYear: number, followupRate?: number) =>
+    request<{ base: LoanScenarioResult; scenario: LoanScenarioResult; interest_saved: number }>(
+      `/loans/${id}/scenario?extra_per_year=${extraPerYear}${followupRate != null ? `&followup_rate=${followupRate}` : ''}`
+    ),
+  createExtraRepayment: (id: string, extra: { date: string; amount: number; transaction_id?: string }) =>
+    request<Loan>(`/loans/${id}/extra-repayments`, { method: 'POST', body: JSON.stringify(extra) }),
+  deleteExtraRepayment: (id: string, extraId: string) =>
+    request<Loan>(`/loans/${id}/extra-repayments/${extraId}`, { method: 'DELETE' }),
+  matchLoanPayments: () => request<{ matched: number }>('/loans/match', { method: 'POST' }),
   getPerformance: (accountId?: string) =>
     request<PerformanceData>(`/portfolio/performance${accountId ? `?account_id=${accountId}` : ''}`),
   getPerformanceHistory: () => request<{ history: PerformanceHistoryPoint[] }>('/portfolio/performance-history'),

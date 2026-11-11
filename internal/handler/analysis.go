@@ -17,6 +17,7 @@ import (
 
 	"github.com/lnsp/wealth/data"
 	"github.com/lnsp/wealth/internal/analytics"
+	"github.com/lnsp/wealth/internal/assets"
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
 
@@ -1306,6 +1307,7 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
+	holdings, _ := assets.Load(ctx, h.queries)
 
 	type monthFlow struct {
 		Month    string  `json:"month"`
@@ -1323,6 +1325,13 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 		}
 		if isAssetPurchase(txn.Category) {
 			continue // cash → physical asset, not an expense
+		}
+		if isLoanPayment(txn.Category) {
+			interest, ok := loanInterestPart(holdings, txn.ID)
+			if !ok {
+				continue // extra repayment: saving
+			}
+			amt = math.Copysign(interest, amt) // keep the import's sign convention
 		}
 		month := txn.Date.Format("2006-01")
 		if monthly[month] == nil {
@@ -2931,6 +2940,7 @@ func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
+	holdings, _ := assets.Load(ctx, h.queries)
 
 	// Category patterns: match counterparty or reference
 	type pattern struct {
@@ -3024,6 +3034,18 @@ func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request)
 		// Use user-assigned category if set
 		if txn.Category.Valid && txn.Category.String != "" {
 			cat = txn.Category.String
+		}
+		// Loan instalment: only the interest is spending; the principal is saved.
+		if isLoanPayment(txn.Category) {
+			interest, _, kind, ok := holdings.PaymentSplit(txn.ID)
+			if !ok {
+				continue
+			}
+			amt = math.Copysign(interest, amt)
+			cat = "Housing"
+			if kind == assets.KindCar {
+				cat = "Transport"
+			}
 		}
 		allCategories[cat] = true
 

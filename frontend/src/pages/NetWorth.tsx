@@ -6,16 +6,18 @@ import { TabBar } from '../components/ui';
 import { useThemeColors } from '../hooks/useThemeColors';
 import { useMarketRefresh } from '../hooks/useMarketRefresh';
 import UnvestedPanel from '../components/UnvestedPanel';
-import AssetsPanel from '../components/AssetsPanel';
+import AssetsTab, { ASSET_VIEW_PARAMS } from '../components/assets/AssetsTab';
+import { useSearchParams } from 'react-router-dom';
 
 type Period = '1D' | '1W' | '1M' | '3M' | '6M' | 'YTD' | '1Y' | 'All';
 const PERIODS: Period[] = ['1D', '1W', '1M', '3M', '6M', 'YTD', '1Y', 'All'];
 
-type NWTab = 'overview' | 'projection' | 'accounts';
+type NWTab = 'overview' | 'projection' | 'accounts' | 'assets';
 const NW_TABS_DASHBOARD: { id: NWTab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'projection', label: 'Projection' },
   { id: 'accounts', label: 'Accounts' },
+  { id: 'assets', label: 'Assets' },
 ];
 
 function periodToDays(period: Period): number {
@@ -87,9 +89,13 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
   // moves) so we can surface the gap when they diverge.
   const [attributionTotal, setAttributionTotal] = useState<number | null>(null);
   const [showAttribution, setShowAttribution] = useState(false);
-  const [activeTab, setActiveTab] = useState<NWTab>(defaultTab || 'overview');
-  const [wfData, setWfData] = useState<{ waterfall: { label: string; value: number; type: string }[]; time_series: { month: string; contributions: number; market_return: number; dividends: number; interest: number; assets?: number; total: number }[]; crossover_month: string; net_contributions: number; market_returns: number; dividends: number; current_nw: number } | null>(null);
-  const [intradayPoints, setIntradayPoints] = useState<{ recorded_at: string; total: number; cash_component: number; investment_component: number; physical_component: number }[]>([]);
+  const [searchParams] = useSearchParams();
+  // Deep links into the Assets tab (?asset=…, ?loan=…) open it directly.
+  const [activeTab, setActiveTab] = useState<NWTab>(
+    defaultTab || (ASSET_VIEW_PARAMS.some(k => searchParams.has(k)) ? 'assets' : 'overview'),
+  );
+  const [wfData, setWfData] = useState<{ waterfall: { label: string; value: number; type: string }[]; time_series: { month: string; contributions: number; market_return: number; dividends: number; interest: number; assets?: number; property_costs?: number; total: number }[]; crossover_month: string; net_contributions: number; market_returns: number; dividends: number; current_nw: number } | null>(null);
+  const [intradayPoints, setIntradayPoints] = useState<{ recorded_at: string; total: number; cash_component: number; investment_component: number; physical_component: number; debt_component: number }[]>([]);
 
   const [holdings, setHoldings] = useState<HoldingRow[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -191,6 +197,9 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
   const totalNetWorth = allSnapshots.length > 0 ? allSnapshots[0].total : 0;
   // Vehicles at their modelled depreciated value (part of the snapshot total)
   const physicalValue = allSnapshots.length > 0 ? (allSnapshots[0].physical_component ?? 0) : 0;
+  const physicalDebt = allSnapshots.length > 0 ? (allSnapshots[0].debt_component ?? 0) : 0;
+  // What's yours in property and vehicles: value minus the loans on them.
+  const physicalYours = physicalValue - physicalDebt;
 
   // Liquid net worth: exclude illiquid asset types (real estate, pension).
   // Vehicles aren't accounts, so they're already outside this sum.
@@ -228,6 +237,7 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
         cash_component: p.cash_component,
         investment_component: p.investment_component,
         physical_component: p.physical_component ?? 0,
+        debt_component: p.debt_component ?? 0,
       }));
     }
     const isWeekday = (d: string) => { const day = new Date(d).getDay(); return day !== 0 && day !== 6; };
@@ -307,12 +317,14 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
         showSymbol: false,
         lineStyle: { width: 2 },
       },
+      // What's yours in property & vehicles (value minus loans), so the
+      // stack adds up to net worth.
       ...(chartSnapshots.some(s => (s.physical_component ?? 0) > 0) ? [{
-        name: 'Vehicles',
+        name: 'Property & vehicles, after loans',
         type: 'line' as const,
         stack: 'total',
         areaStyle: { opacity: 0.3 },
-        data: chartSnapshots.map((s) => s.physical_component ?? 0),
+        data: chartSnapshots.map((s) => (s.physical_component ?? 0) - (s.debt_component ?? 0)),
         smooth: 0.4,
         showSymbol: false,
         lineStyle: { width: 2 },
@@ -387,6 +399,7 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
         {hasIlliquid && (
           <p className="text-[13px] text-ink-muted mt-1.5">
             Liquid: <span className="font-semibold text-forest">{fmt(liquidNetWorth)}</span>
+            {physicalValue > 0 && <> · In property &amp; vehicles, after loans: <span className="font-semibold text-ink">{fmt(physicalYours)}</span></>}
           </p>
         )}
 
@@ -657,10 +670,12 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
         const hasDiv = wfData.time_series.some(t => Math.abs(t.dividends) >= 1);
         const hasInt = wfData.time_series.some(t => Math.abs(t.interest) >= 1);
         const hasAssets = wfData.time_series.some(t => Math.abs(t.assets ?? 0) >= 1);
+        const hasPropertyCosts = wfData.time_series.some(t => Math.abs(t.property_costs ?? 0) >= 1);
         const legendData = ['Contributions', 'Market Returns'];
         if (hasDiv) legendData.push('Dividends');
         if (hasInt) legendData.push('Interest');
-        if (hasAssets) legendData.push('Vehicles');
+        if (hasAssets) legendData.push('Physical assets');
+        if (hasPropertyCosts) legendData.push('Purchase costs & loan interest');
         return (
           <div className="border-t border-divider pt-6 py-3 md:py-5">
             <h3 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Growth Over Time</h3>
@@ -683,7 +698,8 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
                 ...(hasInt ? [{ name: 'Interest', type: 'line' as const, stack: 'attr', areaStyle: { opacity: 0.45, color: tc.walnut }, data: wfData.time_series.map(t => t.interest), itemStyle: { color: tc.walnut }, showSymbol: false, lineStyle: { width: 1, color: tc.walnut } }] : []),
                 // Vehicle value change is usually negative (depreciation), so
                 // it sits on its own stack below the zero line.
-                ...(hasAssets ? [{ name: 'Vehicles', type: 'line' as const, stack: 'assets', areaStyle: { opacity: 0.45, color: tc.claret }, data: wfData.time_series.map(t => t.assets ?? 0), itemStyle: { color: tc.claret }, showSymbol: false, lineStyle: { width: 1, color: tc.claret } }] : []),
+                ...(hasAssets ? [{ name: 'Physical assets', type: 'line' as const, stack: 'assets', areaStyle: { opacity: 0.45, color: tc.amber }, data: wfData.time_series.map(t => t.assets ?? 0), itemStyle: { color: tc.amber }, showSymbol: false, lineStyle: { width: 1, color: tc.amber } }] : []),
+                ...(hasPropertyCosts ? [{ name: 'Purchase costs & loan interest', type: 'line' as const, stack: 'costs', areaStyle: { opacity: 0.45, color: tc.claret }, data: wfData.time_series.map(t => t.property_costs ?? 0), itemStyle: { color: tc.claret }, showSymbol: false, lineStyle: { width: 1, color: tc.claret } }] : []),
               ],
             }} height="220px" />
             {wfData.crossover_month && (
@@ -730,7 +746,7 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
         for (const h of holdings) {
           add(assetClassLabels[h.asset_class] || 'Other', h.value_eur ?? h.market_value ?? 0);
         }
-        add('Vehicles', physicalValue);
+        add('Property & vehicles (yours)', physicalYours);
         const entries = Object.entries(byClass).filter(([, v]) => v !== 0).sort(([, a], [, b]) => Math.abs(b) - Math.abs(a));
         if (entries.length < 2) return null;
         return (
@@ -1393,6 +1409,8 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
       </>)}
 
 
+      {activeTab === 'assets' && <AssetsTab onNetWorthChanged={loadData} />}
+
       {activeTab === 'accounts' && (<>
       {/* Net Worth Chart — detailed stacked view */}
       {chartSnapshots.length > 0 && (
@@ -1401,8 +1419,6 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
           <EChartWrapper option={chartOption} height="280px" />
         </div>
       )}
-
-      <AssetsPanel onChanged={loadData} />
 
       {/* Counterparty Exposure */}
       {accounts.length > 0 && (

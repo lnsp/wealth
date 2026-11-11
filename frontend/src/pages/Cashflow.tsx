@@ -21,6 +21,8 @@ const CATEGORY_LABEL: Record<string, string> = {
   investment: 'Investment',
   internal: 'Internal Transfer',
   asset_purchase: 'Asset Purchase',
+  loan_payment: 'Loan Payment',
+  loan_principal: 'Loan Principal',
   other: 'Other',
 };
 

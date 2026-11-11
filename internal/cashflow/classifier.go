@@ -46,6 +46,10 @@ const (
 	// CatAssetPurchase marks the payment for a tracked physical asset (car):
 	// cash turned into an asset, so it is a transfer rather than spending.
 	CatAssetPurchase Category = "asset_purchase"
+	// CatLoanPayment marks a matched loan instalment. The cashflow view splits
+	// it into interest (housing/transport) and CatLoanPrincipal (saving).
+	CatLoanPayment   Category = "loan_payment"
+	CatLoanPrincipal Category = "loan_principal"
 	CatOther         Category = "other"
 )
 
@@ -56,7 +60,7 @@ func BucketOf(c Category) Bucket {
 		return BucketIncome
 	case CatHousing, CatUtilities, CatInsurance, CatSubscriptions:
 		return BucketFixed
-	case CatInvestment, CatInternal, CatAssetPurchase:
+	case CatInvestment, CatInternal, CatAssetPurchase, CatLoanPayment, CatLoanPrincipal:
 		return BucketTransfer
 	default:
 		return BucketVariable
@@ -136,7 +140,7 @@ func IsKnown(c Category) bool {
 		CatHousing, CatUtilities, CatInsurance, CatSubscriptions,
 		CatGroceries, CatDining, CatTransport, CatHealth,
 		CatEntertainment, CatShopping, CatTax, CatInvestment,
-		CatInternal, CatAssetPurchase, CatOther:
+		CatInternal, CatAssetPurchase, CatLoanPayment, CatLoanPrincipal, CatOther:
 		return true
 	}
 	return false
@@ -149,6 +153,6 @@ func AllCategories() []Category {
 		CatHousing, CatUtilities, CatInsurance, CatSubscriptions,
 		CatGroceries, CatDining, CatTransport, CatHealth,
 		CatEntertainment, CatShopping, CatTax,
-		CatInvestment, CatInternal, CatAssetPurchase, CatOther,
+		CatInvestment, CatInternal, CatAssetPurchase, CatLoanPayment, CatLoanPrincipal, CatOther,
 	}
 }

@@ -13,13 +13,27 @@ cd "$REPO_DIR"
 
 log() { printf '[wealth-update] %s\n' "$*"; }
 
-# Snapshot image IDs before pulling so we can tell whether anything changed.
-before="$(docker compose "${COMPOSE_FILES[@]}" images --quiet | sort -u)"
+# Snapshot local image IDs of configured service tags before pulling so we can
+# tell whether `docker compose pull` downloaded any newer image layers.
+snapshot_configured_image_ids() {
+    local imgs
+    imgs="$(docker compose "${COMPOSE_FILES[@]}" config --images | sort -u)"
+    if [[ -z "$imgs" ]]; then
+        return 0
+    fi
+    local img
+    while IFS= read -r img; do
+        [[ -z "$img" ]] && continue
+        docker image inspect --format '{{.Id}}' "$img" 2>/dev/null || printf 'missing:%s\n' "$img"
+    done <<< "$imgs" | sort -u
+}
+
+before="$(snapshot_configured_image_ids)"
 
 log "pulling images"
 docker compose "${COMPOSE_FILES[@]}" pull --quiet
 
-after="$(docker compose "${COMPOSE_FILES[@]}" images --quiet | sort -u)"
+after="$(snapshot_configured_image_ids)"
 
 if [[ "$before" == "$after" ]]; then
     log "no image changes"

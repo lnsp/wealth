@@ -1,267 +1,305 @@
+import { useState } from 'react';
 import { usePlanning } from './PlanningContext';
+import { Section, SubHeading, MetricCard, MetricGrid, ProgressBar, EmptyState } from '../ui';
+import { fmtEUR, fmtPct, fmtDate } from '../../utils/format';
+import { Assumptions, downloadText, readStored, writeStored } from './shared';
+
+const GROWTH_RATE = 0.07;
+const DONE_KEY = 'playbook_done';
+
+type Milestone = { label: string; money: boolean; pct: number; projectedDate: string };
+type PlanYear = { year: number; age: number; actions: string[]; projectedNW: number };
+
+const actionKey = (year: number, action: string) => `${year}|${action}`;
 
 // Year-by-year action plan combining: year-in-review (last calendar year
 // + YTD NW deltas from snapshots), milestone progress bars (FIRE number,
 // human-capital crossover, next 100k/250k/500k/1M), and an annual
 // checklist (initial setup → recurring Steuererklärung / tax-loss
 // harvesting / rebalance triggers → age-gated retirement events).
-// The export button serializes the full playbook to a .txt download.
+// Ticked actions are saved per item in localStorage; the export button
+// serializes the plan exactly as shown to a .txt download.
 export default function FinancialIndependencePlaybook() {
-  const { accounts, allSnapshots, totalNetWorth, projData, pensionCurrentAge, pensionAge, crBudget, crMarginalRate, crGrossIncome, fireExpenses, fireSWR, fmt } = usePlanning();
+  const { accounts, allSnapshots, totalNetWorth, projData, pensionCurrentAge, pensionAge, crBudget, crMarginalRate, crGrossIncome, fireExpenses, fireSWR } = usePlanning();
+  const [done, setDone] = useState<Record<string, boolean>>(() => {
+    try {
+      const parsed: unknown = JSON.parse(readStored(DONE_KEY, '{}'));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, boolean>) : {};
+    } catch {
+      return {};
+    }
+  });
+  const toggle = (key: string, checked: boolean) => {
+    setDone(prev => {
+      const next = { ...prev };
+      if (checked) next[key] = true; else delete next[key];
+      writeStored(DONE_KEY, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const now = new Date();
+  const thisYear = now.getFullYear();
+  const currentAge = pensionCurrentAge;
+  const retireAge = pensionAge;
+  const grossIncome = parseFloat(crGrossIncome) || 0;
+  const monthlyBudget = parseFloat(crBudget) || 0;
+  const marginalRate = parseFloat(crMarginalRate) || 42;
+
+  // ── Year in review — uses snapshots to surface calendar-year deltas ──
+  let review: { lastYearNW: number; lastYearPct: number; ytdNW: number; ytdPct: number } | null = null;
+  if (allSnapshots.length > 2) {
+    const lastYearStart = new Date(thisYear - 1, 0, 1);
+    const lastYearEnd = new Date(thisYear - 1, 11, 31);
+    const findClosest = (date: Date) => allSnapshots.reduce((best, s) =>
+      Math.abs(new Date(s.date).getTime() - date.getTime()) < Math.abs(new Date(best.date).getTime() - date.getTime()) ? s : best
+    );
+    const startSnap = findClosest(lastYearStart);
+    const endSnap = findClosest(lastYearEnd);
+    const currentSnap = allSnapshots[0];
+    const lastYearNW = endSnap.total - startSnap.total;
+    const ytdNW = currentSnap.total - endSnap.total;
+    review = {
+      lastYearNW,
+      lastYearPct: startSnap.total > 0 ? (lastYearNW / startSnap.total * 100) : 0,
+      ytdNW,
+      ytdPct: endSnap.total > 0 ? (ytdNW / endSnap.total * 100) : 0,
+    };
+  }
+
+  // ── Milestones ──
+  const nw = totalNetWorth;
+  const milestoneContrib = projData?.contribution || monthlyBudget || 0;
+  const projectYearsTo = (target: number) => {
+    if (nw >= target) return 0;
+    let v = nw;
+    for (let y = 1; y <= 60; y++) {
+      v = (v + milestoneContrib * 12) * (1 + GROWTH_RATE);
+      if (v >= target) return y;
+    }
+    return null;
+  };
+  const fireExpAnnual = parseFloat(fireExpenses || '0') || 0;
+  const fireSWRVal = parseFloat(fireSWR) || 3.5;
+  const fireTarget = fireExpAnnual > 0 ? fireExpAnnual / (fireSWRVal / 100) : 0;
+
+  const milestones: Milestone[] = [];
+  const nextRound = Math.ceil(nw / 50000) * 50000;
+  if (nextRound > nw) {
+    const yrs = projectYearsTo(nextRound);
+    milestones.push({ label: `${fmtEUR(nextRound)} net worth`, money: true, pct: Math.min(100, nw / nextRound * 100), projectedDate: yrs ? `${thisYear + yrs}` : '—' });
+  }
+  if (fireTarget > 0) {
+    const yrs = projectYearsTo(fireTarget);
+    milestones.push({ label: 'Financial independence (target portfolio)', money: false, pct: Math.min(100, nw / fireTarget * 100), projectedDate: yrs ? `${thisYear + yrs} (age ${currentAge + yrs})` : nw >= fireTarget ? 'Reached' : '—' });
+  }
+  if (grossIncome > 0) {
+    let humanCap = 0;
+    for (let y = 1; y <= retireAge - currentAge; y++) humanCap += grossIncome * Math.pow(1.02, y) / Math.pow(1.03, y);
+    if (humanCap > 0) {
+      const crossYrs = projectYearsTo(humanCap);
+      milestones.push({ label: 'Financial capital overtakes human capital', money: false, pct: Math.min(100, nw / humanCap * 100), projectedDate: crossYrs ? `${thisYear + crossYrs}` : nw >= humanCap ? 'Reached' : 'over 60 years' });
+    }
+  }
+  for (const t of [100000, 250000, 500000, 1000000]) {
+    if (nw < t) {
+      if (t !== nextRound) {
+        const yrs = projectYearsTo(t);
+        milestones.push({ label: `${fmtEUR(t)} net worth`, money: true, pct: Math.min(100, nw / t * 100), projectedDate: yrs ? `${thisYear + yrs}` : '—' });
+      }
+      break;
+    }
+  }
+
+  // ── Annual checklist + projected net worth ──
+  const hasBav = accounts.some(a => a.tax_treatment === 'bav');
+  const hasRiester = accounts.some(a => a.tax_treatment === 'riester');
+  const hasRurup = accounts.some(a => a.tax_treatment === 'rurup');
+  // Insurance policies are owned by InsuranceInventory; read the persisted
+  // list directly so the playbook's coverage gate works.
+  let hasInsurance = false;
+  try {
+    const persisted: unknown = JSON.parse(readStored('insurance_policies', '[]'));
+    hasInsurance = Array.isArray(persisted) && persisted.length > 0;
+  } catch { /* corrupted localStorage: leave hasInsurance=false */ }
+
+  const planReady = grossIncome > 0 || monthlyBudget > 0;
+  const years: PlanYear[] = [];
+  if (planReady) {
+    let projNW = totalNetWorth;
+    const annualContrib = monthlyBudget * 12;
+    for (let y = 0; y <= Math.min(retireAge - currentAge, 30); y++) {
+      const age = currentAge + y;
+      const calYear = thisYear + y;
+      const actions: string[] = [];
+
+      if (y === 0) {
+        if (!hasBav) actions.push('Set up a company pension (bAV) with employer match');
+        if (!hasRiester) actions.push('Open a Riester account for the state allowances (Zulagen)');
+        if (marginalRate >= 35 && !hasRurup) actions.push('Consider a Rürup pension for the tax deduction');
+        if (!hasInsurance) actions.push('Review insurance cover: disability, personal liability, term life');
+        if (monthlyBudget > 0) actions.push(`Start routing ${fmtEUR(monthlyBudget)} a month as in the Contribution Router`);
+        actions.push('Set up the exemption order (Freistellungsauftrag) for 1.000 €');
+      }
+      if (y > 0) {
+        actions.push('Review and adjust savings-plan amounts');
+        actions.push(`File the tax return (Steuererklärung) for ${calYear - 1}`);
+      }
+      if (age === 55) actions.push('Begin retirement withdrawal planning');
+      if (age === 60) actions.push('Review Riester and Rürup payout options');
+      if (age === 62) actions.push('Company pension: earliest access — review the payout');
+      if (age === retireAge) actions.push('Retire — begin the withdrawal phase');
+      if (y > 0 && y % 3 === 0) actions.push('Look for tax-loss harvesting opportunities');
+      if (y > 0 && y % 5 === 0) actions.push('Rebalance the portfolio');
+
+      projNW = y === 0 ? projNW : (projNW + annualContrib) * (1 + GROWTH_RATE);
+      years.push({ year: calYear, age, actions, projectedNW: Math.round(projNW) });
+    }
+  }
+  const display = years.filter((y, i) => i < 10 || y.age === 55 || y.age === 60 || y.age === 62 || y.age === retireAge);
+  const planEmpty = display.length === 0;
+
+  const exportPlaybook = () => {
+    const lines: string[] = [
+      'Financial Independence Playbook',
+      '='.repeat(40),
+      `Generated: ${fmtDate(now)}`,
+      `Current net worth: ${fmtEUR(totalNetWorth)}`,
+      `Monthly budget: ${fmtEUR(monthlyBudget)}`,
+      `Current age: ${currentAge} | Retire at: ${retireAge}`,
+      `Projection: ${fmtPct(GROWTH_RATE * 100, { digits: 0 })} growth a year`,
+      '',
+    ];
+    for (const y of display) {
+      lines.push(`${y.year} (age ${y.age}) — projected net worth: ${fmtEUR(y.projectedNW)}`);
+      for (const a of y.actions) lines.push(`  [${done[actionKey(y.year, a)] ? 'x' : ' '}] ${a}`);
+      lines.push('');
+    }
+    lines.push(`Generated by Wealth on ${fmtDate(now)}`);
+    downloadText(`playbook-${thisYear}.txt`, lines);
+  };
 
   return (
-    <div className="border-t border-divider pt-6 py-3 md:py-5">
-      <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Financial Independence Playbook</h2>
-      <p className="text-[13px] text-ink-muted mb-3 md:mb-4 px-1 md:px-0">
-        Year-by-year action plan based on your current situation and goals.
-      </p>
+    <Section
+      id="playbook"
+      title="Financial Independence Playbook"
+      subtitle="A year-by-year action plan based on your profile, accounts and goals."
+      actions={!planEmpty ? (
+        <button type="button" onClick={exportPlaybook} className="apple-btn-secondary min-h-[44px] md:min-h-[40px]">Export playbook</button>
+      ) : undefined}
+    >
+      {review && (
+        <div className="mb-7">
+          <SubHeading>Year in review</SubHeading>
+          <MetricGrid className="mt-3">
+            <MetricCard
+              label={`${thisYear - 1} change`}
+              tone={review.lastYearNW > 0 ? 'positive' : review.lastYearNW < 0 ? 'negative' : 'neutral'}
+              value={fmtEUR(review.lastYearNW, { sign: true })}
+              sublabel={`${fmtPct(review.lastYearPct, { sign: true })} net worth, including deposits`}
+            />
+            <MetricCard
+              label={`${thisYear} so far`}
+              tone={review.ytdNW > 0 ? 'positive' : review.ytdNW < 0 ? 'negative' : 'neutral'}
+              value={fmtEUR(review.ytdNW, { sign: true })}
+              sublabel={`${fmtPct(review.ytdPct, { sign: true })} net worth, including deposits`}
+            />
+          </MetricGrid>
+        </div>
+      )}
 
-      {/* Year-in-Review — uses recent snapshots to surface calendar-year deltas */}
-      {allSnapshots.length > 2 && (() => {
-        const now = new Date();
-        const lastYearStart = new Date(now.getFullYear() - 1, 0, 1);
-        const lastYearEnd = new Date(now.getFullYear() - 1, 11, 31);
-        const findClosest = (date: Date) => allSnapshots.reduce((best, s) =>
-          Math.abs(new Date(s.date).getTime() - date.getTime()) < Math.abs(new Date(best.date).getTime() - date.getTime()) ? s : best
-        );
-        const startSnap = findClosest(lastYearStart);
-        const endSnap = findClosest(lastYearEnd);
-        const currentSnap = allSnapshots[0];
-        const lastYearNW = endSnap.total - startSnap.total;
-        const lastYearPct = startSnap.total > 0 ? (lastYearNW / startSnap.total * 100) : 0;
-        const ytdNW = currentSnap.total - endSnap.total;
-        const ytdPct = endSnap.total > 0 ? (ytdNW / endSnap.total * 100) : 0;
-        return (
-          <div className="mb-4 px-1 md:px-0">
-            <p className="font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em] mb-2">Year in Review</p>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="rounded-xl bg-parchment-deep p-3 text-center">
-                <p className="text-[12px] text-ink-muted mb-1">{now.getFullYear() - 1} Change</p>
-                <p className={`font-serif text-[18px] font-semibold tabular-nums ${lastYearNW >= 0 ? 'text-sage' : 'text-claret'}`}>{lastYearNW >= 0 ? '+' : ''}{fmt(lastYearNW)}</p>
-                <p className="text-[11px] text-ink-muted">{lastYearPct >= 0 ? '+' : ''}{lastYearPct.toFixed(1)}%</p>
-              </div>
-              <div className="rounded-xl bg-parchment-deep p-3 text-center">
-                <p className="text-[12px] text-ink-muted mb-1">{now.getFullYear()} YTD</p>
-                <p className={`font-serif text-[18px] font-semibold tabular-nums ${ytdNW >= 0 ? 'text-sage' : 'text-claret'}`}>{ytdNW >= 0 ? '+' : ''}{fmt(ytdNW)}</p>
-                <p className="text-[11px] text-ink-muted">{ytdPct >= 0 ? '+' : ''}{ytdPct.toFixed(1)}%</p>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* Milestones */}
-      {(() => {
-        const nw = totalNetWorth;
-        const monthlyContrib = projData?.contribution || parseFloat(crBudget) || 0;
-        const annualContrib = monthlyContrib * 12;
-        const rate = 0.07;
-
-        const projectYearsTo = (target: number) => {
-          if (nw >= target) return 0;
-          let v = nw;
-          for (let y = 1; y <= 60; y++) {
-            v = (v + annualContrib) * (1 + rate);
-            if (v >= target) return y;
-          }
-          return null;
-        };
-
-        const currentAge = pensionCurrentAge;
-        const fireExpAnnual = parseFloat(fireExpenses || '0');
-        const fireSWRVal = parseFloat(fireSWR) || 3.5;
-        const fireTarget = fireExpAnnual > 0 ? fireExpAnnual / (fireSWRVal / 100) : 0;
-
-        type Milestone = { label: string; pct: number; projectedDate: string };
-        const milestones: Milestone[] = [];
-
-        const nextRound = Math.ceil(nw / 50000) * 50000;
-        if (nextRound > nw) {
-          const yrs = projectYearsTo(nextRound);
-          milestones.push({ label: `${fmt(nextRound)} Net Worth`, pct: Math.min(100, nw / nextRound * 100), projectedDate: yrs ? `${new Date().getFullYear() + yrs}` : '—' });
-        }
-        if (fireTarget > 0) {
-          const yrs = projectYearsTo(fireTarget);
-          milestones.push({ label: 'FIRE Number', pct: Math.min(100, nw / fireTarget * 100), projectedDate: yrs ? `${new Date().getFullYear() + yrs} (age ${currentAge + yrs})` : nw >= fireTarget ? 'Reached' : '—' });
-        }
-        const grossIncome = parseFloat(crGrossIncome) || 0;
-        if (grossIncome > 0) {
-          let humanCap = 0;
-          const retireAge = pensionAge;
-          for (let y = 1; y <= retireAge - currentAge; y++) humanCap += grossIncome * Math.pow(1.02, y) / Math.pow(1.03, y);
-          const crossYrs = projectYearsTo(humanCap);
-          milestones.push({ label: 'Crossover (Financial > Human)', pct: Math.min(100, nw / humanCap * 100), projectedDate: crossYrs ? `${new Date().getFullYear() + crossYrs}` : nw >= humanCap ? 'Reached' : '60+' });
-        }
-        for (const t of [100000, 250000, 500000, 1000000]) {
-          if (nw < t) {
-            const yrs = projectYearsTo(t);
-            milestones.push({ label: `${fmt(t)} Milestone`, pct: Math.min(100, nw / t * 100), projectedDate: yrs ? `${new Date().getFullYear() + yrs}` : '—' });
-            break;
-          }
-        }
-
-        if (milestones.length === 0) return null;
-        return (
-          <div className="mb-4 px-1 md:px-0">
-            <p className="font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em] mb-2">Milestones</p>
-            <div className="space-y-2">
-              {milestones.map((m, i) => (
-                <div key={i} className="rounded-xl bg-parchment-deep p-3">
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="text-[13px] font-medium text-ink">{m.label}</span>
-                    <span className="text-[12px] text-ink-muted tabular-nums">{m.projectedDate}</span>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <div className="flex-1 h-2 rounded-full bg-divider overflow-hidden">
-                      <div className={`h-full rounded-full transition-all duration-500 ${m.pct >= 100 ? 'bg-sage' : m.pct >= 50 ? 'bg-forest' : 'bg-amber'}`} style={{ width: `${Math.min(m.pct, 100)}%` }} />
-                    </div>
-                    <span className="text-[11px] tabular-nums text-ink-muted shrink-0">{m.pct.toFixed(0)}%</span>
-                  </div>
+      {milestones.length > 0 && (
+        <div className="mb-7">
+          <SubHeading>Milestones</SubHeading>
+          <ul className="mt-2 border-t border-divider">
+            {milestones.map(m => (
+              <li key={m.label} className="border-b border-divider py-3">
+                <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-x-4">
+                  <span className="text-[14px] font-medium text-ink" data-privacy={m.money ? 'blur' : undefined}>{m.label}</span>
+                  <span className="text-[13px] text-ink-muted">{m.projectedDate === '—' ? 'Not within 60 years' : m.projectedDate === 'Reached' ? 'Reached' : `Expected ${m.projectedDate}`}</span>
                 </div>
-              ))}
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* Annual checklist + projected NW */}
-      {(() => {
-        const currentAge = pensionCurrentAge;
-        const retireAge = pensionAge;
-        const grossIncome = parseFloat(crGrossIncome) || 0;
-        const monthlyBudget = parseFloat(crBudget) || 0;
-        const marginalRate = parseFloat(crMarginalRate) || 42;
-        const hasBav = accounts.some(a => a.tax_treatment === 'bav');
-        const hasRiester = accounts.some(a => a.tax_treatment === 'riester');
-        const hasRurup = accounts.some(a => a.tax_treatment === 'rurup');
-        // Insurance policies are owned by InsuranceInventory now; read the
-        // persisted list directly so the playbook's coverage gate works.
-        let hasInsurance = false;
-        try {
-          const persisted = JSON.parse(localStorage.getItem('insurance_policies') || '[]') as unknown[];
-          hasInsurance = Array.isArray(persisted) && persisted.length > 0;
-        } catch { /* corrupted localStorage: leave hasInsurance=false */ }
-
-        if (grossIncome <= 0 && monthlyBudget <= 0) {
-          return <p className="text-[13px] text-ink-muted px-1 md:px-0">Enter gross income and monthly budget above to generate your playbook.</p>;
-        }
-
-        const years: { year: number; age: number; actions: string[]; projectedNW: number }[] = [];
-        let projNW = totalNetWorth;
-        const annualContrib = monthlyBudget * 12;
-        const returnRate = 0.07;
-
-        for (let y = 0; y <= Math.min(retireAge - currentAge, 30); y++) {
-          const age = currentAge + y;
-          const calYear = new Date().getFullYear() + y;
-          const actions: string[] = [];
-
-          if (y === 0) {
-            if (!hasBav) actions.push('Set up bAV with employer match');
-            if (!hasRiester) actions.push('Open Riester account for Zulagen');
-            if (marginalRate >= 35 && !hasRurup) actions.push('Consider Rürup for tax deduction');
-            if (!hasInsurance) actions.push('Review insurance coverage (BU, Haftpflicht, Risikoleben)');
-            if (monthlyBudget > 0) actions.push(`Start ${fmt(monthlyBudget)}/mo contribution routing`);
-            actions.push('Set up Freistellungsauftrag (1.000 EUR)');
-          }
-          if (y > 0) {
-            actions.push('Review and adjust Sparplan amounts');
-            actions.push(`File Steuererklärung for ${calYear - 1}`);
-          }
-          if (age === 55) actions.push('Begin retirement withdrawal planning');
-          if (age === 60) actions.push('Review Riester/Rürup payout options');
-          if (age === 62) actions.push('bAV earliest access — review payout');
-          if (age === retireAge) actions.push('Retire — begin withdrawal phase');
-          if (y > 0 && y % 3 === 0) actions.push('Scan for tax-loss harvesting opportunities');
-          if (y > 0 && y % 5 === 0) actions.push('Rebalance portfolio allocation');
-
-          projNW = y === 0 ? projNW : (projNW + annualContrib) * (1 + returnRate);
-          years.push({ year: calYear, age, actions, projectedNW: Math.round(projNW) });
-        }
-
-        const display = years.filter((y, i) => i < 10 || y.age === 55 || y.age === 60 || y.age === 62 || y.age === retireAge);
-
-        return (
-          <div className="space-y-3 px-1 md:px-0">
-            {monthlyBudget === 0 && (
-              <p className="text-[11px] text-amber mb-1">Projections assume market growth only (no contributions). Set monthly budget in Contribution Router for accurate projections.</p>
-            )}
-            {display.map(y => (
-              <div key={y.year} className="rounded-xl bg-parchment-deep p-3">
-                <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <span className="text-[14px] font-medium text-ink">{y.year}</span>
-                    <span className="text-[12px] text-ink-muted ml-2">Age {y.age}</span>
-                  </div>
-                  <span className="font-serif text-[15px] tabular-nums text-forest font-medium">{fmt(y.projectedNW)}</span>
+                <div className="flex items-center gap-3">
+                  <ProgressBar className="flex-1" value={m.pct} label={`Progress to ${m.label}`} />
+                  <span className="shrink-0 text-[13px] text-ink-body" data-privacy="blur">{fmtPct(m.pct, { digits: 0 })}</span>
                 </div>
-                <div className="space-y-1">
-                  {y.actions.map((a, i) => (
-                    <label key={i} className="flex items-start gap-2 text-[12px] text-ink-body cursor-pointer">
-                      <input type="checkbox" className="mt-0.5 accent-forest" />
-                      <span>{a}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
+              </li>
             ))}
-          </div>
-        );
-      })()}
+          </ul>
+          <p className="mt-2 text-[13px] text-ink-muted">
+            Assumes you keep adding <span data-privacy="blur">{fmtEUR(milestoneContrib)}</span> a month
+            ({projData?.contribution ? 'your 12-month average' : 'the monthly budget from Your Profile'}) and {fmtPct(GROWTH_RATE * 100, { digits: 0 })} growth a year.
+            Human capital uses 2 % salary growth and a 3 % discount rate.
+          </p>
+        </div>
+      )}
 
-      <div className="mt-4 px-1 md:px-0">
-        <button
-          onClick={() => {
-            const currentAge = pensionCurrentAge;
-            const retireAge = pensionAge;
-            const monthlyBudget = parseFloat(crBudget) || 0;
-            const nw = totalNetWorth;
-            const lines: string[] = [
-              `Financial Independence Playbook`,
-              `${'='.repeat(40)}`,
-              `Generated: ${new Date().toLocaleDateString('de-DE')}`,
-              `Current Net Worth: ${fmt(nw)}`,
-              `Monthly Budget: ${fmt(monthlyBudget)}`,
-              `Current Age: ${currentAge} | Retire at: ${retireAge}`,
-              '',
-            ];
-            let projNW = nw;
-            const annualContrib = monthlyBudget * 12;
-            for (let y = 0; y <= Math.min(retireAge - currentAge, 30); y++) {
-              const age = currentAge + y;
-              const calYear = new Date().getFullYear() + y;
-              projNW = y === 0 ? projNW : (projNW + annualContrib) * 1.07;
-              const show = y < 10 || age === 55 || age === 60 || age === 62 || age === retireAge;
-              if (show) {
-                lines.push(`${calYear} (Age ${age}) — Projected: ${fmt(Math.round(projNW))}`);
-                if (y === 0) {
-                  lines.push(`  [ ] Set up contribution routing (${fmt(monthlyBudget)}/mo)`);
-                  lines.push(`  [ ] Review insurance coverage`);
-                  lines.push(`  [ ] Set up Freistellungsauftrag`);
-                }
-                if (y > 0) lines.push(`  [ ] File Steuererklärung for ${calYear - 1}`);
-                if (y > 0) lines.push(`  [ ] Review and adjust Sparplan amounts`);
-                if (y > 0 && y % 3 === 0) lines.push(`  [ ] Scan for tax-loss harvesting`);
-                if (y > 0 && y % 5 === 0) lines.push(`  [ ] Rebalance portfolio`);
-                if (age === 55) lines.push(`  [ ] Begin retirement withdrawal planning`);
-                if (age === 60) lines.push(`  [ ] Review Riester/Rürup payout options`);
-                if (age === 62) lines.push(`  [ ] bAV earliest access — review payout`);
-                if (age === retireAge) lines.push(`  [ ] Retire — begin withdrawal phase`);
-                lines.push('');
-              }
-            }
-            lines.push(`Generated by Wealth on ${new Date().toLocaleDateString('de-DE')}`);
-            const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url; a.download = `playbook-${new Date().getFullYear()}.txt`;
-            a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-          }}
-          className="apple-btn-secondary text-[13px] px-4 py-1.5"
-        >
-          Export Playbook
-        </button>
-      </div>
-    </div>
+      <SubHeading>Action plan</SubHeading>
+      {!planReady && (
+        <div className="mt-3">
+          <EmptyState
+            title="Your plan needs a profile"
+            message="Enter your gross income or monthly budget in Your Profile at the top of this page to generate the playbook."
+            action={{ label: 'Go to Your Profile', href: '#profile' }}
+          />
+        </div>
+      )}
+      {planReady && planEmpty && (
+        <div className="mt-3">
+          <EmptyState
+            title="No years to plan"
+            message="Your retirement age in Your Profile must not be lower than your current age."
+            action={{ label: 'Go to Your Profile', href: '#profile' }}
+          />
+        </div>
+      )}
+      {!planEmpty && (
+        <>
+          <p className="mt-1 text-[13px] text-ink-muted">
+            Projected net worth assumes {monthlyBudget > 0
+              ? <>the <span data-privacy="blur">{fmtEUR(monthlyBudget)}</span> monthly budget from Your Profile</>
+              : <>no further contributions (no monthly budget is set in <a href="#profile" className="font-medium text-forest underline">Your Profile</a>)</>}
+            {' '}and {fmtPct(GROWTH_RATE * 100, { digits: 0 })} growth a year. Ticks are saved in this browser.
+          </p>
+          <ol className="mt-3 flex flex-col gap-3">
+            {display.map(y => (
+              <li key={y.year} className="rounded-apple border border-divider p-4">
+                <div className="mb-1 flex flex-wrap items-baseline justify-between gap-x-4">
+                  <h4 className="text-[15px] font-medium text-ink">
+                    {y.year} <span className="ml-1 text-[13px] font-normal text-ink-muted">Age {y.age}</span>
+                  </h4>
+                  <span className="font-serif text-[18px] text-ink" data-privacy="blur">{fmtEUR(y.projectedNW)}</span>
+                </div>
+                {y.actions.length === 0 ? (
+                  <p className="text-[13px] text-ink-muted">Nothing scheduled.</p>
+                ) : (
+                  <ul>
+                    {y.actions.map(a => {
+                      const key = actionKey(y.year, a);
+                      const checked = !!done[key];
+                      return (
+                        <li key={a}>
+                          <label className="flex min-h-[44px] cursor-pointer items-center gap-3 text-[14px] text-ink-body">
+                            <input
+                              type="checkbox"
+                              className="h-5 w-5 shrink-0 accent-forest"
+                              checked={checked}
+                              onChange={e => toggle(key, e.target.checked)}
+                            />
+                            <span className={checked ? 'line-through text-ink-muted' : ''} data-privacy={a.includes('€') ? 'blur' : undefined}>{a}</span>
+                          </label>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </li>
+            ))}
+          </ol>
+          <Assumptions>
+            <p>Shows the next ten years, then the years you turn 55, 60, 62 and {retireAge}.</p>
+          </Assumptions>
+        </>
+      )}
+    </Section>
   );
 }

@@ -1,4 +1,5 @@
 import { Component, type ReactNode } from 'react';
+import { ErrorState } from './ui/StateViews';
 
 interface Props {
   children: ReactNode;
@@ -27,18 +28,16 @@ export default class ErrorBoundary extends Component<Props, State> {
   render() {
     if (this.state.hasError) {
       if (this.props.fallback) return this.props.fallback;
+      // Page-level fallback. Sections and tab panels have their own SectionBoundary, so this
+      // only shows when a whole page fails. Navigation stays usable around it, and "Try again"
+      // re-renders the same URL (tab included, since tabs live in the query string).
       return (
-        <div role="alert" className="p-6 text-center">
-          <p className="font-serif text-heading text-ink mb-2">Something went wrong</p>
-          <p className="text-[16px] text-ink-muted mb-4">
-            {this.state.error?.message || 'An unexpected error occurred.'}
-          </p>
-          <button
-            onClick={() => this.setState({ hasError: false, error: null })}
-            className="apple-btn-secondary"
-          >
-            Try again
-          </button>
+        <div className="py-6">
+          <ErrorState
+            message="This page couldn\u2019t be displayed. Navigation still works."
+            details={this.state.error?.message}
+            onRetry={() => this.setState({ hasError: false, error: null })}
+          />
         </div>
       );
     }

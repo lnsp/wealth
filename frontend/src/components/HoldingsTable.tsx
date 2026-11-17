@@ -1,230 +1,318 @@
+import { useEffect, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { HoldingRow } from '../api/client';
-import { useThemeColors } from '../hooks/useThemeColors';
+import { Chip, EmptyState } from './ui';
+import { fmtEUR, fmtMoney, fmtPct, fmtQty, labelFor } from '../utils/format';
+
+/** A single holding above this share of the portfolio is flagged as a concentration risk. */
+export const CONCENTRATION_LIMIT_PCT = 30;
+
+export const holdingKey = (h: HoldingRow) => `${h.account_id}-${h.security_isin}`;
 
 interface Props {
   holdings: HoldingRow[];
-  onSecurityClick?: (isin: string) => void;
+  /** Key (see `holdingKey`) of the row whose detail is open. */
+  expandedKey?: string | null;
+  /** Called when a security's name button is pressed. Omit to render plain, non-expandable rows. */
+  onToggle?: (holding: HoldingRow) => void;
+  /** Detail content, rendered directly under the expanded row. */
+  detail?: ReactNode;
 }
 
-export default function HoldingsTable({ holdings, onSecurityClick }: Props) {
-  const tc = useThemeColors();
+/**
+ * Currency facts the holdings API guarantees:
+ *  - `current_price` is in `price_currency`, `avg_cost_basis` per share in `currency` (trading currency);
+ *  - `market_value`, `unrealized_pl` and `value_eur` are EUR.
+ * The EUR cost basis is therefore market value minus EUR gain for priced rows; for unpriced rows
+ * `value_eur` already is the EUR cost. Gain % always divides EUR by EUR.
+ */
+function eurFigures(h: HoldingRow) {
+  const priced = h.market_value != null && h.unrealized_pl != null;
+  const value = h.market_value ?? h.value_eur;
+  const gain = priced ? (h.unrealized_pl as number) : null;
+  const cost = gain != null ? value - gain : h.value_eur;
+  const gainPct = gain != null && cost > 0 ? (gain / cost) * 100 : null;
+  return { value, gain, cost, gainPct };
+}
 
-  function weightColor(pct: number): string {
-    if (pct >= 30) return tc.claret;
-    if (pct >= 20) return tc.gold;
-    if (pct >= 10) return tc.forest;
-    return tc.sage;
+function toneClass(n: number | null): string {
+  if (n == null || n === 0) return 'text-ink';
+  return n > 0 ? 'text-sage' : 'text-claret';
+}
+
+function useIsDesktop(): boolean {
+  const query = '(min-width: 1024px)';
+  const [match, setMatch] = useState(() => typeof window === 'undefined' || !window.matchMedia ? true : window.matchMedia(query).matches);
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia(query);
+    const on = () => setMatch(mq.matches);
+    on();
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+  return match;
+}
+
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg className="w-4 h-4 shrink-0 text-ink-muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={open ? 'M6 9l6 6 6-6' : 'M9 6l6 6-6 6'} />
+    </svg>
+  );
+}
+
+/** Percent label, bar on a fixed-width track, and — below the bar — the concentration chip. */
+function WeightCell({ pct }: { pct: number | null }) {
+  if (pct == null) return <span className="text-ink-muted">—</span>;
+  return (
+    <>
+      <div className="flex items-center gap-2">
+        <span className="w-[52px] shrink-0 text-ink">{fmtPct(pct)}</span>
+        <span className="flex-1 h-1.5 rounded-[3px] bg-divider overflow-hidden" aria-hidden="true">
+          <span className="block h-full bg-forest" style={{ width: `${Math.max(0, Math.min(pct, 100))}%` }} />
+        </span>
+      </div>
+      {pct > CONCENTRATION_LIMIT_PCT && (
+        <Chip tone="warning" className="mt-1.5">Over {CONCENTRATION_LIMIT_PCT} % limit</Chip>
+      )}
+    </>
+  );
+}
+
+/** Facts from the holdings row that have no column of their own. */
+function RowFacts({ h }: { h: HoldingRow }) {
+  const facts: { label: string; value: ReactNode }[] = [
+    { label: 'Account', value: h.account_name || '—' },
+    { label: 'Asset class', value: `${labelFor(h.asset_class)}${h.symbol ? ` · ${h.symbol}` : ''}` },
+    { label: 'Cost basis', value: <span data-privacy="blur">{fmtEUR(eurFigures(h).cost)}</span> },
+    { label: 'Dividends received', value: <span data-privacy="blur">{fmtMoney(h.total_dividends, h.currency, { cents: true })}</span> },
+  ];
+  if (h.fx_impact_pct != null) {
+    facts.push({
+      label: `Est. currency effect, 1 year${h.fx_exposure ? ` (${h.fx_exposure})` : ''}`,
+      value: <span className={toneClass(h.fx_impact_pct)}>{fmtPct(h.fx_impact_pct, { sign: true })}</span>,
+    });
+  }
+  return (
+    <dl className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-3 mb-4">
+      {facts.map(f => (
+        <div key={f.label} className="min-w-0">
+          <dt className="label-caps">{f.label}</dt>
+          <dd className="text-[14px] text-ink mt-0.5 break-words">{f.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+export default function HoldingsTable({ holdings, expandedKey, onToggle, detail }: Props) {
+  const isDesktop = useIsDesktop();
+
+  if (holdings.length === 0) {
+    return (
+      <EmptyState
+        title="No holdings yet"
+        message="Import your broker's transactions to see positions, values and gains here."
+        action={{ label: 'Import transactions', href: '/settings?tab=data' }}
+      />
+    );
   }
 
-  const ALLOC_COLORS = [tc.forest, tc.sage, tc.gold, tc.walnut, tc.claret, tc.slate, tc.gold, tc.claret];
-  const fmt = (n: number) =>
-    new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' }).format(n);
-  const fmtQty = (n: number) =>
-    new Intl.NumberFormat('de-DE', { minimumFractionDigits: 3, maximumFractionDigits: 3 }).format(n);
-  const fmtPct = (n: number) =>
-    `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
-
-  const hasMarketPrices = holdings.some((h) => h.market_value != null);
-
-  // Sort by weight descending
   const sorted = [...holdings].sort((a, b) => (b.weight_pct ?? 0) - (a.weight_pct ?? 0));
+  const multiAccount = new Set(holdings.map(h => h.account_id)).size > 1;
 
-  if (sorted.length === 0) {
+  const totalValue = sorted.reduce((s, h) => s + eurFigures(h).value, 0);
+  const anyPriced = sorted.some(h => eurFigures(h).gain != null);
+  const totalGain = sorted.reduce((s, h) => s + (eurFigures(h).gain ?? 0), 0);
+  const totalCost = totalValue - totalGain;
+  const totalGainPct = anyPriced && totalCost > 0 ? (totalGain / totalCost) * 100 : null;
+  const totalWeight = sorted.reduce((s, h) => s + (h.weight_pct ?? 0), 0);
+  const hasWeights = sorted.some(h => h.weight_pct != null);
+  const unpriced = sorted.filter(h => h.market_value == null).length;
+
+  const nameButton = (h: HoldingRow, open: boolean, detailId: string) => {
+    const label = (
+      <span className="min-w-0 flex-1">
+        <span className="block text-[14px] font-medium text-ink line-clamp-2 break-words" title={h.name}>{h.name}</span>
+        <span className="block text-[12px] text-ink-muted truncate">
+          {multiAccount && h.account_name ? `${h.account_name} · ` : ''}
+          <span className="font-mono">{h.security_isin}</span>
+        </span>
+      </span>
+    );
+    if (!onToggle) return <div className="flex items-center gap-2 min-h-[44px]">{label}</div>;
     return (
-      <div className="px-5 py-12 text-center text-[16px] text-ink-muted">
-        No holdings yet. Import transactions to see your portfolio.
-      </div>
+      <button
+        type="button"
+        onClick={() => onToggle(h)}
+        aria-expanded={open}
+        aria-controls={detailId}
+        className="flex items-center gap-2 w-full min-h-[44px] text-left rounded-[4px] hover:text-forest"
+      >
+        <Chevron open={open} />
+        {label}
+      </button>
+    );
+  };
+
+  const priceLines = (h: HoldingRow) => {
+    const priceCurrency = h.price_currency || h.currency || 'EUR';
+    return {
+      price: h.current_price != null ? fmtMoney(h.current_price, priceCurrency, { cents: true }) : null,
+      avgCost: fmtMoney(h.avg_cost_basis, h.currency || 'EUR', { cents: true }),
+    };
+  };
+
+  const footnote = (
+    <p className="mt-3 text-[12px] text-ink-muted">
+      Gain % is the EUR gain divided by the EUR cost basis. Value and cost of holdings in another currency are both
+      converted at the latest ECB reference rate, so gain % reflects the price change in the trading currency and
+      not currency movement since purchase.
+      {unpriced > 0 && ` ${unpriced} ${unpriced === 1 ? 'holding has' : 'holdings have'} no market price and ${unpriced === 1 ? 'is' : 'are'} shown at cost.`}
+    </p>
+  );
+
+  if (!isDesktop) {
+    return (
+      <>
+        <ul className="flex flex-col gap-3">
+          {sorted.map(h => {
+            const key = holdingKey(h);
+            const open = expandedKey === key;
+            const detailId = `holding-detail-${key}`;
+            const { value, gain, gainPct } = eurFigures(h);
+            const { price, avgCost } = priceLines(h);
+            return (
+              <li key={key} className={`rounded-apple border border-divider px-4 py-3 ${open ? 'bg-parchment-deep' : ''}`}>
+                {nameButton(h, open, detailId)}
+                <div className="mt-2 flex items-start justify-between gap-3">
+                  <div className="min-w-0 text-[13px] text-ink-body">
+                    <p>{fmtQty(h.quantity)} units</p>
+                    <p>{price ?? 'No price'}</p>
+                    <p className="text-[12px] text-ink-muted">avg cost {avgCost}</p>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <p className="text-[15px] font-medium text-ink" data-privacy="blur">{fmtEUR(value)}</p>
+                    {gain != null ? (
+                      <p className={`text-[13px] ${toneClass(gain)}`}>
+                        <span data-privacy="blur">{fmtEUR(gain, { sign: true })}</span>
+                        {gainPct != null && <span className="block text-[12px]">{fmtPct(gainPct, { sign: true })}</span>}
+                      </p>
+                    ) : (
+                      <p className="text-[12px] text-ink-muted">at cost</p>
+                    )}
+                  </div>
+                </div>
+                <div className="mt-2 text-[13px]"><WeightCell pct={h.weight_pct} /></div>
+                {open && (
+                  <div id={detailId} className="mt-3 pt-3 border-t border-divider">
+                    <RowFacts h={h} />
+                    {detail}
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+        <div className="mt-3 flex items-start justify-between gap-3 rounded-apple border border-divider bg-inset px-4 py-3">
+          <span className="text-[14px] font-semibold text-ink">Total</span>
+          <div className="text-right">
+            <p className="text-[15px] font-semibold text-ink" data-privacy="blur">{fmtEUR(totalValue)}</p>
+            {anyPriced && (
+              <p className={`text-[13px] ${toneClass(totalGain)}`}>
+                <span data-privacy="blur">{fmtEUR(totalGain, { sign: true })}</span>
+                {totalGainPct != null && <> · {fmtPct(totalGainPct, { sign: true })}</>}
+              </p>
+            )}
+          </div>
+        </div>
+        {footnote}
+      </>
     );
   }
 
   return (
     <>
-      {/* Stacked allocation bar */}
-      {sorted.some(h => h.weight_pct != null) && (
-        <div className="mb-4 px-1 md:px-0">
-          <div className="flex h-3 w-full rounded-full overflow-hidden">
-            {sorted.map((h, i) => (
-              <div
-                key={`${h.account_id}-${h.security_isin}`}
-                className="transition-all duration-300"
-                style={{
-                  width: `${h.weight_pct ?? 0}%`,
-                  backgroundColor: ALLOC_COLORS[i % ALLOC_COLORS.length],
-                }}
-                title={`${h.name}: ${(h.weight_pct ?? 0).toFixed(1)}%`}
-              />
-            ))}
-          </div>
-          <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2">
-            {sorted.map((h, i) => (
-              <div key={`${h.account_id}-${h.security_isin}-legend`} className="flex items-center gap-1.5">
-                <div className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: ALLOC_COLORS[i % ALLOC_COLORS.length] }} />
-                <span className="text-[12px] text-ink-muted">
-                  <span data-privacy="blur">{h.name.length > 20 ? h.name.slice(0, 18) + '...' : h.name}</span> <span data-privacy="blur" className="tabular-nums">{(h.weight_pct ?? 0).toFixed(1)}%</span>
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Mobile: card layout */}
-      <div className="md:hidden space-y-3 -mx-1">
-        {sorted.map((h, i) => {
-          const costBasis = h.quantity * h.avg_cost_basis;
-          const pl = h.unrealized_pl ?? 0;
-          const plPct = costBasis !== 0 ? (pl / costBasis) * 100 : 0;
-          const color = ALLOC_COLORS[i % ALLOC_COLORS.length];
-
-          return (
-            <div
-              key={`${h.account_id}-${h.security_isin}`}
-              className="rounded-apple bg-parchment-deep px-4 py-3"
-            >
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0 flex-1">
-                  <p className={`text-[15px] font-medium text-ink truncate ${onSecurityClick ? 'cursor-pointer hover:text-forest' : ''}`}
-                    onClick={() => onSecurityClick?.(h.security_isin)}>{h.name}</p>
-                  <p className="text-[12px] text-ink-muted mt-0.5">
-                    {h.asset_class}{h.symbol ? ` · ${h.symbol}` : ''}
-                  </p>
-                </div>
-                {hasMarketPrices && h.market_value != null ? (
-                  <div className="text-right shrink-0">
-                    <p className="text-[15px] font-medium tabular-nums">{fmt(h.market_value)}</p>
-                    <p className={`text-[12px] tabular-nums ${pl >= 0 ? 'text-sage' : 'text-claret'}`}>
-                      {pl >= 0 ? '+' : ''}{fmt(pl)} ({fmtPct(plPct)})
-                    </p>
-                  </div>
-                ) : (
-                  <p className="text-[15px] font-medium tabular-nums shrink-0">{fmt(costBasis)}</p>
-                )}
-              </div>
-              {/* Weight bar */}
-              {h.weight_pct != null && (
-                <div className="mt-2 flex items-center gap-2">
-                  <div className="flex-1 h-2 rounded-full bg-divider">
-                    <div
-                      className="h-2 rounded-full transition-all duration-300"
-                      style={{ width: `${Math.min(h.weight_pct, 100)}%`, backgroundColor: color }}
-                    />
-                  </div>
-                  <span className="text-[12px] font-medium tabular-nums shrink-0" style={{ color }}>
-                    {h.weight_pct.toFixed(1)}%
-                  </span>
-                </div>
-              )}
-              <div className="flex items-center gap-4 mt-2 text-[12px] text-ink-muted tabular-nums">
-                <span>{fmtQty(h.quantity)} units</span>
-                <span>Avg {fmt(h.avg_cost_basis)}</span>
-                {h.total_dividends > 0 && (
-                  <span className="text-sage">Div {fmt(h.total_dividends)}</span>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Desktop: table layout */}
-      <p className="hidden md:block text-[11px] text-ink-muted text-right mb-1 px-1">Scroll for more →</p>
-      <div className="hidden md:block overflow-x-auto -mx-5">
-        <table className="w-full min-w-[800px]">
+      <div role="region" aria-label="Holdings table" tabIndex={0} className="overflow-x-auto rounded-apple border border-divider">
+        <table className="apple-table table-fixed min-w-[700px]">
+          <colgroup>
+            <col />
+            <col className="w-[84px]" />
+            <col className="w-[132px]" />
+            <col className="w-[92px]" />
+            <col className="w-[92px]" />
+            <col className="w-[132px]" />
+          </colgroup>
           <thead>
-            <tr className="text-left font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em]">
-              <th className="px-5 pb-2 font-medium">Name</th>
-              <th className="px-5 pb-2 font-medium text-right">Quantity</th>
-              <th className="px-5 pb-2 font-medium text-right">Avg Cost</th>
-              {hasMarketPrices && <th className="px-5 pb-2 font-medium text-right">Price</th>}
-              {hasMarketPrices && <th className="px-5 pb-2 font-medium text-right">Market Value</th>}
-              {hasMarketPrices && <th className="px-5 pb-2 font-medium text-right">P&L</th>}
-              {hasMarketPrices && <th className="px-5 pb-2 font-medium text-right">FX Impact</th>}
-              <th className="px-5 pb-2 font-medium text-right">Weight</th>
-              <th className="px-5 pb-2 font-medium text-right">Dividends</th>
+            <tr>
+              <th scope="col" className="!px-2">Security</th>
+              <th scope="col" className="num !px-2">Quantity</th>
+              <th scope="col" className="num !px-2">Price</th>
+              <th scope="col" className="num !px-2">Value</th>
+              <th scope="col" className="num !px-2">Gain</th>
+              <th scope="col" className="!px-2">Weight</th>
             </tr>
           </thead>
-          <tbody>
-            {sorted.map((h, i) => {
-              const costBasis = h.quantity * h.avg_cost_basis;
-              const pl = h.unrealized_pl ?? 0;
-              const plPct = costBasis !== 0 ? (pl / costBasis) * 100 : 0;
-              const color = ALLOC_COLORS[i % ALLOC_COLORS.length];
-
-              return (
-                <tr
-                  key={`${h.account_id}-${h.security_isin}`}
-                  className={`transition-colors hover:bg-parchment-deep ${
-                    i < sorted.length - 1 ? 'border-b border-divider' : ''
-                  }`}
-                >
-                  <td className="px-5 py-3">
-                    <div className="flex items-center gap-2">
-                      <div className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: color }} />
-                      <div>
-                        <div className={`text-[15px] font-medium text-ink ${onSecurityClick ? 'cursor-pointer hover:text-forest' : ''}`}
-                          onClick={() => onSecurityClick?.(h.security_isin)}>{h.name}</div>
-                        <div className="text-[12px] text-ink-muted mt-0.5">
-                          {h.asset_class}{h.symbol ? ` · ${h.symbol}` : ''} · {h.security_isin}
-                        </div>
-                      </div>
-                    </div>
+          {sorted.map(h => {
+            const key = holdingKey(h);
+            const open = expandedKey === key;
+            const detailId = `holding-detail-${key}`;
+            const { value, gain, gainPct } = eurFigures(h);
+            const { price, avgCost } = priceLines(h);
+            const bg = open ? 'bg-parchment-deep' : '';
+            return (
+              <tbody key={key}>
+                <tr className={bg}>
+                  <td className="!p-2 !border-b !border-divider">{nameButton(h, open, detailId)}</td>
+                  <td className="num !p-2 !border-b !border-divider whitespace-nowrap">{fmtQty(h.quantity)}</td>
+                  <td className="num !p-2 !border-b !border-divider whitespace-nowrap">
+                    {price ?? <span className="text-ink-muted">No price</span>}
+                    <span className="block text-[12px] text-ink-muted">avg cost {avgCost}</span>
                   </td>
-                  <td className="px-5 py-3 text-right text-[15px] tabular-nums">{fmtQty(h.quantity)}</td>
-                  <td className="px-5 py-3 text-right text-[15px] tabular-nums">{fmt(h.avg_cost_basis)}</td>
-                  {hasMarketPrices && (
-                    <td className="px-5 py-3 text-right text-[15px] tabular-nums">
-                      {h.current_price != null ? fmt(h.current_price) : '—'}
-                    </td>
-                  )}
-                  {hasMarketPrices && (
-                    <td className="px-5 py-3 text-right text-[15px] tabular-nums font-medium">
-                      {h.market_value != null ? fmt(h.market_value) : fmt(costBasis)}
-                    </td>
-                  )}
-                  {hasMarketPrices && (
-                    <td className="px-5 py-3 text-right text-[15px] tabular-nums">
-                      {h.unrealized_pl != null ? (
-                        <div className={pl >= 0 ? 'text-sage' : 'text-claret'}>
-                          <div>{pl >= 0 ? '+' : ''}{fmt(pl)}</div>
-                          <div className="text-[12px]">{fmtPct(plPct)}</div>
-                        </div>
-                      ) : '—'}
-                    </td>
-                  )}
-                  {hasMarketPrices && (
-                    <td className="px-5 py-3 text-right text-[15px] tabular-nums">
-                      {h.fx_impact_pct != null ? (
-                        <div>
-                          <div className={h.fx_impact_pct >= 0 ? 'text-sage' : 'text-claret'}>
-                            {h.fx_impact_pct >= 0 ? '+' : ''}{h.fx_impact_pct.toFixed(1)}%
-                          </div>
-                          {h.fx_exposure && <div className="text-[12px] text-ink-muted">{h.fx_exposure}</div>}
-                        </div>
-                      ) : <span className="text-ink-muted/40">—</span>}
-                    </td>
-                  )}
-                  <td className="px-5 py-3 text-right w-28">
-                    {h.weight_pct != null ? (
-                      <div>
-                        <span className="text-[15px] font-semibold tabular-nums" style={{ color: weightColor(h.weight_pct) }}>
-                          {h.weight_pct.toFixed(1)}%
-                        </span>
-                        <div className="mt-1 h-1.5 w-full rounded-full bg-divider">
-                          <div
-                            className="h-1.5 rounded-full transition-all duration-300"
-                            style={{ width: `${Math.min(h.weight_pct, 100)}%`, backgroundColor: color }}
-                          />
-                        </div>
-                      </div>
-                    ) : '—'}
+                  <td className="num !p-2 !border-b !border-divider whitespace-nowrap !text-ink">
+                    <span data-privacy="blur">{fmtEUR(value)}</span>
+                    {gain == null && <span className="block text-[12px] text-ink-muted">at cost</span>}
                   </td>
-                  <td className="px-5 py-3 text-right text-[15px] tabular-nums text-sage">{fmt(h.total_dividends)}</td>
+                  <td className="num !p-2 !border-b !border-divider whitespace-nowrap">
+                    {gain != null ? (
+                      <div className={toneClass(gain)}>
+                        <span data-privacy="blur">{fmtEUR(gain, { sign: true })}</span>
+                        <span className="block text-[12px]">{gainPct != null ? fmtPct(gainPct, { sign: true }) : '—'}</span>
+                      </div>
+                    ) : <span className="text-ink-muted">—</span>}
+                  </td>
+                  <td className="!p-2 !border-b !border-divider"><WeightCell pct={h.weight_pct} /></td>
                 </tr>
-              );
-            })}
-          </tbody>
+                {open && (
+                  <tr id={detailId} className={bg}>
+                    <td colSpan={6} className="!px-4 !pt-2 !pb-5 !border-b !border-divider">
+                      <RowFacts h={h} />
+                      {detail}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            );
+          })}
+          <tfoot>
+            <tr className="bg-inset">
+              <td className="!px-2 !py-3 font-semibold !text-ink" colSpan={3}>Total</td>
+              <td className="num !px-2 !py-3 font-semibold !text-ink whitespace-nowrap"><span data-privacy="blur">{fmtEUR(totalValue)}</span></td>
+              <td className="num !px-2 !py-3 font-semibold whitespace-nowrap">
+                {anyPriced ? (
+                  <div className={toneClass(totalGain)}>
+                    <span data-privacy="blur">{fmtEUR(totalGain, { sign: true })}</span>
+                    <span className="block text-[12px] font-normal">{totalGainPct != null ? fmtPct(totalGainPct, { sign: true }) : '—'}</span>
+                  </div>
+                ) : '—'}
+              </td>
+              <td className="!px-2 !py-3 !text-ink">{hasWeights ? fmtPct(totalWeight) : '—'}</td>
+            </tr>
+          </tfoot>
         </table>
       </div>
+      {footnote}
     </>
   );
 }

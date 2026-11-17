@@ -20,6 +20,7 @@ export default {
         'ink-body': 'var(--color-ink-body)',
         'ink-muted': 'var(--color-ink-muted)',
         divider: 'var(--color-divider)',
+        field: 'var(--color-field)',
         inset: 'var(--color-inset)',
         // Accents — swap in dark mode for contrast (all WCAG AA on every surface)
         forest: 'var(--color-forest)',
@@ -60,7 +61,7 @@ export default {
         'display': ['44px', { lineHeight: '52px', fontWeight: '400', letterSpacing: '-0.025em', fontFamily: '"EB Garamond", Georgia, "Times New Roman", serif' }],
         'title': ['26px', { lineHeight: '32px', fontWeight: '400', letterSpacing: '-0.015em', fontFamily: '"EB Garamond", Georgia, "Times New Roman", serif' }],
         'heading': ['20px', { lineHeight: '28px', fontWeight: '500', letterSpacing: '-0.005em' }],
-        'label': ['11px', { lineHeight: '16px', fontWeight: '500', letterSpacing: '0.1em' }],
+        'label': ['13px', { lineHeight: '16px', fontWeight: '600', letterSpacing: '0.1em' }],
       },
       transitionDuration: {
         DEFAULT: '350ms',

@@ -6,55 +6,55 @@ test.describe('Portfolio page', () => {
     await page.getByRole('link', { name: 'Portfolio', exact: true }).click();
     await page.waitForURL('**/portfolio');
     // Wait for the page to finish loading — the TabBar is always rendered once loading completes
-    await page.waitForSelector('button:has-text("Overview")');
+    await expect(page.getByRole('tab', { name: 'Overview' })).toBeVisible();
   });
 
   test('loads the portfolio page with KPIs', async ({ page }) => {
-    const marketValue = page.getByText('Market Value').first();
-    if (await marketValue.count() > 0) {
-      await expect(marketValue).toBeVisible();
-    }
-    const positions = page.getByText('Positions');
-    if (await positions.count() > 0) {
-      await expect(positions.first()).toBeVisible();
-    }
-    const dividends = page.getByText('Dividends').first();
-    if (await dividends.count() > 0) {
-      await expect(dividends).toBeVisible();
-    }
+    const overview = page.getByRole('tabpanel', { name: 'Overview' });
+    await expect(overview.getByText('Market value', { exact: true })).toBeVisible();
+    await expect(overview.getByText('Cost basis', { exact: true })).toBeVisible();
+    // The position count moved into the Market value caption
+    await expect(overview.getByText(/\d+ holdings?/).first()).toBeVisible();
+    await expect(overview.getByText('Dividends received', { exact: true })).toBeVisible();
+  });
+
+  test('tab choice is kept in the URL and survives a reload', async ({ page }) => {
+    await page.getByRole('tab', { name: 'Dividends' }).click();
+    await expect(page).toHaveURL(/\/portfolio\?tab=dividends$/);
+    await page.reload();
+    await expect(page.getByRole('tab', { name: 'Dividends' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('heading', { name: 'Dividend Income' })).toBeVisible();
   });
 
   test('displays dividend income section with monthly/yearly toggle', async ({ page }) => {
     await page.getByRole('tab', { name: 'Dividends' }).click();
-    const heading = page.getByRole('heading', { name: 'Dividend Income' });
-    if (await heading.count() > 0) {
-      await expect(heading.first()).toBeVisible();
-      await expect(page.getByRole('button', { name: 'monthly' })).toBeVisible();
-      await expect(page.getByRole('button', { name: 'yearly' })).toBeVisible();
-    }
+    await expect(page.getByRole('heading', { name: 'Dividend Income' })).toBeVisible();
+    const view = page.getByRole('group', { name: 'Dividend view' });
+    await expect(view.getByRole('button', { name: 'By month' })).toBeVisible();
+    await expect(view.getByRole('button', { name: 'By year' })).toBeVisible();
   });
 
   test('monthly view is selected by default', async ({ page }) => {
     await page.getByRole('tab', { name: 'Dividends' }).click();
-    const monthlyBtn = page.getByRole('button', { name: 'monthly' });
-    if (await monthlyBtn.count() > 0) {
-      await expect(monthlyBtn).toBeVisible();
-      await expect(page.getByRole('heading', { name: 'Dividend Income' })).toBeVisible();
-    }
+    const view = page.getByRole('group', { name: 'Dividend view' });
+    await expect(view.getByRole('button', { name: 'By month' })).toHaveAttribute('aria-pressed', 'true');
+    await expect(view.getByRole('button', { name: 'By year' })).toHaveAttribute('aria-pressed', 'false');
   });
 
   test('clicking yearly switches the dividend chart view', async ({ page }) => {
     await page.getByRole('tab', { name: 'Dividends' }).click();
-    const yearlyBtn = page.getByRole('button', { name: 'yearly' });
-    if (await yearlyBtn.count() > 0) {
-      await yearlyBtn.click();
-      await page.waitForTimeout(500);
-      await expect(page.getByRole('heading', { name: 'Dividend Income' })).toBeVisible();
+    const view = page.getByRole('group', { name: 'Dividend view' });
+    const monthly = view.getByRole('button', { name: 'By month' });
+    const yearly = view.getByRole('button', { name: 'By year' });
 
-      await page.getByRole('button', { name: 'monthly' }).click();
-      await page.waitForTimeout(500);
-      await expect(page.getByRole('heading', { name: 'Dividend Income' })).toBeVisible();
-    }
+    await yearly.click();
+    await expect(yearly).toHaveAttribute('aria-pressed', 'true');
+    await expect(monthly).toHaveAttribute('aria-pressed', 'false');
+    await expect(page.getByRole('heading', { name: 'Payout History' })).toBeVisible();
+
+    await monthly.click();
+    await expect(monthly).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.getByRole('heading', { name: 'Payout History' })).toBeVisible();
   });
 
   test('dividends API returns all fields including advanced metrics', async ({ request }) => {
@@ -105,17 +105,11 @@ test.describe('Portfolio page', () => {
 
   test('displays by security breakdown', async ({ page }) => {
     await page.getByRole('tab', { name: 'Dividends' }).click();
-    const bySecurity = page.getByText('By Security');
-    if (await bySecurity.count() > 0) {
-      await expect(bySecurity.first()).toBeVisible();
-    }
+    await expect(page.getByRole('heading', { name: 'By Security' })).toBeVisible();
   });
 
   test('shows price freshness indicator', async ({ page }) => {
-    const priceText = page.getByText('Prices as of');
-    if (await priceText.count() > 0) {
-      await expect(priceText.first()).toBeVisible();
-    }
+    await expect(page.getByText(/Prices as of \d/)).toBeVisible();
   });
 
   test('holdings API returns price_as_of date', async ({ request }) => {
@@ -127,12 +121,14 @@ test.describe('Portfolio page', () => {
   });
 
   test('displays realized and unrealized P&L in performance section', async ({ page }) => {
-    const realized = page.getByText('Realized', { exact: true });
-    if (await realized.count() > 0) {
-      await expect(realized.first()).toBeVisible();
-      await expect(page.getByText('Unrealized').first()).toBeVisible();
-      await expect(page.getByText('Total Gains').first()).toBeVisible();
-    }
+    const overview = page.getByRole('tabpanel', { name: 'Overview' });
+    await expect(overview.getByRole('heading', { name: 'Performance', exact: true })).toBeVisible();
+    // Relabelled tiles: Realized → Realised gain, Unrealized → Remaining gain, Total Gains → Total gain
+    await expect(overview.getByText('Realised gain · since inception', { exact: true })).toBeVisible();
+    await expect(overview.getByText('Remaining gain · since inception', { exact: true })).toBeVisible();
+    await expect(overview.getByText('Total gain · since inception', { exact: true })).toBeVisible();
+    await expect(overview.getByText('Unrealised gain', { exact: true })).toBeVisible();
+    await expect(overview.getByText('Net capital invested', { exact: true })).toBeVisible();
   });
 
   test('performance API returns realized and unrealized fields', async ({ request }) => {
@@ -236,17 +232,12 @@ test.describe('Portfolio page', () => {
 
   test('displays dividend KPI cards', async ({ page }) => {
     await page.getByRole('tab', { name: 'Dividends' }).click();
-    const heading = page.getByRole('heading', { name: 'Dividend Income' });
-    if (await heading.count() > 0) {
-      await expect(heading.first()).toBeVisible();
-      const totalReceived = page.getByText('Total Received');
-      if (await totalReceived.count() > 0) {
-        await expect(totalReceived.first()).toBeVisible();
-        await expect(page.getByText('Trailing 12 Months').first()).toBeVisible();
-        await expect(page.getByText('Yield on Cost').first()).toBeVisible();
-        await expect(page.getByText('Growth YoY').first()).toBeVisible();
-      }
-    }
+    const panel = page.getByRole('tabpanel', { name: 'Dividends' });
+    await expect(panel.getByRole('heading', { name: 'Dividend Income' })).toBeVisible();
+    await expect(panel.getByText('Total received', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Trailing 12 months', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Yield on cost', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Growth · year on year', { exact: true })).toBeVisible();
   });
 
   test('rebalance API returns valid response', async ({ request }) => {
@@ -301,14 +292,9 @@ test.describe('Portfolio page', () => {
 
   test('displays target allocation section on Allocation tab', async ({ page }) => {
     await page.getByRole('tab', { name: 'Allocation' }).click();
-    const heading = page.getByRole('heading', { name: 'Target Allocation' });
-    if (await heading.count() > 0) {
-      await expect(heading.first()).toBeVisible();
-      const editBtn = page.getByRole('button', { name: 'Edit Targets' });
-      if (await editBtn.count() > 0) {
-        await expect(editBtn.first()).toBeVisible();
-      }
-    }
+    await expect(page).toHaveURL(/\/portfolio\?tab=allocation$/);
+    await expect(page.getByRole('heading', { name: 'Target Allocation' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Edit targets' })).toBeVisible();
   });
 
   test('dividends API returns calendar with upcoming payments', async ({ request }) => {

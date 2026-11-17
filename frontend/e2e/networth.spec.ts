@@ -13,16 +13,30 @@ test.describe('Net Worth page', () => {
     await expect(page.locator('p.text-\\[36px\\]').first()).toBeVisible();
   });
 
-  test('renders period selector buttons including 1D', async ({ page }) => {
-    const periods = ['1D', '1M', '3M', '6M', 'YTD', '1Y', 'All'];
+  test('renders period selector buttons 1M to All (no 1D/1W)', async ({ page }) => {
+    const group = page.getByRole('group', { name: 'Time period' });
+    const periods = ['1M', '3M', '6M', 'YTD', '1Y', 'All'];
     for (const p of periods) {
-      await expect(page.getByRole('button', { name: p, exact: true })).toBeVisible();
+      await expect(group.getByRole('button', { name: p, exact: true })).toBeVisible();
     }
+    await expect(group.getByRole('button')).toHaveCount(periods.length);
+    // The 1D and 1W periods were removed in the redesign; the daily change is always shown instead.
+    await expect(page.getByRole('button', { name: '1D', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: '1W', exact: true })).toHaveCount(0);
   });
 
-  test('1D is selected by default', async ({ page }) => {
-    const btn = page.getByRole('button', { name: '1D', exact: true });
-    await expect(btn).toBeVisible();
+  test('1Y is selected by default', async ({ page }) => {
+    const group = page.getByRole('group', { name: 'Time period' });
+    await expect(group.getByRole('button', { name: '1Y', exact: true })).toHaveAttribute('aria-pressed', 'true');
+    await expect(group.locator('button[aria-pressed="true"]')).toHaveCount(1);
+    await expect(page.getByText('over the past year')).toBeVisible();
+  });
+
+  test('selecting a period marks it as pressed', async ({ page }) => {
+    const group = page.getByRole('group', { name: 'Time period' });
+    await group.getByRole('button', { name: '3M', exact: true }).click();
+    await expect(group.getByRole('button', { name: '3M', exact: true })).toHaveAttribute('aria-pressed', 'true');
+    await expect(group.getByRole('button', { name: '1Y', exact: true })).toHaveAttribute('aria-pressed', 'false');
   });
 
   test('always shows daily change with today label', async ({ page }) => {
@@ -53,8 +67,8 @@ test.describe('Net Worth page', () => {
     await expect(page.locator('canvas').first()).toBeVisible();
   });
 
-  test('1D period shows chart', async ({ page }) => {
-    // 1D is default — sparkline chart should be visible
+  test('default period shows chart', async ({ page }) => {
+    // 1Y is default — sparkline chart should be visible
     await expect(page.locator('canvas').first()).toBeVisible();
   });
 
@@ -158,8 +172,19 @@ test.describe('Net Worth page', () => {
     await page.getByRole('tab', { name: 'Projection' }).click();
     await expect(page.getByRole('heading', { name: 'Wealth Projection' })).toBeVisible();
     // Should have sliders
-    await expect(page.getByText('Monthly')).toBeVisible();
-    await expect(page.getByText('Return', { exact: true }).first()).toBeVisible();
+    await expect(page.getByRole('slider', { name: 'Monthly contribution' })).toBeVisible();
+    await expect(page.getByRole('slider', { name: 'Return' })).toBeVisible();
+  });
+
+  test('tab choice is kept in the URL and survives a reload', async ({ page }) => {
+    await page.getByRole('tab', { name: 'Projection' }).click();
+    await expect(page).toHaveURL(/[?&]tab=projection/);
+    await page.reload();
+    await expect(page.getByRole('tab', { name: 'Projection' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('heading', { name: 'Wealth Projection' })).toBeVisible();
+    // Returning to the default tab drops the parameter again
+    await page.getByRole('tab', { name: 'Overview' }).click();
+    await expect(page).not.toHaveURL(/tab=/);
   });
 
   test('savings rate API returns valid data', async ({ request }) => {
@@ -174,19 +199,25 @@ test.describe('Net Worth page', () => {
     expect(body.total_deposits).toBeGreaterThan(0);
   });
 
-  test('displays status bar or next actions on overview', async ({ page }) => {
-    // Status bar shows alerts/errors, or next actions card is visible
-    const hasStatus = await page.getByText(/unread alert|job error/).count();
-    const hasActions = await page.getByText('Next Actions').count();
-    const hasMetrics = await page.getByText('Invested').count();
-    // At least the Rule of Three metrics should be visible
-    expect(hasStatus + hasActions + hasMetrics).toBeGreaterThan(0);
+  test('displays summary tiles and recommended actions on overview', async ({ page, request }) => {
+    // The summary tiles are always shown on the Overview tab
+    const overview = page.getByRole('tabpanel', { name: 'Overview' });
+    await expect(overview.getByText('Liquid wealth', { exact: true })).toBeVisible();
+    // Recommended actions ("Next Actions" before the redesign) appear whenever the API has any
+    const { count } = await (await request.get('/api/portfolio/next-actions')).json();
+    if (count > 0) {
+      await expect(overview.getByRole('heading', { name: 'Recommended Actions' })).toBeVisible();
+      await expect(overview.getByRole('link', { name: /^Open / }).first()).toBeVisible();
+    }
   });
 
-  test('displays Rule of Three metrics on overview', async ({ page }) => {
-    await expect(page.getByText('Invested')).toBeVisible();
-    await expect(page.getByText('Return', { exact: true })).toBeVisible();
-    await expect(page.getByText('Cash')).toBeVisible();
+  // The "Rule of Three" tiles (Invested / Return / Cash) were removed in the redesign.
+  // Their place is taken by Liquid wealth and Market return for the selected period.
+  test('displays Liquid wealth and Market return tiles on overview', async ({ page }) => {
+    const overview = page.getByRole('tabpanel', { name: 'Overview' });
+    await expect(overview.getByText('Liquid wealth', { exact: true })).toBeVisible();
+    await expect(overview.getByText('Market return', { exact: true })).toBeVisible();
+    await expect(overview.getByText('Invested', { exact: true })).toHaveCount(0);
   });
 
   test('attribution API returns summary', async ({ request }) => {
@@ -199,17 +230,20 @@ test.describe('Net Worth page', () => {
   });
 
   test('displays estate calculator on Planning page', async ({ page }) => {
-    // Navigate to Planning page
-    await page.getByRole('link', { name: 'Planning' }).click();
+    // Navigate to Planning page — the Estate Calculator lives on the Protection tab
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('link', { name: 'Planning', exact: true }).click();
+    await page.getByRole('tab', { name: 'Protection' }).click();
+    await expect(page).toHaveURL(/\/planning\?tab=protection/);
     await expect(page.getByRole('heading', { name: 'Estate Calculator' })).toBeVisible();
     await expect(page.getByText('German inheritance tax')).toBeVisible();
   });
 
   test('displays FIRE calculator on Planning page', async ({ page }) => {
-    // Navigate to Planning page
-    await page.getByRole('link', { name: 'Planning' }).click();
+    // Navigate to Planning page — FIRE & Retirement is the default tab
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('link', { name: 'Planning', exact: true }).click();
+    await expect(page.getByRole('tab', { name: 'FIRE & Retirement' })).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByRole('heading', { name: 'FIRE Calculator' })).toBeVisible();
-    await expect(page.getByPlaceholder('e.g. 36000')).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Annual expenses' })).toBeVisible();
   });
 
   test('displays projection milestones on Projection tab', async ({ page }) => {

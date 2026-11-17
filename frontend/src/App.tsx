@@ -11,6 +11,8 @@ import Tax from './pages/Tax';
 import Settings from './pages/Settings';
 import Login from './pages/Login';
 import NotFound from './pages/NotFound';
+import More from './pages/More';
+import { fmtDateTime } from './utils/format';
 import ErrorBoundary from './components/ErrorBoundary';
 
 const navItems = [
@@ -74,6 +76,79 @@ const navItems = [
   },
 ];
 
+// Mobile bottom bar: four primary destinations plus "More" (style guide: 5 tabs).
+const MOBILE_TABS = ['/', '/portfolio', '/cashflow', '/transactions'];
+// Pages reached through More: the bar highlights More and the header shows a back arrow.
+const MORE_PATHS = ['/analysis', '/planning', '/tax', '/settings'];
+const PAGE_TITLES: Record<string, string> = {
+  '/': 'Net Worth', '/portfolio': 'Portfolio', '/analysis': 'Analysis', '/planning': 'Planning',
+  '/tax': 'Tax', '/transactions': 'Transactions', '/cashflow': 'Cashflow', '/settings': 'Settings', '/more': 'More',
+};
+
+interface NotificationBellProps {
+  containerRef: React.RefObject<HTMLDivElement>;
+  panelId: string;
+  showNotifications: boolean;
+  unreadCount: number;
+  notifications: NotificationEntry[];
+  onToggle: () => void;
+  className?: string;
+}
+
+function NotificationBell({
+  containerRef,
+  panelId,
+  showNotifications,
+  unreadCount,
+  notifications,
+  onToggle,
+  className = '',
+}: NotificationBellProps) {
+  return (
+    <div ref={containerRef} className={`relative ${className}`}>
+      <button
+        onClick={onToggle}
+        data-notification-bell="true"
+        aria-label="Notifications"
+        aria-expanded={showNotifications}
+        aria-haspopup="true"
+        aria-controls={panelId}
+        className="relative inline-flex items-center justify-center min-w-[44px] min-h-[44px] text-ink-muted hover:text-ink transition-colors"
+      >
+        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0" />
+        </svg>
+        {unreadCount > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-claret text-[10px] font-bold text-white dark:text-parchment-deep px-1">
+            {unreadCount > 9 ? '9+' : unreadCount}
+          </span>
+        )}
+      </button>
+      {showNotifications && (
+        <div id={panelId} role="region" aria-label="Notifications" className="absolute right-0 top-full mt-2 w-80 max-h-96 overflow-y-auto rounded-xl bg-parchment shadow-lg border border-divider z-50">
+          <div className="px-4 py-3 border-b border-divider">
+            <h3 className="text-[15px] font-semibold text-ink">Notifications</h3>
+          </div>
+          {notifications.length === 0 ? (
+            <p className="px-4 py-6 text-[13px] text-ink-muted text-center">No notifications yet</p>
+          ) : (
+            <div className="divide-y divide-divider">
+              {notifications.slice(0, 20).map(n => (
+                <div key={n.id} className={`px-4 py-3 ${!n.is_read ? 'bg-inset border-l-[3px] border-forest' : ''}`}>
+                  <p className="text-[13px] text-ink">{n.message}</p>
+                  <p className="text-[11px] text-ink-muted mt-0.5">
+                    {fmtDateTime(n.triggered_at)}
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const location = useLocation();
   const [navBarPos, setNavBarPos] = useState({ top: 0, height: 0 });
@@ -128,17 +203,22 @@ export default function App() {
   const checkAuth = useCallback(async () => {
     try {
       const resp = await fetch('/api/auth/status');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
-      setAuthenticated(data.authenticated);
+      setAuthenticated(Boolean(data.authenticated));
       // required field is false when auth is disabled, absent (= true) when enabled
       setAuthRequired(data.required !== false);
     } catch {
-      setAuthRequired(false);
+      setAuthenticated(false);
+      setAuthRequired(true);
     }
   }, []);
 
+  const ready = authRequired !== null && (!authRequired || authenticated);
+
   useEffect(() => { checkAuth(); }, [checkAuth]);
   useEffect(() => {
+    if (!ready) return;
     const poll = () => api.listNotifications().then(r => {
       setUnreadCount(r.unread_count);
       setNotifications(r.notifications || []);
@@ -146,28 +226,26 @@ export default function App() {
     poll();
     const interval = setInterval(poll, 60000);
     return () => clearInterval(interval);
-  }, []);
+  }, [ready]);
 
-  const notifRef = useRef<HTMLDivElement>(null);
+  const desktopNotifRef = useRef<HTMLDivElement>(null);
+  const mobileNotifRef = useRef<HTMLDivElement>(null);
   // Close dropdown when clicking outside
   useEffect(() => {
     if (!showNotifications) return;
     const handleClick = (e: MouseEvent) => {
-      if (notifRef.current && !notifRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      const inDesktop = desktopNotifRef.current?.contains(target) ?? false;
+      const inMobile = mobileNotifRef.current?.contains(target) ?? false;
+      if (!inDesktop && !inMobile) {
         setShowNotifications(false);
       }
     };
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setShowNotifications(false);
-        // NotificationBell is defined inside the parent, so each
-        // setShowNotifications re-render produces a new component type and
-        // remounts the button DOM node. We have to defer focus past React's
-        // commit (via rAF) so we restore focus to the NEW node — and we have
-        // to query by aria-controls since the bell renders twice (desktop
-        // sidebar + mobile header) and only one is visible per viewport.
         requestAnimationFrame(() => {
-          const candidates = document.querySelectorAll<HTMLButtonElement>('button[aria-controls="notifications-panel"]');
+          const candidates = document.querySelectorAll<HTMLButtonElement>('button[data-notification-bell="true"]');
           for (const btn of candidates) {
             const rect = btn.getBoundingClientRect();
             if (rect.width > 0 && rect.height > 0) {
@@ -193,48 +271,14 @@ export default function App() {
     }
   };
 
-  const NotificationBell = ({ className = '' }: { className?: string }) => (
-    <div ref={notifRef} className={`relative ${className}`}>
-      <button onClick={toggleNotifications} aria-label="Notifications" aria-expanded={showNotifications} aria-haspopup="true" aria-controls="notifications-panel" className="relative inline-flex items-center justify-center min-w-[44px] min-h-[44px] text-ink-muted hover:text-ink transition-colors">
-        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0" />
-        </svg>
-        {unreadCount > 0 && (
-          <span className="absolute -top-0.5 -right-0.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-claret text-[10px] font-bold text-white dark:text-parchment-deep px-1">
-            {unreadCount > 9 ? '9+' : unreadCount}
-          </span>
-        )}
-      </button>
-      {showNotifications && (
-        <div id="notifications-panel" role="region" aria-label="Notifications" className="absolute right-0 top-full mt-2 w-80 max-h-96 overflow-y-auto rounded-xl bg-parchment shadow-lg border border-divider z-50">
-          <div className="px-4 py-3 border-b border-divider">
-            <h3 className="text-[15px] font-semibold text-ink">Notifications</h3>
-          </div>
-          {notifications.length === 0 ? (
-            <p className="px-4 py-6 text-[13px] text-ink-muted text-center">No notifications yet</p>
-          ) : (
-            <div className="divide-y divide-divider">
-              {notifications.slice(0, 20).map(n => (
-                <div key={n.id} className={`px-4 py-3 ${!n.is_read ? 'bg-inset border-l-[3px] border-forest' : ''}`}>
-                  <p className="text-[13px] text-ink">{n.message}</p>
-                  <p className="text-[11px] text-ink-muted mt-0.5">
-                    {new Date(n.triggered_at).toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                  </p>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
+  const inMore = MORE_PATHS.some(p => location.pathname === p || location.pathname.startsWith(p + '/'));
+  const moreActive = inMore || location.pathname === '/more';
+  const pageTitle = PAGE_TITLES[location.pathname] ?? 'Page not found';
 
   const handleLogout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' });
     setAuthenticated(false);
   };
-
-  const ready = authRequired !== null && (!authRequired || authenticated);
 
   return (
     <>
@@ -262,7 +306,7 @@ export default function App() {
               <circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" strokeWidth="1" />
               <text x="16" y="22" textAnchor="middle" fontFamily="EB Garamond, Georgia, serif" fontSize="18" fontWeight="500" fill="currentColor">W</text>
             </svg>
-            <h1 className="font-serif text-[17px] font-medium text-ink tracking-tight flex-1">Wealth</h1>
+            <span className="font-serif text-[17px] font-medium text-ink tracking-tight flex-1">Wealth</span>
             <button onClick={() => setDarkMode(d => !d)} aria-pressed={darkMode} aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'} className="p-1 text-ink-muted hover:text-ink transition-colors" title={darkMode ? 'Light mode' : 'Dark mode'}>
               <svg className="w-[18px] h-[18px]" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
                 {darkMode
@@ -279,14 +323,21 @@ export default function App() {
                 }
               </svg>
             </button>
-            <NotificationBell />
+            <NotificationBell
+              containerRef={desktopNotifRef}
+              panelId="notifications-panel-desktop"
+              showNotifications={showNotifications}
+              unreadCount={unreadCount}
+              notifications={notifications}
+              onToggle={toggleNotifications}
+            />
           </div>
 
           <nav ref={navRef} className="flex-1 px-3 py-1 relative" aria-label="Main navigation">
             {/* Sliding accent bar */}
             <span
               className="absolute left-0 w-[3px] bg-forest rounded-full"
-              style={{ top: navBarPos.top, height: navBarPos.height, transition: 'top 250ms cubic-bezier(0.4,0,0.2,1), height 250ms cubic-bezier(0.4,0,0.2,1)' }}
+              style={{ top: navBarPos.top, height: navBarPos.height, transition: 'top 350ms cubic-bezier(0.16,1,0.3,1), height 350ms cubic-bezier(0.16,1,0.3,1)' }}
             />
             <div className="space-y-0.5">
               {navItems.map(({ path, label, icon }) => (
@@ -295,8 +346,8 @@ export default function App() {
                   to={path}
                   end={path === '/'}
                   className={({ isActive }) =>
-                    `flex items-center gap-2.5 rounded-[3px] px-2.5 py-[7px] text-[15px] transition-colors duration-[250ms] ${isActive
-                      ? 'text-forest font-medium'
+                    `flex items-center gap-2.5 rounded-[3px] px-2.5 py-[7px] text-[15px] transition-colors ${isActive
+                      ? 'text-forest font-semibold'
                       : 'text-ink-muted hover:text-ink-body'
                     }`
                   }
@@ -312,7 +363,7 @@ export default function App() {
             <div className="px-3 py-3 border-t border-divider">
               <button
                 onClick={handleLogout}
-                className="w-full flex items-center gap-2.5 rounded-[3px] px-2.5 py-[7px] text-[15px] text-ink-muted hover:bg-black/[0.03] dark:hover:bg-white/[0.06] active:bg-black/[0.05] dark:active:bg-white/[0.1] transition-all duration-[250ms]"
+                className="w-full flex items-center gap-2.5 rounded-[3px] px-2.5 py-[7px] text-[15px] text-ink-muted hover:text-ink-body transition-colors"
               >
                 <svg className="w-[18px] h-[18px]" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9" />
@@ -328,15 +379,25 @@ export default function App() {
             header controls first, matching the visual top-to-bottom flow. */}
         <header className="md:hidden fixed inset-x-0 top-0 z-30 border-b border-divider backdrop-blur-xl" style={{ backgroundColor: 'color-mix(in srgb, var(--color-inset) 95%, transparent)', paddingTop: 'env(safe-area-inset-top, 0px)' }}>
           <div className="h-12 flex items-center justify-between px-4">
-            <div className="flex items-center gap-2">
-              <svg viewBox="0 0 32 32" className="w-6 h-6 shrink-0 text-forest" aria-hidden="true">
-                <circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" strokeWidth="1" />
-                <text x="16" y="22" textAnchor="middle" fontFamily="EB Garamond, Georgia, serif" fontSize="18" fontWeight="500" fill="currentColor">W</text>
-              </svg>
+            <div className="flex items-center gap-2.5 min-w-0">
+              {inMore ? (
+                <NavLink to="/more" aria-label="Back to More" className="-ml-3 inline-flex items-center justify-center min-w-[44px] min-h-[44px] text-ink">
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M15 5l-7 7 7 7" />
+                  </svg>
+                </NavLink>
+              ) : (
+                <svg viewBox="0 0 32 32" className="w-6 h-6 shrink-0 text-forest" aria-hidden="true">
+                  <circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" strokeWidth="1" />
+                  <text x="16" y="22" textAnchor="middle" fontFamily="EB Garamond, Georgia, serif" fontSize="18" fontWeight="500" fill="currentColor">W</text>
+                </svg>
+              )}
+              {/* The page's h1 on phones; pages render their own h1 from md up. */}
+              <h1 className={`font-serif text-[20px] leading-7 font-medium text-ink truncate ${inMore ? '-ml-2.5' : ''}`}>{pageTitle}</h1>
             </div>
-            <div className="flex gap-2">
+            <div className="flex -mr-3">
               <button onClick={() => setDarkMode(d => !d)} aria-pressed={darkMode} className="inline-flex items-center justify-center min-w-[44px] min-h-[44px] text-ink-muted" title={darkMode ? 'Light mode' : 'Dark mode'} aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
                   {darkMode
                     ? <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" />
                     : <path strokeLinecap="round" strokeLinejoin="round" d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 006.002-2.082z" />
@@ -344,20 +405,21 @@ export default function App() {
                 </svg>
               </button>
               <button onClick={() => setPrivacyMode(p => !p)} aria-pressed={privacyMode} className="inline-flex items-center justify-center min-w-[44px] min-h-[44px] text-ink-muted" title={privacyMode ? 'Show values' : 'Hide values'} aria-label={privacyMode ? 'Show monetary values' : 'Hide monetary values'}>
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
                   {privacyMode
                     ? <path strokeLinecap="round" strokeLinejoin="round" d="M3.98 8.223A10.477 10.477 0 001.934 12C3.226 16.338 7.244 19.5 12 19.5c.993 0 1.953-.138 2.863-.395M6.228 6.228A10.45 10.45 0 0112 4.5c4.756 0 8.773 3.162 10.065 7.498a10.523 10.523 0 01-4.293 5.774M6.228 6.228L3 3m3.228 3.228l3.65 3.65m7.894 7.894L21 21m-3.228-3.228l-3.65-3.65m0 0a3 3 0 10-4.243-4.243m4.242 4.242L9.88 9.88" />
                     : <><path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" /><path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></>
                   }
                 </svg>
               </button>
-              <NotificationBell />
-              <NavLink to="/settings" className="inline-flex items-center justify-center min-w-[44px] min-h-[44px] text-ink-muted" aria-label="Settings">
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z" />
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                </svg>
-              </NavLink>
+              <NotificationBell
+                containerRef={mobileNotifRef}
+                panelId="notifications-panel-mobile"
+                showNotifications={showNotifications}
+                unreadCount={unreadCount}
+                notifications={notifications}
+                onToggle={toggleNotifications}
+              />
             </div>
           </div>
         </header>
@@ -366,18 +428,21 @@ export default function App() {
         <main id="main" tabIndex={-1} className="md:ml-56 flex-1 min-w-0 min-h-screen pb-[88px] md:pb-0 overflow-x-hidden safe-area-header-offset focus:outline-none">
           <div className="mx-auto max-w-5xl px-4 py-5 md:px-8 md:py-8">
             <ErrorBoundary key={location.pathname}>
-              <Routes>
-                <Route path="/" element={<NetWorth />} />
-                <Route path="/portfolio" element={<Portfolio />} />
-                <Route path="/analysis" element={<Analysis />} />
-                <Route path="/planning" element={<Planning />} />
-                <Route path="/cashflow" element={<Cashflow />} />
-                <Route path="/tax" element={<Tax />} />
-                <Route path="/lab" element={<Navigate to="/tax" replace />} />
-                <Route path="/transactions" element={<Transactions />} />
-                <Route path="/settings" element={<Settings onLogout={authRequired ? handleLogout : undefined} authEnabled={authRequired || false} />} />
-                <Route path="*" element={<NotFound />} />
-              </Routes>
+              {ready ? (
+                <Routes>
+                  <Route path="/" element={<NetWorth />} />
+                  <Route path="/portfolio" element={<Portfolio />} />
+                  <Route path="/analysis" element={<Analysis />} />
+                  <Route path="/planning" element={<Planning />} />
+                  <Route path="/cashflow" element={<Cashflow />} />
+                  <Route path="/tax" element={<Tax />} />
+                  <Route path="/lab" element={<Navigate to="/tax" replace />} />
+                  <Route path="/transactions" element={<Transactions />} />
+                  <Route path="/settings" element={<Settings onLogout={authRequired ? handleLogout : undefined} authEnabled={authRequired || false} />} />
+                  <Route path="/more" element={<More onLogout={authRequired ? handleLogout : undefined} />} />
+                  <Route path="*" element={<NotFound />} />
+                </Routes>
+              ) : null}
             </ErrorBoundary>
           </div>
         </main>
@@ -385,21 +450,30 @@ export default function App() {
         {/* Mobile bottom tab bar — placed last so keyboard tab order goes
             top header → main content → bottom nav, matching visual flow. */}
         <nav className="md:hidden fixed inset-x-0 bottom-0 z-30 border-t border-divider backdrop-blur-xl safe-area-bottom" aria-label="Main navigation" style={{ backgroundColor: 'color-mix(in srgb, var(--color-inset) 95%, transparent)' }}>
-          <div className="flex items-stretch justify-around pb-[4px]">
-            {navItems.filter(n => !n.desktopOnly).map(({ path, label, icon }) => (
+          <div className="flex items-stretch pb-[4px]">
+            {navItems.filter(n => MOBILE_TABS.includes(n.path)).sort((x, y) => MOBILE_TABS.indexOf(x.path) - MOBILE_TABS.indexOf(y.path)).map(({ path, label, icon }) => (
               <NavLink
                 key={path}
                 to={path}
                 end={path === '/'}
                 className={({ isActive }) =>
-                  `flex flex-1 flex-col items-center gap-0.5 py-2 pt-2 text-[10px] font-medium transition-colors duration-[250ms] ${isActive ? 'text-forest' : 'text-ink-muted'
-                  }`
+                  `flex flex-1 min-w-0 flex-col items-center justify-center gap-[3px] min-h-[56px] border-t-2 text-[12px] whitespace-nowrap transition-colors ${isActive ? 'border-forest text-forest font-bold' : 'border-transparent text-ink-muted font-medium'}`
                 }
               >
                 {icon}
-                <span className="truncate max-w-[48px] text-center">{label}</span>
+                <span>{label}</span>
               </NavLink>
             ))}
+            <NavLink
+              to="/more"
+              aria-current={moreActive ? 'page' : undefined}
+              className={`flex flex-1 min-w-0 flex-col items-center justify-center gap-[3px] min-h-[56px] border-t-2 text-[12px] whitespace-nowrap transition-colors ${moreActive ? 'border-forest text-forest font-bold' : 'border-transparent text-ink-muted font-medium'}`}
+            >
+              <svg className="w-[18px] h-[18px]" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" aria-hidden="true">
+                <path strokeLinecap="round" d="M4 7h16M4 12h16M4 17h16" />
+              </svg>
+              <span>More</span>
+            </NavLink>
           </div>
         </nav>
       </div>

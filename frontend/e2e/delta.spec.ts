@@ -99,16 +99,17 @@ test.describe('Delta App CSV import', () => {
         await page.request.post('/api/auth/login', { data: { password } });
       }
     }
-    await page.goto('/settings');
-    const section = page.getByText('Bank Accounts & Securities');
-    await section.scrollIntoViewIfNeeded();
-    await section.click();
+    // The "Add Account" form opens from the "Add account" button on the Accounts tab.
+    await page.goto('/settings?tab=accounts');
+    await expect(page.getByRole('tab', { name: 'Accounts' })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('button', { name: 'Add account' }).click();
     await expect(page.getByRole('heading', { name: 'Add Account' })).toBeVisible();
 
-    const institutionSelect = page.locator('select').filter({
-      has: page.locator('option[value="delta"]'),
-    });
-    await expect(institutionSelect).toHaveCount(1);
+    const institutionSelect = page.getByRole('combobox', { name: 'Institution' });
+    await expect(institutionSelect).toBeVisible();
     await expect(institutionSelect.locator('option[value="delta"]')).toHaveText('Delta');
+    // The option is selectable, not just present
+    await institutionSelect.selectOption('delta');
+    await expect(institutionSelect).toHaveValue('delta');
   });
 });

@@ -1,21 +1,28 @@
+import { useState } from 'react';
 import { usePlanning } from './PlanningContext';
 import { useThemeColors } from '../../hooks/useThemeColors';
 import EChartWrapper from '../charts/EChartWrapper';
+import { Section, SubHeading, MetricCard, MetricGrid, NumberField, EmptyState } from '../ui';
+import { fmtEUR, fmtAxis } from '../../utils/format';
 
-// Human Capital = present value of future earnings, discounted at 3% real
-// and grown at 2% nominal salary growth. The crossover chart shows when
-// financial capital (current NW + contributions @7% real) surpasses the
+// Human Capital = present value of future earnings, discounted (default 3 %)
+// and grown at a salary growth rate (default 2 %). The crossover chart shows when
+// financial capital (current NW + contributions, default 7 % growth) surpasses the
 // remaining human-capital stream — typically late-40s for a typical career.
+// Income, ages and the monthly budget come from Your Profile.
 export default function HumanCapital() {
-  const { totalNetWorth, crGrossIncome, setCrGrossIncome, pensionCurrentAge, setPensionCurrentAge, pensionAge, crBudget, fmt } = usePlanning();
+  const { totalNetWorth, crGrossIncome, pensionCurrentAge, pensionAge, crBudget } = usePlanning();
   const tc = useThemeColors();
+  const [salaryGrowthPct, setSalaryGrowthPct] = useState(2);
+  const [discountPct, setDiscountPct] = useState(3);
+  const [portfolioGrowthPct, setPortfolioGrowthPct] = useState(7);
 
   const grossIncome = parseFloat(crGrossIncome) || 0;
   const currentAge = pensionCurrentAge;
   const retireAge = pensionAge;
   const yearsToRetire = Math.max(0, retireAge - currentAge);
-  const discountRate = 0.03;
-  const growthRate = 0.02;
+  const discountRate = discountPct / 100;
+  const growthRate = salaryGrowthPct / 100;
   const monthlyContrib = parseFloat(crBudget) || 0;
 
   let humanCapital = 0;
@@ -36,64 +43,82 @@ export default function HumanCapital() {
         remainingHuman += grossIncome * Math.pow(1 + growthRate, r) / Math.pow(1 + discountRate, r - y);
       }
       crossoverData.push({ age: currentAge + y, human: Math.round(remainingHuman), financial: Math.round(projFinancial) });
-      projFinancial = (projFinancial + monthlyContrib * 12) * 1.07;
+      projFinancial = (projFinancial + monthlyContrib * 12) * (1 + portfolioGrowthPct / 100);
     }
   }
   const crossoverAge = crossoverData.find(d => d.financial >= d.human)?.age;
+  const ready = grossIncome > 0 && yearsToRetire > 0;
 
   return (
-    <div className="border-t border-divider pt-6 py-3 md:py-5">
-      <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Human Capital</h2>
-      <p className="text-[13px] text-ink-muted mb-3 md:mb-4 px-1 md:px-0">
-        Present value of your future earnings compared to financial capital.
-      </p>
-
-      <div className="grid grid-cols-2 gap-2 mb-4 px-1 md:px-0">
-        <div>
-          <label className="text-[11px] text-ink-muted block mb-1">Gross Annual Income</label>
-          <input aria-label="Gross annual income" type="number" value={crGrossIncome} onChange={e => { setCrGrossIncome(e.target.value); localStorage.setItem('gross_annual_income', e.target.value); }} placeholder="e.g. 60000" className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-        </div>
-        <div>
-          <label className="text-[11px] text-ink-muted block mb-1">Current Age</label>
-          <input aria-label="Current age" type="number" value={pensionCurrentAge} onChange={e => { setPensionCurrentAge(parseInt(e.target.value) || 35); localStorage.setItem('pension_current_age', e.target.value); }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-        </div>
-      </div>
-
-      {grossIncome > 0 && yearsToRetire > 0 && (
+    <Section
+      id="human-capital"
+      title="Human Capital"
+      subtitle="What your future earnings are worth today, compared with the money you have already built up."
+    >
+      {!ready ? (
+        <EmptyState
+          title={grossIncome <= 0 ? 'Gross income needed' : 'Retirement age needed'}
+          message={grossIncome <= 0
+            ? 'Enter your gross income in Your Profile at the top of this page to value your future earnings.'
+            : 'Your retirement age in Your Profile must be higher than your current age.'}
+          action={{ label: 'Go to Your Profile', href: '#profile' }}
+        />
+      ) : (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mb-4 px-1 md:px-0">
-            <div className="rounded-xl bg-parchment-deep p-3 text-center">
-              <p className="text-[12px] text-ink-muted mb-1">Human Capital</p>
-              <p className="font-serif text-[20px] font-semibold tabular-nums text-forest">{fmt(humanCapital)}</p>
-              <p className="text-[11px] text-ink-muted mt-0.5">{yearsToRetire} years to retirement</p>
-            </div>
-            <div className="rounded-xl bg-parchment-deep p-3 text-center">
-              <p className="text-[12px] text-ink-muted mb-1">Financial Capital</p>
-              <p className="font-serif text-[20px] font-semibold tabular-nums text-gold">{fmt(financialCapital)}</p>
-              <p className="text-[11px] text-ink-muted mt-0.5">current net worth</p>
-            </div>
-            {crossoverAge && (
-              <div className="rounded-xl bg-parchment-deep p-3 text-center">
-                <p className="text-[12px] text-ink-muted mb-1">Crossover Age</p>
-                <p className="font-serif text-[20px] font-semibold tabular-nums">{crossoverAge}</p>
-                <p className="text-[11px] text-ink-muted mt-0.5">financial surpasses human</p>
-              </div>
-            )}
+          <div className="grid grid-cols-2 gap-x-3 gap-y-4 md:grid-cols-3">
+            <NumberField label="Salary growth" unit="% p.a." value={salaryGrowthPct} onValueChange={setSalaryGrowthPct} />
+            <NumberField label="Discount rate" unit="% p.a." value={discountPct} onValueChange={setDiscountPct} hint="How much less a euro earned next year is worth today." />
+            <NumberField label="Portfolio growth" unit="% p.a." value={portfolioGrowthPct} onValueChange={setPortfolioGrowthPct} />
           </div>
 
-          <EChartWrapper option={{
-            tooltip: { trigger: 'axis' as const },
-            legend: { data: ['Human Capital', 'Financial Capital'], bottom: 0, textStyle: { fontSize: 11, color: tc.inkMuted } },
-            xAxis: { type: 'category' as const, data: crossoverData.map(d => `${d.age}`), axisLabel: { fontSize: 11, color: tc.inkMuted }, axisLine: { show: false }, axisTick: { show: false } },
-            yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => v >= 1000000 ? `${(v / 1000000).toFixed(1)}M` : `${(v / 1000).toFixed(0)}k`, fontSize: 11, color: tc.inkMuted }, splitLine: { lineStyle: { color: tc.divider } } },
-            series: [
-              { name: 'Human Capital', type: 'line' as const, data: crossoverData.map(d => d.human), smooth: 0.3, showSymbol: false, lineStyle: { color: tc.forest, width: 2 }, areaStyle: { opacity: 0.08, color: tc.forest } },
-              { name: 'Financial Capital', type: 'line' as const, data: crossoverData.map(d => d.financial), smooth: 0.3, showSymbol: false, lineStyle: { color: tc.gold, width: 2 }, areaStyle: { opacity: 0.08, color: tc.gold } },
-            ],
-            grid: { left: 55, right: 16, top: 10, bottom: 40 },
-          }} height="250px" />
+          <MetricGrid className="mt-5">
+            <MetricCard
+              label="Human capital"
+              value={fmtEUR(humanCapital)}
+              sublabel={`Gross earnings over ${yearsToRetire} ${yearsToRetire === 1 ? 'year' : 'years'} to retirement, in today’s value`}
+            />
+            <MetricCard label="Financial capital" value={fmtEUR(financialCapital)} sublabel="Your net worth today" />
+            <MetricCard
+              label="Crossover age"
+              money={false}
+              value={crossoverAge ?? 'Not before retirement'}
+              sublabel="When financial capital overtakes remaining human capital"
+            />
+          </MetricGrid>
+
+          <SubHeading className="mt-6">Human and financial capital by age</SubHeading>
+          <p className="mt-1 text-[13px] text-ink-muted">
+            Financial capital assumes you invest the <span data-privacy="blur">{fmtEUR(monthlyContrib)}</span> monthly budget from Your Profile.
+          </p>
+          <EChartWrapper
+            option={{
+              tooltip: { trigger: 'axis' as const, valueFormatter: (v: unknown) => fmtEUR(Number(v)) },
+              legend: {
+                bottom: 0,
+                itemWidth: 16,
+                data: [
+                  { name: 'Human capital', icon: 'path://M0 4h19v2h-19z' },
+                  { name: 'Financial capital', icon: 'path://M0 4h5v2h-5zM7 4h5v2h-5zM14 4h5v2h-5z' },
+                ],
+              },
+              xAxis: { type: 'category' as const, name: 'Age', nameLocation: 'middle' as const, nameGap: 26, data: crossoverData.map(d => `${d.age}`), axisLabel: { fontSize: 11 } },
+              yAxis: { type: 'value' as const, name: '€', axisLabel: { fontSize: 11, formatter: (v: number) => fmtAxis(v) } },
+              series: [
+                {
+                  name: 'Human capital', type: 'line' as const, data: crossoverData.map(d => d.human), smooth: 0.3, showSymbol: false,
+                  color: tc.forest, itemStyle: { color: tc.forest }, lineStyle: { color: tc.forest, width: 2 }, areaStyle: { opacity: 0.08, color: tc.forest },
+                },
+                {
+                  name: 'Financial capital', type: 'line' as const, data: crossoverData.map(d => d.financial), smooth: 0.3, showSymbol: false,
+                  color: tc.gold, itemStyle: { color: tc.gold }, lineStyle: { color: tc.gold, width: 2, type: 'dashed' as const }, areaStyle: { opacity: 0.08, color: tc.gold },
+                },
+              ],
+              grid: { left: 52, right: 16, top: 28, bottom: 64 },
+            }}
+            height="280px"
+          />
         </>
       )}
-    </div>
+    </Section>
   );
 }

@@ -1,7 +1,12 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
+import type { ReactNode } from 'react';
 import { api, type Account, type NetWorthSnapshot, type ProjectionData } from '../api/client';
-import { TabBar } from '../components/ui';
-import { PlanningProvider, type PlanningState } from '../components/planning/PlanningContext';
+import {
+  PageHeader, Section, TabBar, TabPanel, useTabParam, NumberField,
+  LoadingState, ErrorState, SectionBoundary,
+} from '../components/ui';
+import { PlanningProvider, usePlanning, type PensionSource, type PlanningState } from '../components/planning/PlanningContext';
+import { readStored, writeStored, toNum } from '../components/planning/shared';
 import ContributionRouter from '../components/planning/ContributionRouter';
 import EstateCalculator from '../components/planning/EstateCalculator';
 import FinancialIndependencePlaybook from '../components/planning/FinancialIndependencePlaybook';
@@ -10,7 +15,6 @@ import HumanCapital from '../components/planning/HumanCapital';
 import InsuranceInventory from '../components/planning/InsuranceInventory';
 import LiabilityAmortization from '../components/planning/LiabilityAmortization';
 import LifeEventSimulator from '../components/planning/LifeEventSimulator';
-import MoneyLeftOnTable from '../components/planning/MoneyLeftOnTable';
 import OpportunityCosts from '../components/planning/OpportunityCosts';
 import Rentenluecke from '../components/planning/Rentenluecke';
 import WithdrawalSequence from '../components/planning/WithdrawalSequence';
@@ -18,64 +22,120 @@ import WithdrawalSimulation from '../components/planning/WithdrawalSimulation';
 import WithdrawalSources from '../components/planning/WithdrawalSources';
 
 type PlanningSubTab = 'fire' | 'growth' | 'protection';
+const TAB_IDS: readonly PlanningSubTab[] = ['fire', 'growth', 'protection'];
 const PLANNING_TABS: { id: PlanningSubTab; label: string }[] = [
   { id: 'fire', label: 'FIRE & Retirement' },
   { id: 'growth', label: 'Growth' },
   { id: 'protection', label: 'Protection' },
 ];
 
+/** String state mirrored to localStorage under `key`. */
+function useStored(key: string, initial: string): [string, (v: string) => void] {
+  const [value, setValue] = useState<string>(() => readStored(key, initial));
+  const set = useCallback((v: string) => { setValue(v); writeStored(key, v); }, [key]);
+  return [value, set];
+}
+
+/** Whole-number state mirrored to localStorage under `key`. */
+function useStoredInt(key: string, initial: number): [number, (v: number) => void] {
+  const [value, setValue] = useState<number>(() => parseInt(readStored(key, String(initial)), 10) || initial);
+  const set = useCallback((v: number) => { setValue(v); writeStored(key, String(v)); }, [key]);
+  return [value, set];
+}
+
+/**
+ * The inputs several calculators share, in one place and visible on every tab.
+ * Individual calculators no longer repeat these fields.
+ */
+function ProfileSection() {
+  const {
+    pensionCurrentAge, setPensionCurrentAge, pensionAge, setPensionAge,
+    crMarginalRate, setCrMarginalRate, crGrossIncome, setCrGrossIncome,
+    crBudget, setCrBudget, crChildren, setCrChildren,
+  } = usePlanning();
+
+  return (
+    <Section id="profile" title="Your Profile" subtitle="Used by every calculator on all three tabs." first>
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-x-3 gap-y-4">
+        <NumberField label="Age" unit="years" integer min={0} value={pensionCurrentAge} onValueChange={v => setPensionCurrentAge(Math.max(0, v))} />
+        <NumberField label="Retirement age" unit="years" integer min={0} value={pensionAge} onValueChange={v => setPensionAge(Math.max(0, v))} />
+        <NumberField label="Marginal tax rate" unit="%" value={toNum(crMarginalRate)} onValueChange={v => setCrMarginalRate(String(v))} />
+        <NumberField label="Gross income" unit="€ / year" value={toNum(crGrossIncome)} onValueChange={v => setCrGrossIncome(String(v))} />
+        <NumberField label="Monthly budget" unit="€ / month" value={toNum(crBudget)} onValueChange={v => setCrBudget(String(v))} hint="What you can invest each month." />
+        <NumberField label="Children" integer min={0} value={toNum(crChildren)} onValueChange={v => setCrChildren(String(Math.max(0, v)))} hint="Counts towards Riester allowances." />
+      </div>
+    </Section>
+  );
+}
+
+/** One calculator: a render error shows an error band in its place, the rest of the page stays. */
+function Guarded({ children }: { children: ReactNode }) {
+  return <SectionBoundary>{children}</SectionBoundary>;
+}
+
 export default function Planning() {
   // Shared dashboard data — fetched independently of NetWorth so this page
-  // stands on its own (no shared parent state, no defaultTab dance).
+  // stands on its own.
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [allSnapshots, setAllSnapshots] = useState<NetWorthSnapshot[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // Projection — Planning's FIRE Calculator + Withdrawal sections read
-  // projData.contribution / projData.return_pct as their default basis. We
-  // own a local copy here so the Projection tab and Planning don't fight.
+  // Projection — the FIRE calculator and Life Events read projData.contribution /
+  // projData.return_pct as their default basis.
   const [projData, setProjData] = useState<ProjectionData | null>(null);
+  const [projFailed, setProjFailed] = useState(false);
+  const [projDefaultContrib, setProjDefaultContrib] = useState<number | null>(null);
   const [projContrib, setProjContrib] = useState<string>('');
   const [projReturn, setProjReturn] = useState<string>('');
 
-  // Sub-tab pill nav
-  const [planningSubTab, setPlanningSubTab] = useState<PlanningSubTab>(() => (localStorage.getItem('planning_subtab') as PlanningSubTab) || 'fire');
+  // Tab state lives in the URL (?tab=growth).
+  const [tab, setTab] = useTabParam<PlanningSubTab>(TAB_IDS, 'fire');
 
   // FIRE inputs
-  const [fireExpenses, setFireExpenses] = useState<string>(() => localStorage.getItem('fire_expenses') || '');
-  const [fireSWR, setFireSWR] = useState<string>(() => localStorage.getItem('fire_swr') || '3.5');
-  const [pensionIncome, setPensionIncome] = useState<string>(() => localStorage.getItem('pension_income') || '');
-  const [otherIncome, setOtherIncome] = useState<string>(() => localStorage.getItem('other_income') || '');
+  const [fireExpenses, setFireExpenses] = useStored('fire_expenses', '');
+  const [fireSWR, setFireSWR] = useStored('fire_swr', '3.5');
+  const [pensionIncome, setPensionIncome] = useStored('pension_income', '');
+  const [otherIncome, setOtherIncome] = useStored('other_income', '');
 
-  // Contribution Router
-  const [crMarginalRate, setCrMarginalRate] = useState<string>(() => localStorage.getItem('marginal_tax_rate') || '42');
-  const [crChildren, setCrChildren] = useState<string>(() => localStorage.getItem('num_children') || '0');
-  const [crBudget, setCrBudget] = useState<string>(() => localStorage.getItem('monthly_invest_budget') || '');
-  const [crGrossIncome, setCrGrossIncome] = useState<string>(() => localStorage.getItem('gross_annual_income') || '');
+  // Profile
+  const [crMarginalRate, setCrMarginalRate] = useStored('marginal_tax_rate', '42');
+  const [crChildren, setCrChildren] = useStored('num_children', '0');
+  const [crBudget, setCrBudget] = useStored('monthly_invest_budget', '');
+  const [crGrossIncome, setCrGrossIncome] = useStored('gross_annual_income', '');
+  const [pensionAge, setPensionAge] = useStoredInt('pension_age', 67);
+  const [pensionCurrentAge, setPensionCurrentAge] = useStoredInt('pension_current_age', 35);
 
-  // Rentenlücke (pension gap)
-  const [pensionSources, setPensionSources] = useState<{ type: string; label: string; monthly_gross: number; rentenpunkte: number; start_age: number; tax_portion_pct: number }[]>(() => {
-    try { return JSON.parse(localStorage.getItem('pension_sources') || '[]'); } catch { return []; }
+  // Pension gap
+  const [pensionSources, setPensionSourcesState] = useState<PensionSource[]>(() => {
+    try {
+      const parsed: unknown = JSON.parse(readStored('pension_sources', '[]'));
+      return Array.isArray(parsed) ? (parsed as PensionSource[]) : [];
+    } catch {
+      return [];
+    }
   });
-  const [pensionAge, setPensionAge] = useState<number>(() => parseInt(localStorage.getItem('pension_age') || '67') || 67);
-  const [pensionCurrentAge, setPensionCurrentAge] = useState<number>(() => parseInt(localStorage.getItem('pension_current_age') || '35') || 35);
-  const [pensionNeed, setPensionNeed] = useState<number>(() => parseInt(localStorage.getItem('pension_need') || '3000') || 3000);
-  const [pensionContrib, setPensionContrib] = useState<string>(() => localStorage.getItem('pension_contrib') || '');
+  const setPensionSources = useCallback((v: PensionSource[]) => {
+    setPensionSourcesState(v);
+    writeStored('pension_sources', JSON.stringify(v));
+  }, []);
+  const [pensionNeed, setPensionNeed] = useStoredInt('pension_need', 3000);
+  const [pensionContrib, setPensionContrib] = useStored('pension_contrib', '');
 
-  // (Insurance Inventory, Estate heirs, Opportunity Cost, Rentenlücke
-  // result: owned by their respective section components — see
-  // components/planning/.)
+  // Growth until retirement (Withdrawal Sources + Simulation)
+  const [growthBrokerage, setGrowthBrokerage] = useStored('planning_growth_brokerage', '7');
+  const [growthOther, setGrowthOther] = useStored('planning_growth_other', '2');
 
   const loadData = useCallback(async () => {
     try {
+      setLoading(true);
       setLoadError(null);
       const [accRes, nwRes] = await Promise.all([
         api.listAccounts(),
         api.getNetWorth(9999),
       ]);
-      setAccounts(accRes.accounts || []);
-      setAllSnapshots(nwRes.snapshots || []);
+      setAccounts(Array.isArray(accRes?.accounts) ? accRes.accounts : []);
+      setAllSnapshots(Array.isArray(nwRes?.snapshots) ? nwRes.snapshots : []);
     } catch (e) {
       console.error('Failed to load planning data:', e);
       setLoadError(e instanceof Error ? e.message : 'Failed to load data');
@@ -86,19 +146,22 @@ export default function Planning() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  useEffect(() => {
-    // Opportunity-cost fetch lives in the <OpportunityCosts /> component
-    // now; Planning only kicks off the projection fetch (consumed by FIRE
-    // Calculator + the Withdrawal sections via PlanningContext).
+  const reloadProjection = useCallback(() => {
+    setProjFailed(false);
     api.getProjection().then(d => {
       setProjData(d);
-      if (d.contribution != null) setProjContrib(String(d.contribution));
+      if (d.contribution != null) {
+        setProjDefaultContrib(d.contribution);
+        setProjContrib(String(d.contribution));
+      }
       if (d.return_pct != null) setProjReturn(String(d.return_pct));
-    }).catch(() => {});
+    }).catch(() => setProjFailed(true));
   }, []);
 
+  useEffect(() => { reloadProjection(); }, [reloadProjection]);
+
   // Re-run projection when FIRE inputs change — FIRE Calculator surfaces the
-  // refreshed milestone/sensitivity bands from projData immediately.
+  // refreshed drawdown from projData immediately.
   useEffect(() => {
     if (!projContrib && !projReturn) return;
     const timer = setTimeout(() => {
@@ -118,92 +181,87 @@ export default function Planning() {
   }, [projContrib, projReturn, fireExpenses, fireSWR, pensionIncome, otherIncome, crMarginalRate]);
 
   const totalNetWorth = allSnapshots.length > 0 ? allSnapshots[0].total : 0;
-  const fmt = (n: number) => new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' }).format(n);
 
   // Context value — memoize so sections don't re-render on unrelated state
-  // changes. Setters from useState are already stable references.
+  // changes. Setters are stable references.
   const planningCtx = useMemo<PlanningState>(() => ({
     accounts, allSnapshots, totalNetWorth,
-    projData, projContrib, setProjContrib, projReturn, setProjReturn,
+    projData, projFailed, reloadProjection, projDefaultContrib,
+    projContrib, setProjContrib, projReturn, setProjReturn,
     fireExpenses, setFireExpenses, fireSWR, setFireSWR,
     pensionIncome, setPensionIncome, otherIncome, setOtherIncome,
     crMarginalRate, setCrMarginalRate, crChildren, setCrChildren,
     crBudget, setCrBudget, crGrossIncome, setCrGrossIncome,
-    pensionSources, setPensionSources,
     pensionAge, setPensionAge, pensionCurrentAge, setPensionCurrentAge,
+    pensionSources, setPensionSources,
     pensionNeed, setPensionNeed, pensionContrib, setPensionContrib,
-    fmt,
+    growthBrokerage, setGrowthBrokerage, growthOther, setGrowthOther,
   }), [
     accounts, allSnapshots, totalNetWorth,
-    projData, projContrib, projReturn,
-    fireExpenses, fireSWR, pensionIncome, otherIncome,
-    crMarginalRate, crChildren, crBudget, crGrossIncome,
-    pensionSources, pensionAge, pensionCurrentAge, pensionNeed, pensionContrib,
+    projData, projFailed, reloadProjection, projDefaultContrib, projContrib, projReturn,
+    fireExpenses, setFireExpenses, fireSWR, setFireSWR,
+    pensionIncome, setPensionIncome, otherIncome, setOtherIncome,
+    crMarginalRate, setCrMarginalRate, crChildren, setCrChildren,
+    crBudget, setCrBudget, crGrossIncome, setCrGrossIncome,
+    pensionAge, setPensionAge, pensionCurrentAge, setPensionCurrentAge,
+    pensionSources, setPensionSources,
+    pensionNeed, setPensionNeed, pensionContrib, setPensionContrib,
+    growthBrokerage, setGrowthBrokerage, growthOther, setGrowthOther,
   ]);
 
   if (loading) {
     return (
-      <div className="px-1 md:px-0 py-6 md:py-8">
-        <h1 className="font-serif text-title text-ink mb-3">Planning</h1>
-        <div className="text-[13px] text-ink-muted">Loading…</div>
+      <div>
+        <PageHeader title="Planning" />
+        <LoadingState message="Loading planning data" lines={6} />
       </div>
     );
   }
 
   if (loadError) {
     return (
-      <div className="px-1 md:px-0 py-6 md:py-8">
-        <h1 className="font-serif text-title text-ink mb-3">Planning</h1>
-        <div className="rounded-[8px] border border-claret bg-parchment-deep p-4 text-[13px] text-claret flex items-center justify-between">
-          <span>Failed to load planning data: {loadError}</span>
-          <button onClick={loadData} className="text-forest text-[13px] font-medium shrink-0">Retry</button>
-        </div>
+      <div className="space-y-4">
+        <PageHeader title="Planning" />
+        <ErrorState message="Planning data couldn’t be loaded." details={loadError} onRetry={loadData} />
       </div>
     );
   }
 
   return (
     <PlanningProvider value={planningCtx}>
-    <div className="px-1 md:px-0 py-6 md:py-8 space-y-6">
-      <h1 className="font-serif text-title text-ink">Planning</h1>
+      <div>
+        <PageHeader title="Planning" />
 
-      {/* Sub-tab navigation — splits 15 sections into FIRE/Growth/Protection
-          so the page no longer requires 12 screens of scrolling. */}
-      <TabBar
-        tabs={PLANNING_TABS}
-        activeTab={planningSubTab}
-        onTabChange={(t) => { setPlanningSubTab(t); localStorage.setItem('planning_subtab', t); }}
-      />
+        <div className="md:mt-4">
+          <TabBar tabs={PLANNING_TABS} activeTab={tab} onTabChange={setTab} ariaLabel="Planning sections" />
+        </div>
 
-      {planningSubTab === 'fire' && <FireCalculator />}
+        <TabPanel id={tab}>
+          <Guarded><ProfileSection /></Guarded>
 
-      {planningSubTab === 'growth' && (<>
-        <ContributionRouter />
-        <MoneyLeftOnTable />
-        <HumanCapital />
-      </>)}
+          {tab === 'fire' && (<>
+            <Guarded><FireCalculator /></Guarded>
+            <Guarded><Rentenluecke /></Guarded>
+            <Guarded><WithdrawalSources /></Guarded>
+            <Guarded><WithdrawalSequence /></Guarded>
+            <Guarded><WithdrawalSimulation /></Guarded>
+            <Guarded><FinancialIndependencePlaybook /></Guarded>
+          </>)}
 
-      {planningSubTab === 'protection' && <InsuranceInventory />}
+          {tab === 'growth' && (<>
+            <Guarded><ContributionRouter /></Guarded>
+            <Guarded><OpportunityCosts /></Guarded>
+            <Guarded><HumanCapital /></Guarded>
+            <Guarded><LifeEventSimulator /></Guarded>
+          </>)}
 
-      {planningSubTab === 'fire' && <Rentenluecke />}
-
-      {planningSubTab === 'protection' && <EstateCalculator />}
-
-      {planningSubTab === 'growth' && (<>
-        <OpportunityCosts />
-        <LifeEventSimulator />
-      </>)}
-
-      {planningSubTab === 'protection' && <LiabilityAmortization />}
-
-      {planningSubTab === 'fire' && (<>
-        <WithdrawalSources />
-        <WithdrawalSequence />
-        <WithdrawalSimulation />
-        <FinancialIndependencePlaybook />
-      </>)}
-
-    </div>
+          {tab === 'protection' && (<>
+            <Guarded><InsuranceInventory /></Guarded>
+            <Guarded><EstateCalculator /></Guarded>
+            <Guarded><LiabilityAmortization /></Guarded>
+          </>)}
+        </TabPanel>
+      </div>
     </PlanningProvider>
   );
 }

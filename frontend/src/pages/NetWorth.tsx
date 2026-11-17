@@ -1,104 +1,219 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import type { ReactNode } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import { api, type Account, type HoldingRow, type NetWorthSnapshot, type GoalProgress, type ProjectionData } from '../api/client';
 import EChartWrapper from '../components/charts/EChartWrapper';
-import AccountCard from '../components/AccountCard';
-import { TabBar } from '../components/ui';
+import AccountCard, { institutionLabel } from '../components/AccountCard';
+import {
+  PageHeader, TabBar, TabPanel, useTabParam, Section, SubHeading, MetricCard, MetricGrid,
+  PeriodSelector, periodCutoff, formatDateForPeriod, LoadingState, ErrorState, EmptyState,
+  SectionBoundary, useConfirm, Chip, RankedBars, ProgressBar,
+} from '../components/ui';
+import type { Period } from '../components/ui';
 import { useThemeColors } from '../hooks/useThemeColors';
 import { useMarketRefresh } from '../hooks/useMarketRefresh';
 import UnvestedPanel from '../components/UnvestedPanel';
 import AssetsTab, { ASSET_VIEW_PARAMS } from '../components/assets/AssetsTab';
-import { useSearchParams } from 'react-router-dom';
-
-type Period = '1D' | '1W' | '1M' | '3M' | '6M' | 'YTD' | '1Y' | 'All';
-const PERIODS: Period[] = ['1D', '1W', '1M', '3M', '6M', 'YTD', '1Y', 'All'];
+import { escapeHtml, fmtEUR, fmtPct, fmtNum, fmtAxis, fmtDateLong, fmtMonth, fmtMonthShort } from '../utils/format';
 
 type NWTab = 'overview' | 'projection' | 'accounts' | 'assets';
-const NW_TABS_DASHBOARD: { id: NWTab; label: string }[] = [
+const NW_TAB_IDS: readonly NWTab[] = ['overview', 'projection', 'accounts', 'assets'];
+const NW_TABS: { id: NWTab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'projection', label: 'Projection' },
   { id: 'accounts', label: 'Accounts' },
   { id: 'assets', label: 'Assets' },
 ];
 
-function periodToDays(period: Period): number {
-  const now = new Date();
-  switch (period) {
-    case '1D': return 2;
-    case '1W': return 7;
-    case '1M': return 30;
-    case '3M': return 90;
-    case '6M': return 180;
-    case 'YTD': {
-      const start = new Date(now.getFullYear(), 0, 1);
-      return Math.ceil((now.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1;
-    }
-    case '1Y': return 365;
-    case 'All': return 9999;
+const PERIODS: Period[] = ['1M', '3M', '6M', 'YTD', '1Y', 'All'];
+const PERIOD_PHRASE: Record<Period, string> = {
+  '1M': 'over the past month',
+  '3M': 'over the past 3 months',
+  '6M': 'over the past 6 months',
+  'YTD': 'since 1 January',
+  '1Y': 'over the past year',
+  '3Y': 'over the past 3 years',
+  'All': 'all time',
+};
+
+/** Where the full list of alerts lives (Portfolio → Goals & Alerts). */
+const ALERTS_HREF = '/portfolio?tab=goals';
+
+interface NextAction { title: string; detail: string; impact_eur: number; urgency: string; category: string; link: string }
+interface WaterfallBar { label: string; value: number; type: string }
+interface AttributionMonth { month: string; contributions: number; market_return: number; dividends: number; interest: number; assets?: number; property_costs?: number; total: number }
+interface WaterfallData {
+  waterfall: WaterfallBar[];
+  time_series: AttributionMonth[];
+  crossover_month: string;
+  net_contributions: number;
+  market_returns: number;
+  dividends: number;
+  current_nw: number;
+}
+type LoadStatus = 'loading' | 'ready' | 'error';
+
+const toneCls = (n: number) => (n > 0 ? 'text-sage' : n < 0 ? 'text-claret' : 'text-ink');
+const monthDate = (m: string) => (m.length === 7 ? `${m}-01` : m);
+/** "1 year 7 months", "7 months", "2 years". */
+function fmtDuration(months: number): string {
+  const y = Math.floor(months / 12);
+  const m = months % 12;
+  const parts: string[] = [];
+  if (y > 0) parts.push(`${y} ${y === 1 ? 'year' : 'years'}`);
+  if (m > 0 || y === 0) parts.push(`${m} ${m === 1 ? 'month' : 'months'}`);
+  return parts.join(' ');
+}
+
+/** Phones get horizontal bars and fewer labels; re-evaluates on resize/rotation. */
+function useIsNarrow(): boolean {
+  const query = '(max-width: 767px)';
+  const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.matchMedia(query).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const on = () => setNarrow(mq.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+  return narrow;
+}
+
+interface LegendItem { label: string; color: string; style?: 'solid' | 'dashed' | 'dotted' | 'band' | 'box' | 'dot' }
+
+/** Legend whose swatches repeat the series' colour and line style. */
+function ChartLegend({ items, className = '' }: { items: LegendItem[]; className?: string }) {
+  return (
+    <ul className={`flex flex-wrap items-center gap-x-5 gap-y-1.5 text-[12px] text-ink-body ${className}`}>
+      {items.map(it => (
+        <li key={it.label} className="inline-flex items-center gap-2">
+          {it.style === 'box' || it.style === 'band' ? (
+            <span aria-hidden="true" className="w-3 h-3 rounded-[2px]" style={{ background: it.color, opacity: it.style === 'band' ? 0.3 : 1 }} />
+          ) : it.style === 'dot' ? (
+            <span aria-hidden="true" className="w-2.5 h-2.5 rounded-full" style={{ background: it.color }} />
+          ) : (
+            <svg aria-hidden="true" width="26" height="8" viewBox="0 0 26 8">
+              <line x1="1" y1="4" x2="25" y2="4" stroke={it.color} strokeWidth="2"
+                strokeDasharray={it.style === 'dashed' ? '6 4' : it.style === 'dotted' ? '2 3' : undefined} />
+            </svg>
+          )}
+          {it.label}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/* ───────────────────────────── Attribution maths ─────────────────────────────
+ * The backend reports cumulative monthly figures. A period is the difference
+ * between the latest month and the month end closest to the period start, so
+ * no figure is recomputed here — only subtracted.
+ */
+
+interface Cause { label: string; value: number }
+interface PeriodAttribution {
+  causes: Cause[];
+  /** Last bar: net change over the period, or current net worth when counting from zero. */
+  net: number;
+  fromZero: boolean;
+  startNW: number;
+  endNW: number;
+  startMonth: string | null;
+  endMonth: string;
+  firstMonth: string;
+  market: number;
+  /** Monthly points from the baseline month to the latest month. */
+  points: AttributionMonth[];
+  startContrib: number;
+}
+
+const WATERFALL_LABELS: Record<string, string> = {
+  'Market Returns': 'Market returns',
+  'Physical Assets': 'Property and vehicles',
+  'Purchase Costs': 'Purchase costs',
+  'Loan Interest': 'Loan interest',
+};
+
+function computeAttribution(wf: WaterfallData | null, period: Period): PeriodAttribution | null {
+  const ts = wf?.time_series ?? [];
+  if (!wf || ts.length === 0) return null;
+  const end = ts[ts.length - 1];
+  let baseIdx = -1;
+  const cutoff = periodCutoff(period);
+  if (cutoff) {
+    // Month end closest to the cutoff: shift by half a month, then step back one month.
+    const shifted = new Date(cutoff);
+    shifted.setDate(shifted.getDate() + 15);
+    const b = new Date(shifted.getFullYear(), shifted.getMonth() - 1, 1);
+    const key = `${b.getFullYear()}-${String(b.getMonth() + 1).padStart(2, '0')}`;
+    for (let i = 0; i < ts.length; i++) if (ts[i].month <= key) baseIdx = i;
+    if (baseIdx >= ts.length - 1) baseIdx = ts.length - 2;
   }
-}
-
-function periodLabel(period: Period): string {
-  if (period === '1D') return 'today';
-  if (period === '1W') return 'this week';
-  if (period === 'All') return 'all time';
-  return period;
-}
-
-function formatChartDate(dateStr: string, period: Period): string {
-  const d = new Date(dateStr);
-  switch (period) {
-    case '1D':
-      return d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-    case '1W':
-      return d.toLocaleDateString('de-DE', { weekday: 'short', day: 'numeric', month: 'short' });
-    case '1M':
-    case '3M':
-      return d.toLocaleDateString('de-DE', { day: 'numeric', month: 'short' });
-    case '6M':
-    case 'YTD':
-    case '1Y':
-      return d.toLocaleDateString('de-DE', { day: 'numeric', month: 'short', year: '2-digit' });
-    case 'All':
-      return d.toLocaleDateString('de-DE', { month: 'short', year: '2-digit' });
+  if (baseIdx < 0) {
+    // Whole history: the backend's own waterfall, which also separates fees and taxes.
+    const causes = (wf.waterfall ?? [])
+      .filter(w => w.type !== 'total' && Math.abs(w.value) >= 1)
+      .map(w => ({ label: WATERFALL_LABELS[w.label] ?? w.label, value: w.value }));
+    return {
+      causes, net: wf.current_nw, fromZero: true, startNW: 0, endNW: wf.current_nw,
+      startMonth: null, endMonth: end.month, firstMonth: ts[0].month, market: wf.market_returns,
+      points: ts, startContrib: 0,
+    };
   }
+  const base = ts[baseIdx];
+  const d = (pick: (m: AttributionMonth) => number) => pick(end) - pick(base);
+  const market = d(m => m.market_return);
+  const causes: Cause[] = [
+    { label: 'Contributions', value: d(m => m.contributions) },
+    { label: 'Market returns', value: market },
+    { label: 'Dividends', value: d(m => m.dividends) },
+    { label: 'Interest', value: d(m => m.interest) },
+    { label: 'Property and vehicles', value: d(m => m.assets ?? 0) },
+    { label: 'Purchase costs and loan interest', value: d(m => m.property_costs ?? 0) },
+  ].filter(c => Math.abs(c.value) >= 1);
+  return {
+    causes, net: end.total - base.total, fromZero: false, startNW: base.total, endNW: end.total,
+    startMonth: base.month, endMonth: end.month, firstMonth: ts[0].month, market,
+    points: ts.slice(baseIdx), startContrib: base.contributions,
+  };
 }
 
-export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
-  const tc = useThemeColors();
+/* ─────────────────────────────────── Page ─────────────────────────────────── */
+
+export default function NetWorth() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [allSnapshots, setAllSnapshots] = useState<NetWorthSnapshot[]>([]);
   const [loading, setLoading] = useState(true);
-  const [period, setPeriod] = useState<Period>('1M');
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [period, setPeriod] = useState<Period>('1Y');
   const [goals, setGoals] = useState<GoalProgress[]>([]);
-  const [projData, setProjData] = useState<ProjectionData | null>(null);
-  const [projContrib, setProjContrib] = useState<string>('');
-  const [projReturn, setProjReturn] = useState<string>('');
-  const [projHorizon, setProjHorizon] = useState<string>(() => localStorage.getItem('proj_horizon') || '30');
-  const [projContribGrowth, setProjContribGrowth] = useState<string>(() => localStorage.getItem('proj_contrib_growth') || '0');
-  const [savedScenarios, setSavedScenarios] = useState<{ name: string; contribution: number; return_pct: number; projection: { date: string; value: number }[] }[]>(() => {
-    try { return JSON.parse(localStorage.getItem('proj_scenarios') || '[]'); } catch { return []; }
-  });
-  const [activeScenarios, setActiveScenarios] = useState<Set<number>>(() => new Set());
-  const [showAllMilestones, setShowAllMilestones] = useState(false);
-  const [nextActions, setNextActions] = useState<{ title: string; detail: string; impact_eur: number; urgency: string; category: string; link: string }[]>([]);
+  const [holdings, setHoldings] = useState<HoldingRow[]>([]);
+  const [nextActions, setNextActions] = useState<NextAction[]>([]);
+  const [actionsStatus, setActionsStatus] = useState<LoadStatus>('loading');
   const [unreadAlerts, setUnreadAlerts] = useState(0);
   const [jobErrors, setJobErrors] = useState(0);
   const [attribution, setAttribution] = useState('');
-  // total_change from /api/portfolio/attribution — market-only price-delta on
-  // held shares. Reconciles vs dailyChange (which is total ΔNW including cash
-  // moves) so we can surface the gap when they diverge.
+  // total_change from /api/portfolio/attribution — market-only price delta on held
+  // shares. Shown next to today's change so the gap (cash flows) is named.
   const [attributionTotal, setAttributionTotal] = useState<number | null>(null);
   const [showAttribution, setShowAttribution] = useState(false);
-  const [searchParams] = useSearchParams();
-  // Deep links into the Assets tab (?asset=…, ?loan=…) open it directly.
-  const [activeTab, setActiveTab] = useState<NWTab>(
-    defaultTab || (ASSET_VIEW_PARAMS.some(k => searchParams.has(k)) ? 'assets' : 'overview'),
-  );
-  const [wfData, setWfData] = useState<{ waterfall: { label: string; value: number; type: string }[]; time_series: { month: string; contributions: number; market_return: number; dividends: number; interest: number; assets?: number; property_costs?: number; total: number }[]; crossover_month: string; net_contributions: number; market_returns: number; dividends: number; current_nw: number } | null>(null);
-  const [intradayPoints, setIntradayPoints] = useState<{ recorded_at: string; total: number; cash_component: number; investment_component: number; physical_component: number; debt_component: number }[]>([]);
+  const [wfData, setWfData] = useState<WaterfallData | null>(null);
+  const [wfStatus, setWfStatus] = useState<LoadStatus>('loading');
 
-  const [holdings, setHoldings] = useState<HoldingRow[]>([]);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  // Tab state lives in the URL. Deep links into the Assets tab (?asset=…, ?loan=…) open it directly.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [tabParam] = useTabParam<NWTab>(NW_TAB_IDS, 'overview');
+  const activeTab: NWTab = searchParams.has('tab')
+    ? tabParam
+    : ASSET_VIEW_PARAMS.some(k => searchParams.has(k)) ? 'assets' : 'overview';
+  const setActiveTab = useCallback((tab: NWTab) => {
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev);
+      ASSET_VIEW_PARAMS.forEach(k => next.delete(k));
+      if (tab === 'overview') next.delete('tab'); else next.set('tab', tab);
+      return next;
+    }, { replace: true });
+  }, [setSearchParams]);
+
   const loadData = useCallback(async () => {
     try {
       setLoadError(null);
@@ -108,11 +223,9 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
       ]);
       setAccounts(accRes.accounts || []);
       setAllSnapshots(nwRes.snapshots || []);
-      // Holdings drive the holdings-aware asset-allocation donut; failure is
-      // non-fatal — donut just falls back to "no holdings" state.
+      // Holdings drive the allocation and concentration sections; a failure is
+      // non-fatal — those sections say so instead of disappearing.
       api.listHoldings().then(r => setHoldings(r.holdings || [])).catch(() => {});
-      // Also fetch intraday data for 1D view
-      api.getNetWorthIntraday().then(r => setIntradayPoints(r.points || [])).catch(() => {});
     } catch (e) {
       console.error('Failed to load data:', e);
       setLoadError(e instanceof Error ? e.message : 'Failed to load data');
@@ -121,7 +234,23 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
     }
   }, []);
 
-  // Track previous net worth for tick animation
+  const loadWaterfall = useCallback(() => {
+    setWfStatus('loading');
+    fetch('/api/portfolio/wealth-waterfall')
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((d: WaterfallData) => { setWfData(d); setWfStatus('ready'); })
+      .catch(() => setWfStatus('error'));
+  }, []);
+
+  const loadActions = useCallback(() => {
+    setActionsStatus('loading');
+    fetch('/api/portfolio/next-actions')
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then(d => { setNextActions(d.actions || []); setActionsStatus('ready'); })
+      .catch(() => setActionsStatus('error'));
+  }, []);
+
+  // Track previous net worth for the tick animation
   const prevNetWorth = useRef<number | null>(null);
   const [tick, setTick] = useState<'up' | 'down' | null>(null);
 
@@ -133,9 +262,10 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
   // Tick animation: flash sage/claret when net worth changes
   useEffect(() => {
     if (allSnapshots.length === 0) return;
-    const current = allSnapshots[allSnapshots.length - 1]?.total ?? 0;
+    const current = allSnapshots[0]?.total ?? 0;
     if (prevNetWorth.current !== null && current !== prevNetWorth.current) {
       setTick(current > prevNetWorth.current ? 'up' : 'down');
+      prevNetWorth.current = current;
       const timer = setTimeout(() => setTick(null), 1200);
       return () => clearTimeout(timer);
     }
@@ -144,36 +274,1116 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
 
   useEffect(() => {
     api.getGoalsProgress().then(r => setGoals(r.goals || [])).catch(() => {});
-    fetch('/api/portfolio/next-actions').then(r => r.json()).then(d => setNextActions(d.actions || [])).catch(() => {});
     api.listNotifications().then(r => setUnreadAlerts(r.unread_count)).catch(() => {});
     api.getAttribution().then(r => { setAttribution(r.summary); setAttributionTotal(r.total_change ?? null); }).catch(() => {});
-    fetch('/api/portfolio/wealth-waterfall').then(r => r.json()).then(setWfData).catch(() => {});
-    fetch('/api/settings/scheduler-status').then(r => r.json()).then(d => {
-      setJobErrors((d.jobs || []).filter((j: { status: string }) => j.status === 'error').length);
-    }).catch(() => {});
+    fetch('/api/settings/scheduler-status')
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then(d => setJobErrors((d.jobs || []).filter((j: { status: string }) => j.status === 'error').length))
+      .catch(() => {});
+    loadWaterfall();
+    loadActions();
+  }, [loadWaterfall, loadActions]);
+
+  const totalNetWorth = allSnapshots.length > 0 ? allSnapshots[0].total : 0;
+
+  // The hero follows the Overview period. Tabs without a period control show a fixed year.
+  const heroPeriod: Period = activeTab === 'overview' ? period : '1Y';
+  const periodSnapshots = useMemo(() => {
+    const cutoff = periodCutoff(heroPeriod);
+    return cutoff ? allSnapshots.filter(s => new Date(s.date) >= cutoff) : allSnapshots;
+  }, [allSnapshots, heroPeriod]);
+  const periodStart = periodSnapshots.length > 1 ? periodSnapshots[periodSnapshots.length - 1].total : totalNetWorth;
+  const change = totalNetWorth - periodStart;
+  const changePct = periodStart !== 0 ? (change / periodStart) * 100 : 0;
+
+  // Daily change: against the most recent snapshot from a previous day
+  const { dailyChange, dailyPrev, dailyChangePct } = useMemo(() => {
+    if (allSnapshots.length < 2) return { dailyChange: 0, dailyPrev: totalNetWorth, dailyChangePct: 0 };
+    const todayStr = allSnapshots[0].date.slice(0, 10);
+    const prev = allSnapshots.find(s => s.date.slice(0, 10) !== todayStr);
+    if (!prev) return { dailyChange: 0, dailyPrev: totalNetWorth, dailyChangePct: 0 };
+    const dc = totalNetWorth - prev.total;
+    const dp = prev.total;
+    return { dailyChange: dc, dailyPrev: dp, dailyChangePct: dp !== 0 ? (dc / dp) * 100 : 0 };
+  }, [allSnapshots, totalNetWorth]);
+
+  // Sparkline: weekday snapshots of the hero period, oldest first
+  const sparkSnapshots = useMemo(() => {
+    const isWeekday = (d: string) => { const day = new Date(d).getDay(); return day !== 0 && day !== 6; };
+    return periodSnapshots.filter(s => isWeekday(s.date)).reverse();
+  }, [periodSnapshots]);
+
+  if (loading) {
+    return (
+      <div>
+        <PageHeader title="Net Worth" />
+        <LoadingState message="Loading net worth" lines={6} />
+      </div>
+    );
+  }
+
+  // A backend failure is distinct from "no data yet" — don't show the welcome
+  // state when the server is just unreachable.
+  if (loadError && allSnapshots.length === 0 && accounts.length === 0) {
+    return (
+      <div>
+        <PageHeader title="Net Worth" />
+        <div className="mt-6">
+          <ErrorState message="Your data couldn’t be loaded." details={loadError} onRetry={loadData} />
+        </div>
+      </div>
+    );
+  }
+
+  // Empty state: nothing imported yet (or accounts exist but no snapshots)
+  if (allSnapshots.length === 0) {
+    const hasAccounts = accounts.length > 0;
+    return (
+      <div>
+        <PageHeader title="Net Worth" />
+        <div className="mt-6">
+          <EmptyState
+            title={hasAccounts ? 'Import your data' : 'Welcome to Wealth'}
+            message={hasAccounts
+              ? 'Your accounts are set up. Import a CSV file in Settings to start tracking your net worth.'
+              : 'Get started by creating an account and importing your first CSV file in Settings.'}
+            action={{ label: 'Go to Settings', href: '/settings' }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const snapshotDate = new Date(allSnapshots[0].date);
+  const daysOld = Math.max(0, Math.floor((Date.now() - snapshotDate.getTime()) / (1000 * 60 * 60 * 24)));
+  const market = attributionTotal ?? 0;
+  const otherToday = dailyChange - market;
+  const showTodayGap = attributionTotal !== null && Math.abs(otherToday) >= 1;
+
+  return (
+    <div>
+      <PageHeader
+        title="Net Worth"
+        meta={
+          <span className="inline-flex flex-wrap items-center justify-end gap-2">
+            As of {fmtDateLong(snapshotDate)}
+            {daysOld >= 2 && (
+              <Chip tone={daysOld < 10 ? 'warning' : 'danger'}>{daysOld < 10 ? `${daysOld} days old` : `Stale, ${daysOld} days old`}</Chip>
+            )}
+          </span>
+        }
+      />
+
+      {/* Hero: the total, how it changed, and a small labelled trend */}
+      <div className="mt-3 md:mt-4 flex flex-wrap items-end justify-between gap-x-10 gap-y-5">
+        <div className="min-w-0">
+          <p className="label-caps">Total Net Worth</p>
+          <p
+            className={`font-serif text-[36px] md:text-[48px] font-normal tracking-tight leading-none mt-2 transition-colors duration-[250ms] ease-out ${tick === 'up' ? 'text-sage' : tick === 'down' ? 'text-claret' : 'text-ink'}`}
+            style={{ fontVariantNumeric: 'lining-nums tabular-nums' }}
+            data-privacy="blur"
+          >
+            {fmtEUR(totalNetWorth)}
+          </p>
+
+          {/* Period change — only where a period control is on screen */}
+          {activeTab === 'overview' && periodSnapshots.length > 1 && (
+            <p className={`text-[14px] mt-2.5 ${toneCls(change)}`}>
+              {change !== 0 && <span aria-hidden="true" className="mr-1">{change > 0 ? '▲' : '▼'}</span>}
+              <span data-privacy="blur">{fmtEUR(change, { sign: true })}</span>
+              {periodStart >= 100 && <> ({fmtPct(changePct, { sign: true })})</>}
+              {' '}<span>{PERIOD_PHRASE[period]}</span>
+            </p>
+          )}
+
+          {/* Today's change, with the optional explanation */}
+          {allSnapshots.length > 1 && (
+            <p className={`flex flex-wrap items-center gap-x-1.5 text-[13px] text-ink-muted ${activeTab === 'overview' ? 'mt-0.5' : 'mt-2.5'}`}>
+              <span className={toneCls(dailyChange)}>
+                {dailyChange !== 0 && <span aria-hidden="true" className="mr-1">{dailyChange > 0 ? '▲' : '▼'}</span>}
+                <span data-privacy="blur">{fmtEUR(dailyChange, { sign: true })}</span>
+                {dailyPrev >= 100 && <> ({fmtPct(dailyChangePct, { sign: true, digits: 2 })})</>}
+              </span>
+              <span>today</span>
+              {attribution && (
+                <button
+                  type="button"
+                  onClick={() => setShowAttribution(prev => !prev)}
+                  aria-expanded={showAttribution}
+                  className="inline-flex items-center min-h-[44px] md:min-h-[32px] px-1.5 text-[13px] font-medium text-forest hover:underline"
+                >
+                  {showAttribution ? 'Hide' : 'Why?'}
+                </button>
+              )}
+            </p>
+          )}
+          {showAttribution && attribution && (
+            <div className="mt-1 max-w-xl space-y-0.5 text-[13px] text-ink-muted">
+              <p>{attribution}</p>
+              {showTodayGap && (
+                <p>
+                  Market <span data-privacy="blur">{fmtEUR(market, { sign: true })}</span>
+                  {' · '}
+                  Cash flow today <span data-privacy="blur">{fmtEUR(otherToday, { sign: true })}</span>
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+
+        {sparkSnapshots.length > 1 && (
+          <SectionBoundary>
+            <HeroSparkline snapshots={sparkSnapshots} period={heroPeriod} />
+          </SectionBoundary>
+        )}
+      </div>
+
+      <div className="mt-6">
+        <TabBar tabs={NW_TABS} activeTab={activeTab} onTabChange={setActiveTab} ariaLabel="Net worth views" />
+      </div>
+
+      <TabPanel id={activeTab}>
+        <SectionBoundary key={activeTab}>
+          {activeTab === 'overview' && (
+            <OverviewTab
+              period={period}
+              onPeriodChange={setPeriod}
+              accounts={accounts}
+              holdings={holdings}
+              goals={goals}
+              snapshot={allSnapshots[0]}
+              wfData={wfData}
+              wfStatus={wfStatus}
+              onRetryWaterfall={loadWaterfall}
+              nextActions={nextActions}
+              actionsStatus={actionsStatus}
+              onRetryActions={loadActions}
+              unreadAlerts={unreadAlerts}
+              jobErrors={jobErrors}
+            />
+          )}
+          {activeTab === 'projection' && <ProjectionTab />}
+          {activeTab === 'accounts' && <AccountsTab accounts={accounts} allSnapshots={allSnapshots} />}
+          {activeTab === 'assets' && <AssetsTab onNetWorthChanged={loadData} snapshotNetWorth={totalNetWorth} />}
+        </SectionBoundary>
+      </TabPanel>
+    </div>
+  );
+}
+
+/* ─────────────────────────────── Hero sparkline ─────────────────────────────── */
+
+function HeroSparkline({ snapshots, period }: { snapshots: NetWorthSnapshot[]; period: Period }) {
+  const tc = useThemeColors();
+  const values = snapshots.map(s => s.total);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const flat = max - min < 1;
+  // The scale is printed next to the line, so a small move reads as small.
+  let minLabel = fmtAxis(min);
+  let maxLabel = fmtAxis(max);
+  if (minLabel === maxLabel) { minLabel = fmtEUR(min); maxLabel = fmtEUR(max); }
+  const first = snapshots[0];
+  const last = snapshots[snapshots.length - 1];
+  return (
+    <div className="w-full md:w-[340px] shrink-0">
+      <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2.5">
+        <div className="flex flex-col justify-between py-0.5 text-right text-[11px] leading-4 text-ink-muted" data-privacy="blur">
+          <span>{maxLabel}</span>
+          {!flat && <span>{minLabel}</span>}
+        </div>
+        <div role="img" aria-label={`Net worth from ${fmtDateLong(first.date)} to ${fmtDateLong(last.date)}, between ${minLabel} and ${maxLabel}`}>
+          <EChartWrapper
+            height="64px"
+            option={{
+              tooltip: {
+                trigger: 'axis' as const,
+                formatter: (params: unknown) => {
+                  const p = params as { dataIndex: number }[];
+                  if (!Array.isArray(p) || p.length === 0) return '';
+                  const snap = snapshots[p[0].dataIndex];
+                  return `${escapeHtml(fmtDateLong(snap.date))}<br/><strong>${fmtEUR(snap.total)}</strong>`;
+                },
+              },
+              grid: { left: 0, right: 6, top: 8, bottom: 8 },
+              xAxis: { type: 'category' as const, show: false, boundaryGap: false, data: snapshots.map(s => s.date) },
+              yAxis: {
+                type: 'value' as const,
+                min: flat ? min - 1 : min,
+                max: flat ? max + 1 : max,
+                interval: flat ? 2 : max - min,
+                axisLabel: { show: false },
+                splitLine: { lineStyle: { type: 'solid' as const } },
+              },
+              series: [{
+                type: 'line' as const,
+                data: values.map((v, i) => (i === values.length - 1 ? { value: v, symbol: 'circle', symbolSize: 6 } : { value: v, symbol: 'none' })),
+                showSymbol: true,
+                color: tc.forest,
+                lineStyle: { width: 1.5 },
+              }],
+            }}
+          />
+        </div>
+        <span />
+        <div className="flex justify-between mt-0.5 text-[11px] leading-4 text-ink-muted">
+          <span>{formatDateForPeriod(first.date, period)}</span>
+          <span>{formatDateForPeriod(last.date, period)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ──────────────────────────────── Overview tab ──────────────────────────────── */
+
+interface OverviewProps {
+  period: Period;
+  onPeriodChange: (p: Period) => void;
+  accounts: Account[];
+  holdings: HoldingRow[];
+  goals: GoalProgress[];
+  snapshot: NetWorthSnapshot;
+  wfData: WaterfallData | null;
+  wfStatus: LoadStatus;
+  onRetryWaterfall: () => void;
+  nextActions: NextAction[];
+  actionsStatus: LoadStatus;
+  onRetryActions: () => void;
+  unreadAlerts: number;
+  jobErrors: number;
+}
+
+function OverviewTab({
+  period, onPeriodChange, accounts, holdings, goals, snapshot, wfData, wfStatus, onRetryWaterfall,
+  nextActions, actionsStatus, onRetryActions, unreadAlerts, jobErrors,
+}: OverviewProps) {
+  const totalNetWorth = snapshot.total;
+  // Property and vehicles at their modelled value, and the loans on them (both part of the snapshot total)
+  const physicalValue = snapshot.physical_component ?? 0;
+  const physicalDebt = snapshot.debt_component ?? 0;
+  const grossAssets = totalNetWorth + physicalDebt;
+
+  // Liquid wealth: every account except property, pension and liability accounts.
+  const illiquidTypes = new Set(['real_estate', 'pension', 'liability']);
+  const liquidAccounts = accounts.filter(a => !illiquidTypes.has(a.type));
+  const liquidNetWorth = liquidAccounts.reduce((sum, a) => sum + (a.balance ?? 0), 0);
+  const onlySecuritiesAndCash = liquidAccounts.every(a => ['brokerage', 'checking', 'savings'].includes(a.type));
+  const illiquidAccounts = accounts.filter(a => illiquidTypes.has(a.type));
+  const illiquidBalance = illiquidAccounts.reduce((sum, a) => sum + (a.balance ?? 0), 0);
+
+  const attr = useMemo(() => computeAttribution(wfData, period), [wfData, period]);
+
+  return (
+    <>
+      {/* One period control for the whole tab */}
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <p className="text-[13px] text-ink-muted">The period applies to the change above and to every chart on this tab.</p>
+        <PeriodSelector value={period} onChange={onPeriodChange} periods={PERIODS} />
+      </div>
+
+      <MetricGrid className="mt-5">
+        <MetricCard label="Liquid wealth" value={fmtEUR(liquidNetWorth)} sublabel={onlySecuritiesAndCash ? 'Securities and cash' : 'Securities, cash and other liquid accounts'} />
+        {physicalValue > 0 && (
+          <MetricCard label="Property and vehicles" value={fmtEUR(physicalValue)} sublabel="At current valuation" />
+        )}
+        {physicalDebt > 0 && (
+          <MetricCard label="Loans" value={fmtEUR(-physicalDebt)}
+            sublabel={grossAssets > 0 ? `${fmtPct((physicalDebt / grossAssets) * 100)} of gross assets` : 'On property and vehicles'} />
+        )}
+        {illiquidAccounts.length > 0 && Math.abs(illiquidBalance) >= 1 && (
+          <MetricCard label="Illiquid accounts" value={fmtEUR(illiquidBalance)} sublabel="Pension, property and liability accounts" />
+        )}
+        <MetricCard
+          label="Market return"
+          value={attr ? fmtEUR(attr.market, { sign: true }) : '—'}
+          tone={attr ? (attr.market > 0 ? 'positive' : attr.market < 0 ? 'negative' : 'neutral') : 'neutral'}
+          money={!!attr}
+          sublabel={attr
+            ? `Securities only, ${attr.fromZero ? 'since tracking began' : `since ${fmtMonthShort(monthDate(attr.startMonth as string))}`}`
+            : wfStatus === 'loading' ? 'Loading…' : 'Not available'}
+        />
+      </MetricGrid>
+
+      <SectionBoundary>
+        <RecommendedActions
+          actions={nextActions}
+          status={actionsStatus}
+          onRetry={onRetryActions}
+          unreadAlerts={unreadAlerts}
+          jobErrors={jobErrors}
+        />
+      </SectionBoundary>
+
+      <SectionBoundary>
+        <UnvestedPanel mode="summary" />
+      </SectionBoundary>
+
+      <SectionBoundary>
+        <AttributionSection attr={attr} status={wfStatus} onRetry={onRetryWaterfall} period={period} />
+      </SectionBoundary>
+
+      <SectionBoundary>
+        <GrowthSection attr={attr} status={wfStatus} onRetry={onRetryWaterfall} crossoverMonth={wfData?.crossover_month || ''} />
+      </SectionBoundary>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 lg:gap-x-10">
+        <SectionBoundary>
+          <AllocationSection accounts={accounts} holdings={holdings} physicalValue={physicalValue} />
+        </SectionBoundary>
+        <SectionBoundary>
+          <CounterpartySection accounts={accounts} />
+        </SectionBoundary>
+      </div>
+
+      <SectionBoundary>
+        <ConcentrationSection holdings={holdings} totalNetWorth={totalNetWorth} />
+      </SectionBoundary>
+
+      {goals.length > 0 && (
+        <SectionBoundary>
+          <GoalsSections goals={goals} accounts={accounts} />
+        </SectionBoundary>
+      )}
+    </>
+  );
+}
+
+/* ───────────────────────────── Recommended actions ───────────────────────────── */
+
+function actionLabel(link: string): string {
+  if (link.startsWith('/analysis')) return 'Open analysis';
+  if (link.startsWith('/portfolio')) return 'Review holdings';
+  if (link.startsWith('/tax')) return 'Open tax tools';
+  if (link.startsWith('/planning')) return 'Open planning';
+  if (link.startsWith('/settings')) return 'Open settings';
+  return 'Open';
+}
+
+function RecommendedActions({ actions, status, onRetry, unreadAlerts, jobErrors }: {
+  actions: NextAction[]; status: LoadStatus; onRetry: () => void; unreadAlerts: number; jobErrors: number;
+}) {
+  const shown = actions.slice(0, 3);
+  return (
+    <Section
+      title="Recommended Actions"
+      actions={(unreadAlerts > 0 || jobErrors > 0) ? (
+        <>
+          {jobErrors > 0 && (
+            <Link to="/settings?tab=data" className="apple-btn-secondary apple-btn-sm min-h-[44px] md:min-h-[36px] border-claret text-claret">
+              {jobErrors} failed background job{jobErrors !== 1 ? 's' : ''}
+            </Link>
+          )}
+          {unreadAlerts > 0 && (
+            <Link to={ALERTS_HREF} className="apple-btn-secondary apple-btn-sm min-h-[44px] md:min-h-[36px]">
+              View all {unreadAlerts} alert{unreadAlerts !== 1 ? 's' : ''}
+            </Link>
+          )}
+        </>
+      ) : undefined}
+    >
+      {status === 'loading' && <LoadingState message="Loading recommendations" lines={2} />}
+      {status === 'error' && <ErrorState message="Recommendations couldn’t be loaded." onRetry={onRetry} />}
+      {status === 'ready' && shown.length === 0 && (
+        <p className="text-[14px] text-ink-body">Nothing needs your attention right now.</p>
+      )}
+      {status === 'ready' && shown.length > 0 && (
+        <ul className="flex flex-col gap-2.5">
+          {shown.map((a, i) => {
+            const label = actionLabel(a.link);
+            const internal = a.link.startsWith('/');
+            const btn = 'apple-btn-secondary apple-btn-sm min-h-[44px] md:min-h-[36px] shrink-0';
+            return (
+              <li key={i} className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-apple border border-divider bg-inset px-4 py-3">
+                <Chip tone={a.urgency === 'now' ? 'danger' : a.urgency === 'this-month' ? 'warning' : 'info'} className="shrink-0">
+                  {a.urgency === 'now' ? 'Act now' : a.urgency === 'this-month' ? 'This month' : 'This quarter'}
+                </Chip>
+                <div className="flex-1 basis-60 min-w-0">
+                  <p className="text-[14px] font-medium text-ink break-words">{a.title}</p>
+                  {a.detail && <p className="text-[13px] text-ink-muted break-words">{a.detail}</p>}
+                  {a.impact_eur > 0 && (
+                    <p className="text-[13px] text-sage">Worth about <span data-privacy="blur">{fmtEUR(a.impact_eur, { sign: true })}</span></p>
+                  )}
+                </div>
+                {internal
+                  ? <Link to={a.link} className={btn} aria-label={`${label}: ${a.title}`}>{label}</Link>
+                  : <a href={a.link} className={btn} aria-label={`${label}: ${a.title}`}>{label}</a>}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {status === 'ready' && actions.length > 3 && (
+        <Link to="/analysis" className="inline-flex items-center min-h-[44px] md:min-h-[32px] mt-2 text-[13px] font-medium text-forest hover:underline">
+          View all {actions.length} recommendations
+        </Link>
+      )}
+    </Section>
+  );
+}
+
+/* ───────────────────────────── Wealth attribution ───────────────────────────── */
+
+function AttributionSection({ attr, status, onRetry, period }: { attr: PeriodAttribution | null; status: LoadStatus; onRetry: () => void; period: Period }) {
+  const tc = useThemeColors();
+  const narrow = useIsNarrow();
+
+  let subtitle: ReactNode;
+  if (attr && attr.fromZero) {
+    subtitle = (
+      <>
+        What built today’s net worth of <span data-privacy="blur">{fmtEUR(attr.endNW)}</span> since tracking began in {fmtMonth(monthDate(attr.firstMonth))}.
+        {period !== 'All' && ' The history is shorter than the selected period.'} Each bar is one cause, drawn from zero.
+      </>
+    );
+  } else if (attr) {
+    subtitle = (
+      <>
+        Net worth {attr.net >= 0 ? 'rose' : 'fell'} from <span data-privacy="blur">{fmtEUR(attr.startNW)}</span> to <span data-privacy="blur">{fmtEUR(attr.endNW)}</span> between
+        the end of {fmtMonth(monthDate(attr.startMonth as string))} and {fmtMonth(monthDate(attr.endMonth))}. Each bar is one cause, drawn from zero.
+        Causes are tracked per month, so the start is the month end closest to the selected period; fees and taxes are part of market returns here.
+      </>
+    );
+  }
+
+  let body: ReactNode;
+  if (status === 'loading') body = <LoadingState message="Loading attribution" />;
+  else if (status === 'error') body = <ErrorState message="The attribution couldn’t be loaded." onRetry={onRetry} />;
+  else if (!attr || attr.causes.length === 0) {
+    body = <p className="text-[14px] text-ink-body">{attr ? 'Net worth did not change in this period.' : 'There is no attribution history yet. It appears after the first monthly snapshot.'}</p>;
+  } else {
+    const netLabel = attr.fromZero ? 'Net worth' : 'Net change';
+    const cats = [...attr.causes.map(c => c.label), '', netLabel];
+    const vals: (number | null)[] = [...attr.causes.map(c => c.value), null, attr.net];
+    const fmtBar = (v: number, isNet: boolean) => fmtEUR(v, { sign: !(isNet && attr.fromZero) });
+    const data = vals.map((v, i) => {
+      if (v === null) return { value: '-' as const };
+      const isNet = i === vals.length - 1;
+      return {
+        value: v,
+        itemStyle: { color: isNet ? tc.slate : v >= 0 ? tc.forest : tc.claret },
+        label: {
+          show: true,
+          position: narrow ? (v >= 0 ? 'right' as const : 'left' as const) : (v >= 0 ? 'top' as const : 'bottom' as const),
+          formatter: () => fmtBar(v, isNet),
+          color: tc.ink,
+          fontSize: 12,
+          fontWeight: isNet ? 600 : 400,
+        },
+      };
+    });
+    const nums = vals.filter((v): v is number => v !== null);
+    const lo = Math.min(0, ...nums);
+    const hi = Math.max(0, ...nums);
+    const span = hi - lo || 1;
+    const categoryAxis = {
+      type: 'category' as const,
+      data: cats,
+      inverse: narrow,
+      axisLabel: { interval: 0, hideOverlap: false, width: narrow ? 104 : 110, overflow: 'break' as const, color: tc.inkBody, fontSize: 12, lineHeight: 15 },
+      axisLine: { show: true, lineStyle: { color: tc.divider } },
+    };
+    const valueAxis = {
+      type: 'value' as const,
+      // Headroom so value labels are never clipped.
+      min: lo < 0 ? lo - span * (narrow ? 0.4 : 0.12) : 0,
+      max: hi + span * (narrow ? 0.4 : 0.12),
+      axisLabel: { showMinLabel: false, showMaxLabel: false, formatter: (v: number) => (v > 0 ? '+' : '') + fmtAxis(v) },
+      splitNumber: narrow ? 3 : 5,
+    };
+    const sepIndex = attr.causes.length;
+    body = (
+      <div role="img" aria-label={`${cats.filter(Boolean).map((c, i) => `${c} ${fmtBar(nums[i], i === nums.length - 1)}`).join(', ')}`}>
+        <EChartWrapper
+          height={narrow ? `${cats.length * 46 + 30}px` : '320px'}
+          option={{
+            tooltip: {
+              trigger: 'axis' as const,
+              axisPointer: { type: 'shadow' as const },
+              formatter: (params: unknown) => {
+                const ps = params as { name: string; dataIndex: number }[];
+                if (!Array.isArray(ps) || ps.length === 0) return '';
+                const v = vals[ps[0].dataIndex];
+                if (v === null || v === undefined) return '';
+                return `${escapeHtml(ps[0].name)}<br/><strong>${fmtBar(v, ps[0].dataIndex === vals.length - 1)}</strong>`;
+              },
+            },
+            grid: { top: narrow ? 4 : 20, right: 8, bottom: 4, left: 4, containLabel: true },
+            xAxis: narrow ? valueAxis : categoryAxis,
+            yAxis: narrow ? categoryAxis : valueAxis,
+            series: [{
+              type: 'bar' as const,
+              barWidth: narrow ? 18 : '56%',
+              data,
+              // Dotted rule: causes on one side, their sum on the other.
+              markLine: {
+                silent: true,
+                symbol: 'none',
+                label: { show: false },
+                lineStyle: { color: tc.inkMuted, type: 'dashed' as const, width: 1 },
+                data: [narrow ? { yAxis: sepIndex } : { xAxis: sepIndex }],
+              },
+            }],
+          }}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <Section title="Wealth Attribution" subtitle={subtitle}>
+      {body}
+    </Section>
+  );
+}
+
+/* ────────────────────────────── Growth over time ────────────────────────────── */
+
+function GrowthSection({ attr, status, onRetry, crossoverMonth }: { attr: PeriodAttribution | null; status: LoadStatus; onRetry: () => void; crossoverMonth: string }) {
+  const tc = useThemeColors();
+  const points = attr?.points ?? [];
+  const baseLabel = attr?.fromZero ? 'Contributions' : 'Start value plus contributions';
+  const baseline = points.map(p => (attr ? attr.startNW + (p.contributions - attr.startContrib) : 0));
+  const lastNW = points.length ? points[points.length - 1].total : 0;
+  const lastBase = baseline.length ? baseline[baseline.length - 1] : 0;
+  const ready = status === 'ready' && points.length > 1;
+
+  return (
+    <Section
+      title="Growth Over Time"
+      subtitle={ready ? 'Net worth at each month end against what was paid in. The gap between the lines is what markets and revaluation added or took away.' : undefined}
+      actions={ready ? (
+        <ChartLegend items={[
+          { label: 'Net worth', color: tc.forest, style: 'solid' },
+          { label: baseLabel, color: tc.gold, style: 'dashed' },
+        ]} />
+      ) : undefined}
+    >
+      {status === 'loading' && <LoadingState message="Loading growth chart" />}
+      {status === 'error' && <ErrorState message="The growth chart couldn’t be loaded." onRetry={onRetry} />}
+      {status === 'ready' && points.length <= 1 && (
+        <p className="text-[14px] text-ink-body">Growth is tracked per month. The chart appears once there are two month ends to compare.</p>
+      )}
+      {ready && (
+        <>
+          <EChartWrapper
+            height="300px"
+            option={{
+              tooltip: {
+                trigger: 'axis' as const,
+                formatter: (params: unknown) => {
+                  const ps = params as { dataIndex: number }[];
+                  if (!Array.isArray(ps) || ps.length === 0) return '';
+                  const i = ps[0].dataIndex;
+                  const p = points[i];
+                  return `${escapeHtml(fmtMonth(monthDate(p.month)))}<br/>Net worth: <strong>${fmtEUR(p.total)}</strong><br/>${escapeHtml(baseLabel)}: <strong>${fmtEUR(baseline[i])}</strong><br/>Difference: <strong>${fmtEUR(p.total - baseline[i], { sign: true })}</strong>`;
+                },
+              },
+              grid: { top: 12, right: 30, bottom: 4, left: 4, containLabel: true },
+              xAxis: { type: 'category' as const, boundaryGap: false, data: points.map(p => fmtMonthShort(monthDate(p.month))) },
+              yAxis: { type: 'value' as const, scale: true, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
+              series: [
+                { name: 'Net worth', type: 'line' as const, color: tc.forest, data: points.map(p => p.total), showSymbol: points.length <= 3, symbolSize: 6, lineStyle: { width: 2 } },
+                { name: baseLabel, type: 'line' as const, color: tc.gold, data: baseline, showSymbol: points.length <= 3, symbolSize: 6, lineStyle: { width: 2, type: 'dashed' as const } },
+              ],
+            }}
+          />
+          <p className="text-[13px] text-ink-muted mt-2">
+            Latest month: net worth <span data-privacy="blur">{fmtEUR(lastNW)}</span>, {baseLabel.toLowerCase()} <span data-privacy="blur">{fmtEUR(lastBase)}</span>,
+            a difference of <span className={toneCls(lastNW - lastBase)} data-privacy="blur">{fmtEUR(lastNW - lastBase, { sign: true })}</span>.
+            {crossoverMonth && <> Cumulative returns first exceeded contributions in {fmtMonth(monthDate(crossoverMonth))}.</>}
+          </p>
+        </>
+      )}
+    </Section>
+  );
+}
+
+/* ─────────────────────────────── Asset allocation ─────────────────────────────── */
+
+function AllocationSection({ accounts, holdings, physicalValue }: { accounts: Account[]; holdings: HoldingRow[]; physicalValue: number }) {
+  // Holdings-aware bins: brokerage cash is split from securities, securities are
+  // binned by asset class, other accounts by account type.
+  const classLabelByType: Record<string, string> = {
+    checking: 'Cash', savings: 'Cash',
+    real_estate: 'Real estate', pension: 'Pension', precious_metals: 'Gold',
+    liability: 'Liabilities', credit: 'Credit',
+  };
+  const assetClassLabels: Record<string, string> = {
+    etf: 'Equities', stock: 'Equities', fund: 'Equities',
+    bond: 'Bonds', commodity: 'Commodities',
+    crypto: 'Crypto', derivative: 'Derivatives',
+  };
+  const byClass: Record<string, number> = {};
+  const add = (label: string, value: number) => {
+    if (value === 0) return;
+    byClass[label] = (byClass[label] || 0) + value;
+  };
+  for (const acc of accounts) {
+    if (acc.type === 'brokerage') {
+      add('Cash', acc.cash_balance ?? 0);
+      continue;
+    }
+    add(classLabelByType[acc.type] || 'Other', acc.balance ?? 0);
+  }
+  // value_eur falls back to cost basis for unpriced positions, matching account balances.
+  for (const h of holdings) {
+    add(assetClassLabels[h.asset_class] || 'Other', h.value_eur ?? h.market_value ?? 0);
+  }
+  // Property and vehicles at full value; their loans are shown under Loans, not netted here.
+  add('Real assets', physicalValue);
+
+  const positive = Object.entries(byClass).filter(([, v]) => v > 0).sort(([, a], [, b]) => b - a);
+  const negative = Object.entries(byClass).filter(([, v]) => v < 0);
+  const gross = positive.reduce((s, [, v]) => s + v, 0);
+
+  return (
+    <Section
+      title="Asset Allocation"
+      subtitle={gross > 0 ? (
+        <>
+          Share of gross assets, <span data-privacy="blur">{fmtEUR(gross)}</span>.
+          {physicalValue > 0 && ' Real assets are property and vehicles at current valuation, before loans.'}
+        </>
+      ) : undefined}
+    >
+      {positive.length === 0 ? (
+        <p className="text-[14px] text-ink-body">No balances to show yet.</p>
+      ) : (
+        <RankedBars
+          scale="total"
+          items={positive.map(([label, value]) => ({
+            label,
+            value,
+            display: fmtEUR(value),
+            share: fmtPct((value / gross) * 100),
+          }))}
+        />
+      )}
+      {negative.length > 0 && (
+        <p className="text-[12px] text-ink-muted mt-3">
+          Not included: {negative.map(([label, value], i) => (
+            <span key={label}>{i > 0 && ', '}{label} <span data-privacy="blur">{fmtEUR(value)}</span></span>
+          ))}.
+        </p>
+      )}
+    </Section>
+  );
+}
+
+/* ───────────────────────────── Counterparty exposure ───────────────────────────── */
+
+function CounterpartySection({ accounts }: { accounts: Account[] }) {
+  const institutions: Record<string, { cash: number; securities: number; scheme: string }> = {};
+  accounts.forEach(a => {
+    const inst = a.institution;
+    if (!institutions[inst]) {
+      institutions[inst] = { cash: 0, securities: 0, scheme: inst === 'sparkasse' ? 'Institutssicherung' : 'Einlagensicherung' };
+    }
+    if (a.type === 'checking' || a.type === 'savings') {
+      institutions[inst].cash += a.balance ?? 0;
+    } else if (a.type === 'brokerage') {
+      institutions[inst].securities += a.holdings_value ?? 0;
+      institutions[inst].cash += a.cash_balance ?? 0;
+    }
+  });
+  const rows = Object.entries(institutions)
+    .map(([inst, d]) => {
+      const pct = d.cash / 100_000 * 100;
+      return {
+        inst,
+        name: institutionLabel(inst),
+        cash: d.cash,
+        securities: d.securities,
+        exposure: d.cash + d.securities,
+        status: pct >= 100 ? 'over' as const : pct >= 80 ? 'near' as const : 'ok' as const,
+      };
+    })
+    .filter(r => Math.abs(r.exposure) >= 0.005)
+    .sort((a, b) => b.exposure - a.exposure);
+  const total = rows.reduce((s, r) => s + Math.max(0, r.exposure), 0);
+  const share = (r: { exposure: number }) => (total > 0 ? fmtPct((Math.max(0, r.exposure) / total) * 100) : '—');
+
+  const protection = (r: typeof rows[number]) => (
+    <span className="flex flex-col items-start gap-1.5">
+      {r.securities > 0 && <Chip>Segregated assets</Chip>}
+      {r.cash > 0 && (
+        <Chip tone={r.status === 'over' ? 'danger' : r.status === 'near' ? 'warning' : 'success'}>
+          {r.status === 'over' ? 'Deposits over limit' : r.status === 'near' ? 'Deposits near limit' : 'Deposits insured'}
+        </Chip>
+      )}
+      {r.securities <= 0 && r.cash <= 0 && <span className="text-ink-muted">—</span>}
+    </span>
+  );
+
+  return (
+    <Section
+      title="Counterparty Exposure"
+      subtitle={total > 0 ? <>Where securities and cash of <span data-privacy="blur">{fmtEUR(total)}</span> are held.</> : undefined}
+    >
+      {rows.length === 0 ? (
+        <p className="text-[14px] text-ink-body">No bank or brokerage balances to show yet.</p>
+      ) : (
+        <>
+          {/* Phones: one card per institution, nothing scrolls sideways */}
+          <ul className="md:hidden apple-card divide-y divide-divider">
+            {rows.map(r => (
+              <li key={r.inst} className="px-4 py-3">
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className="text-[14px] font-medium text-ink min-w-0 break-words">{r.name}</span>
+                  <span className="text-[14px] text-ink shrink-0" data-privacy="blur">{fmtEUR(r.exposure)}</span>
+                </div>
+                <p className="text-[12px] text-ink-muted mt-0.5">
+                  {share(r)} of the total · cash <span data-privacy="blur">{fmtEUR(r.cash)}</span>
+                  {r.securities > 0 && <> · securities <span data-privacy="blur">{fmtEUR(r.securities)}</span></>}
+                </p>
+                <div className="mt-2">{protection(r)}</div>
+              </li>
+            ))}
+          </ul>
+          <div className="hidden md:block apple-card overflow-x-auto" role="region" tabIndex={0} aria-label="Counterparty exposure by institution">
+            <table className="apple-table">
+              <thead>
+                <tr>
+                  <th scope="col">Counterparty</th>
+                  <th scope="col" className="num">Exposure</th>
+                  <th scope="col" className="num">Share</th>
+                  <th scope="col">Protection</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(r => (
+                  <tr key={r.inst}>
+                    <td className="font-medium text-ink">
+                      {r.name}
+                      <span className="block text-[12px] font-normal text-ink-muted" data-privacy="blur">
+                        {r.securities > 0 ? `Securities ${fmtEUR(r.securities)} · cash ${fmtEUR(r.cash)}` : `Cash ${fmtEUR(r.cash)}`}
+                      </span>
+                    </td>
+                    <td className="num whitespace-nowrap text-ink" data-privacy="blur" title={`Cash ${fmtEUR(r.cash)}, securities ${fmtEUR(r.securities)}`}>{fmtEUR(r.exposure)}</td>
+                    <td className="num whitespace-nowrap">{share(r)}</td>
+                    <td>{protection(r)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-[12px] text-ink-muted mt-2.5">
+            Securities in a brokerage account are Sondervermögen (segregated assets) and stay yours if the institution fails.
+            Cash is covered by statutory deposit insurance (Einlagensicherung; at savings banks, Institutssicherung) up to {fmtEUR(100_000)} per institution;
+            “near limit” starts at 80 % of that.
+          </p>
+        </>
+      )}
+    </Section>
+  );
+}
+
+/* ────────────────────────────── Concentration risk ────────────────────────────── */
+
+function ConcentrationSection({ holdings, totalNetWorth }: { holdings: HoldingRow[]; totalNetWorth: number }) {
+  if (holdings.length === 0 || totalNetWorth <= 0) return null;
+  // Any holding above 10 % of net worth; critical beyond 25 %.
+  const concentrated = holdings
+    .filter(h => h.market_value != null && h.market_value > 0 && (h.market_value / totalNetWorth) > 0.10)
+    .map(h => ({
+      name: h.name || h.security_isin,
+      value: h.market_value as number,
+      pct: ((h.market_value as number) / totalNetWorth) * 100,
+      critical: ((h.market_value as number) / totalNetWorth) > 0.25,
+    }))
+    .sort((a, b) => b.pct - a.pct);
+  if (concentrated.length === 0) return null;
+  return (
+    <Section title="Concentration Risk" subtitle="Single holdings above 10 % of net worth; critical above 25 %.">
+      <ul className="flex flex-col gap-2.5">
+        {concentrated.map((c, i) => (
+          <li key={i} className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-apple border border-divider bg-inset px-4 py-3">
+            <Chip tone={c.critical ? 'danger' : 'warning'} className="shrink-0">{c.critical ? 'Critical' : 'Warning'}</Chip>
+            <span className="flex-1 basis-48 min-w-0 text-[14px] font-medium text-ink break-words" data-privacy="blur">{c.name}</span>
+            <span className="text-[13px] text-ink-body">
+              {fmtPct(c.pct)} of net worth · <span data-privacy="blur">{fmtEUR(c.value)}</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Section>
+  );
+}
+
+/* ──────────────────────────────────── Goals ──────────────────────────────────── */
+
+const GOAL_STATUS: Record<GoalProgress['status'], { label: string; tone: 'success' | 'info' | 'warning' }> = {
+  complete: { label: 'Complete', tone: 'success' },
+  ahead: { label: 'Ahead', tone: 'success' },
+  on_track: { label: 'On track', tone: 'info' },
+  behind: { label: 'Behind', tone: 'warning' },
+};
+
+function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: Account[] }) {
+  const tc = useThemeColors();
+
+  // Goal / asset mismatches
+  const mismatches: { goal: string; severity: 'critical' | 'moderate' | 'info'; message: ReactNode }[] = [];
+  goals.forEach(g => {
+    const fundingAccount = g.funding_account_id ? accounts.find(a => a.id === g.funding_account_id) : null;
+    const yearsLeft = g.months_remaining / 12;
+    // Critical: short-horizon goal (<3 years) funded by equities
+    if (yearsLeft > 0 && yearsLeft < 3 && fundingAccount?.type === 'brokerage') {
+      mismatches.push({ goal: g.name, severity: 'critical', message: `Due in ${fmtDuration(g.months_remaining)} but funded by a brokerage account (equities). A market crash could prevent reaching the target. Consider moving to cash or bonds.` });
+    }
+    // Moderate: long-horizon goal (>10 years) sitting in cash
+    if (yearsLeft > 10 && fundingAccount && (fundingAccount.type === 'checking' || fundingAccount.type === 'savings')) {
+      mismatches.push({ goal: g.name, severity: 'moderate', message: `${Math.floor(yearsLeft)}-year horizon but funded by a ${fundingAccount.type} account. Cash returns may not keep pace with inflation. Consider equities for long-term growth.` });
+    }
+    // Over-funded
+    if (g.progress_pct > 110) {
+      mismatches.push({ goal: g.name, severity: 'info', message: <>{fmtPct(g.progress_pct, { digits: 0 })} funded (<span data-privacy="blur">{fmtEUR(g.current_value - g.target_amount)}</span> above target). Consider reallocating the excess to other goals.</> });
+    }
+    // Shortfall: behind schedule with less than half funded and under five years left
+    if (g.status === 'behind' && g.months_remaining > 0 && g.progress_pct < 50 && yearsLeft < 5) {
+      const shortfall = g.target_amount - g.projected_value;
+      if (shortfall > 0) {
+        mismatches.push({ goal: g.name, severity: 'critical', message: <>Projected shortfall of <span data-privacy="blur">{fmtEUR(shortfall)}</span>. Increase contributions by <span data-privacy="blur">{fmtEUR(shortfall / g.months_remaining)}</span> a month to close the gap.</> });
+      }
+    }
+  });
+
+  // Glide path: equity % = min(100, max(0, (years − 2) / 18 × 100))
+  const glideEquity = (yearsLeft: number) => Math.min(100, Math.max(0, Math.round((yearsLeft - 2) / 18 * 100)));
+  const goalPaths = goals.filter(g => g.months_remaining > 0).map(g => {
+    const yearsLeft = g.months_remaining / 12;
+    const recommended = glideEquity(yearsLeft);
+    const fundingAccount = g.funding_account_id ? accounts.find(a => a.id === g.funding_account_id) : null;
+    // Approximation: brokerage ~90 % equity, cash accounts 0 %, anything else 50 %
+    const actual = fundingAccount?.type === 'brokerage' ? 90 : fundingAccount?.type === 'savings' ? 0 : fundingAccount?.type === 'checking' ? 0 : 50;
+    return { name: g.name, yearsLeft, recommended, actual, drift: actual - recommended };
+  });
+  const glideCurve: number[][] = [];
+  for (let y = 0; y <= 30; y++) glideCurve.push([y, glideEquity(y)]);
+
+  // Priority and shortfall — the budget is set on the Planning page (Contribution Router)
+  const totalNeeded = goals.reduce((s, g) => s + g.monthly_contribution, 0);
+  let budget = 0;
+  try { budget = parseFloat(localStorage.getItem('monthly_invest_budget') || '') || 0; } catch { budget = 0; }
+  const hasShortfall = budget > 0 && totalNeeded > budget;
+  const showPriority = goals.length > 1 && (hasShortfall || goals.some(g => g.status === 'behind'));
+  const priorityLabels: Record<number, string> = { 10: 'Emergency', 20: 'Employer match', 30: 'Debt payoff', 40: 'Time-sensitive', 50: 'Long-term' };
+  let remaining = budget;
+  const allocations = [...goals].sort((a, b) => (a.priority || 50) - (b.priority || 50)).map(g => {
+    const needed = g.monthly_contribution;
+    const allocated = hasShortfall ? Math.min(needed, Math.max(0, remaining)) : needed;
+    remaining -= allocated;
+    return { ...g, allocated, shortfall: needed - allocated, priorityLabel: priorityLabels[g.priority] || `Priority ${g.priority}` };
+  });
+
+  return (
+    <>
+      <Section title="Goals" subtitle="Progress towards each goal at its current pace.">
+        <ul className="divide-y divide-divider">
+          {goals.map(g => {
+            // Clamp the bar to [0, 100] — progress can overshoot.
+            const clampedPct = Math.max(0, Math.min(g.progress_pct, 100));
+            let estimate = '';
+            if (g.status === 'complete') {
+              estimate = 'Reached';
+            } else if (g.months_remaining > 0) {
+              const est = new Date();
+              est.setMonth(est.getMonth() + g.months_remaining);
+              estimate = `${fmtDuration(g.months_remaining)} left, estimated ${fmtMonth(est)}`;
+            } else if (g.target_date) {
+              estimate = `Target ${fmtMonth(g.target_date)} — past due`;
+            } else {
+              estimate = 'Past due';
+            }
+            const st = GOAL_STATUS[g.status] ?? GOAL_STATUS.behind;
+            return (
+              <li key={g.id} className="py-3 first:pt-0">
+                <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 mb-2">
+                  <span className="text-[15px] font-medium text-ink min-w-0 break-words">{g.name}</span>
+                  <span className="inline-flex flex-wrap items-center gap-2 text-[12px] text-ink-muted">
+                    {g.status === 'behind' && <span>projected <span data-privacy="blur">{fmtEUR(g.projected_value)}</span></span>}
+                    <Chip tone={st.tone}>{st.label}</Chip>
+                  </span>
+                </div>
+                <ProgressBar value={clampedPct} label={`${g.name}: ${fmtPct(clampedPct)} of target`} />
+                <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-0.5 mt-1.5 text-[12px] text-ink-muted">
+                  <span>{fmtPct(g.progress_pct)} · {estimate}</span>
+                  <span>
+                    <span data-privacy="blur">{fmtEUR(g.current_value)} of {fmtEUR(g.target_amount)}</span>
+                    {g.monthly_contribution > 0 && <> · <span data-privacy="blur">{fmtEUR(g.monthly_contribution)}</span> a month</>}
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+
+        {mismatches.length > 0 && (
+          <div className="mt-5">
+            <SubHeading className="mb-2">Mismatch alerts</SubHeading>
+            <ul className="flex flex-col gap-2.5">
+              {mismatches.map((m, i) => (
+                <li key={i} className="flex flex-wrap items-start gap-x-3 gap-y-1.5 rounded-apple border border-divider bg-inset px-4 py-3">
+                  <Chip tone={m.severity === 'critical' ? 'danger' : m.severity === 'moderate' ? 'warning' : 'info'} className="shrink-0 mt-0.5">
+                    {m.severity === 'critical' ? 'Critical' : m.severity === 'moderate' ? 'Warning' : 'Info'}
+                  </Chip>
+                  <div className="flex-1 basis-56 min-w-0">
+                    <p className="text-[14px] font-medium text-ink break-words">{m.goal}</p>
+                    <p className="text-[13px] text-ink-muted">{m.message}</p>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </Section>
+
+      {goalPaths.length > 0 && (
+        <Section title="Glide Path" subtitle="The recommended share of equities falls as each goal approaches its target date. “Actual” is estimated from the type of the funding account.">
+          <EChartWrapper
+            height="240px"
+            option={{
+              tooltip: { trigger: 'axis' as const, valueFormatter: (v: unknown) => `${fmtNum(Number(Array.isArray(v) ? v[1] : v))} %` },
+              legend: { data: ['Recommended', 'Your goals'], bottom: 0 },
+              grid: { left: 8, right: 20, top: 28, bottom: 52, containLabel: true },
+              xAxis: { type: 'value' as const, name: 'Years to goal', nameLocation: 'middle' as const, nameGap: 26, min: 0, max: 30, splitLine: { show: false } },
+              yAxis: { type: 'value' as const, name: 'Equities', nameTextStyle: { align: 'left' as const }, min: 0, max: 100, axisLabel: { formatter: (v: number) => `${v} %` } },
+              series: [
+                { name: 'Recommended', type: 'line' as const, color: tc.forest, data: glideCurve, showSymbol: false, lineStyle: { width: 2 } },
+                { name: 'Your goals', type: 'scatter' as const, color: tc.gold, data: goalPaths.map(g => [Math.round(g.yearsLeft * 10) / 10, g.actual]), symbolSize: 12 },
+              ],
+            }}
+          />
+          <ul className="mt-3 divide-y divide-divider">
+            {goalPaths.map(g => {
+              const off = Math.abs(g.drift);
+              return (
+                <li key={g.name} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 py-2.5">
+                  <div className="min-w-0 flex-1 basis-40">
+                    <p className="text-[14px] text-ink break-words">{g.name}</p>
+                    <p className="text-[12px] text-ink-muted">{fmtDuration(Math.round(g.yearsLeft * 12))} remaining</p>
+                  </div>
+                  <p className="text-[13px] text-ink-body">
+                    Recommended {g.recommended} % equities · actual {g.actual} %
+                  </p>
+                  <Chip tone={off > 20 ? 'danger' : off > 10 ? 'warning' : 'success'}>
+                    {off > 10 ? `${fmtNum(off)} points ${g.drift > 0 ? 'above' : 'below'}` : 'In line'}
+                  </Chip>
+                </li>
+              );
+            })}
+          </ul>
+        </Section>
+      )}
+
+      {showPriority && (
+        <Section
+          title="Goal Priority"
+          subtitle={hasShortfall
+            ? <>Budget shortfall: <span data-privacy="blur">{fmtEUR(totalNeeded)}</span> a month needed but only <span data-privacy="blur">{fmtEUR(budget)}</span> available. Contributions are allocated by priority.</>
+            : 'Goals ranked by priority. Adjust the priority in Settings to control the allocation order.'}
+        >
+          <ol className="divide-y divide-divider">
+            {allocations.map((g, i) => (
+              <li key={g.id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 py-2.5">
+                <div className="flex items-baseline gap-2.5 min-w-0 flex-1 basis-48">
+                  <span className="text-[13px] text-ink-muted w-5 shrink-0">{i + 1}.</span>
+                  <div className="min-w-0">
+                    <p className="text-[14px] text-ink break-words">{g.name}</p>
+                    <p className="text-[12px] text-ink-muted">{g.priorityLabel} · {g.months_remaining > 0 ? `${fmtDuration(g.months_remaining)} left` : 'past due'}</p>
+                  </div>
+                </div>
+                <div className="text-right text-[13px]">
+                  <p className="text-ink"><span data-privacy="blur">{fmtEUR(hasShortfall ? g.allocated : g.monthly_contribution)}</span> a month</p>
+                  {hasShortfall && g.shortfall > 0 && (
+                    <p className="text-claret"><span data-privacy="blur">{fmtEUR(g.shortfall)}</span> unfunded</p>
+                  )}
+                  {!hasShortfall && g.status === 'behind' && <p className="text-amber">Behind schedule</p>}
+                </div>
+              </li>
+            ))}
+          </ol>
+          {hasShortfall && (
+            <p className="text-[13px] text-ink-body mt-3">
+              Increase the budget by <span data-privacy="blur">{fmtEUR(totalNeeded - budget)}</span> a month to fully fund all goals.
+            </p>
+          )}
+        </Section>
+      )}
+    </>
+  );
+}
+
+/* ──────────────────────────────── Projection tab ──────────────────────────────── */
+
+interface Scenario { name: string; contribution: number; return_pct: number; projection: { date: string; value: number }[] }
+
+function readStored(key: string, fallback: string): string {
+  try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
+}
+function writeStored(key: string, value: string) {
+  try { localStorage.setItem(key, value); } catch { /* storage unavailable: keep in memory only */ }
+}
+
+function Slider({ id, label, display, value, min, max, step, onChange }: {
+  id: string; label: string; display: ReactNode; value: string; min: number; max: number; step: number; onChange: (v: string) => void;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="flex items-baseline justify-between gap-3">
+        <label htmlFor={id} className="text-[13px] font-medium text-ink">{label}</label>
+        <output htmlFor={id} className="text-[14px] text-ink whitespace-nowrap">{display}</output>
+      </div>
+      <input
+        id={id} type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(e.target.value)}
+        className="block w-full h-[44px] md:h-[32px] accent-forest cursor-pointer"
+      />
+    </div>
+  );
+}
+
+function ProjectionTab() {
+  const tc = useThemeColors();
+  const [confirm, confirmDialog] = useConfirm();
+  const [projData, setProjData] = useState<ProjectionData | null>(null);
+  const [status, setStatus] = useState<LoadStatus>('loading');
+  const [projContrib, setProjContrib] = useState('');
+  const [projReturn, setProjReturn] = useState('');
+  const [projHorizon, setProjHorizon] = useState(() => readStored('proj_horizon', '30'));
+  const [projContribGrowth, setProjContribGrowth] = useState(() => readStored('proj_contrib_growth', '0'));
+  const [savedScenarios, setSavedScenarios] = useState<Scenario[]>(() => {
+    try { return JSON.parse(localStorage.getItem('proj_scenarios') || '[]'); } catch { return []; }
+  });
+  const [activeScenarios, setActiveScenarios] = useState<Set<number>>(() => new Set());
+  const [showAllMilestones, setShowAllMilestones] = useState(false);
+
+  const loadInitial = useCallback(() => {
+    setStatus('loading');
     api.getProjection().then(d => {
       setProjData(d);
       if (d.contribution != null) setProjContrib(String(d.contribution));
       if (d.return_pct != null) setProjReturn(String(d.return_pct));
-    }).catch(() => {});
+      setStatus('ready');
+    }).catch(() => setStatus('error'));
   }, []);
+  useEffect(() => { loadInitial(); }, [loadInitial]);
 
-  // Auto-update projection when sliders change (debounced). FIRE-target
-  // sizing parameters (annual expenses, SWR, marginal tax, contribution
-  // growth) live on the Planning page now and re-fetch their own projection
-  // independently — Net Worth's Projection tab is purely "what's my future
-  // NW under these contrib/return/horizon assumptions?".
+  // Re-project when a slider moves (debounced). FIRE sizing parameters live on
+  // the Planning page; this tab only asks "where does liquid wealth go under
+  // these contribution / return / horizon assumptions?".
   useEffect(() => {
     if (!projContrib && !projReturn) return;
     const timer = setTimeout(() => {
       const c = parseFloat(projContrib);
       const r = parseFloat(projReturn);
-      const horizon = parseInt(projHorizon);
+      const horizon = parseInt(projHorizon, 10);
       const contribG = parseFloat(projContribGrowth);
       if (!isNaN(c) && !isNaN(r)) {
         api.getProjection(
           c, r,
-          undefined, // expenses (Planning's FIRE Calc owns this)
+          undefined, // expenses (Planning)
           undefined, // swr (Planning)
           undefined, // marginal_rate (Planning)
           undefined, // taxPortion
@@ -185,1351 +1395,470 @@ export default function NetWorth({ defaultTab }: { defaultTab?: NWTab } = {}) {
     return () => clearTimeout(timer);
   }, [projContrib, projReturn, projHorizon, projContribGrowth]);
 
-  // Filter snapshots for change calculation (exact period window)
-  const snapshots = useMemo(() => {
-    if (period === 'All') return allSnapshots;
-    const days = periodToDays(period);
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - days);
-    return allSnapshots.filter(s => new Date(s.date) >= cutoff);
-  }, [allSnapshots, period]);
+  if (status === 'loading') return <LoadingState message="Loading projection" lines={6} />;
+  if (status === 'error' || !projData) {
+    return <div className="mt-6"><ErrorState message="The projection couldn’t be loaded." onRetry={loadInitial} /></div>;
+  }
+  if (projData.history.length === 0 && projData.projection.length === 0) {
+    return (
+      <div className="mt-6">
+        <EmptyState
+          title="Nothing to project yet"
+          message="The projection starts from your securities and cash. Import transactions to see where they could go."
+          action={{ label: 'Go to Settings', href: '/settings' }}
+        />
+      </div>
+    );
+  }
 
-  const totalNetWorth = allSnapshots.length > 0 ? allSnapshots[0].total : 0;
-  // Vehicles at their modelled depreciated value (part of the snapshot total)
-  const physicalValue = allSnapshots.length > 0 ? (allSnapshots[0].physical_component ?? 0) : 0;
-  const physicalDebt = allSnapshots.length > 0 ? (allSnapshots[0].debt_component ?? 0) : 0;
-  // What's yours in property and vehicles: value minus the loans on them.
-  const physicalYours = physicalValue - physicalDebt;
+  const contribNum = parseFloat(projContrib) || 0;
+  const returnNum = parseFloat(projReturn) || 0;
+  const horizonNum = parseInt(projHorizon, 10) || 0;
+  const growthNum = parseFloat(projContribGrowth) || 0;
+  const scenarioColors = [tc.walnut, tc.claret, tc.sage];
+  const shownScenarios = savedScenarios.map((s, i) => ({ s, i })).filter(({ i }) => activeScenarios.has(i));
+  const hist = projData.history;
+  const proj = projData.projection;
+  const milestones = projData.milestones ?? [];
+  const shownMilestones = showAllMilestones ? milestones : milestones.slice(0, 2);
+  const acc = projData.projection_accuracy;
 
-  // Liquid net worth: exclude illiquid asset types (real estate, pension).
-  // Vehicles aren't accounts, so they're already outside this sum.
-  const illiquidTypes = new Set(['real_estate', 'pension', 'liability']);
-  const liquidNetWorth = accounts.reduce((sum, acc) => {
-    if (illiquidTypes.has(acc.type)) return sum;
-    return sum + (acc.balance ?? 0);
-  }, 0);
-  const hasIlliquid = accounts.some(acc => illiquidTypes.has(acc.type)) || physicalValue > 0;
-
-  // Period change: compare newest vs oldest in filtered range
-  const periodStart = snapshots.length > 1 ? snapshots[snapshots.length - 1].total : totalNetWorth;
-  const change = totalNetWorth - periodStart;
-  const changePct = periodStart !== 0 ? (change / periodStart) * 100 : 0;
-
-  // Daily change: find the most recent snapshot from a previous day (not today)
-  const { dailyChange, dailyPrev, dailyChangePct } = useMemo(() => {
-    if (allSnapshots.length < 2) return { dailyChange: 0, dailyPrev: totalNetWorth, dailyChangePct: 0 };
-    const todayStr = allSnapshots[0].date.slice(0, 10);
-    const prev = allSnapshots.find(s => s.date.slice(0, 10) !== todayStr);
-    if (!prev) return { dailyChange: 0, dailyPrev: totalNetWorth, dailyChangePct: 0 };
-    const dc = totalNetWorth - prev.total;
-    const dp = prev.total;
-    return { dailyChange: dc, dailyPrev: dp, dailyChangePct: dp !== 0 ? (dc / dp) * 100 : 0 };
-  }, [allSnapshots, totalNetWorth]);
-
-  // Chart data: show all data points within the selected period, skip weekends.
-  // For 1D, use intraday data points (timestamped every 15 min).
-  const chartSnapshots = useMemo(() => {
-    if (period === '1D') {
-      // Convert intraday points to snapshot-like objects for the chart
-      return intradayPoints.map(p => ({
-        date: p.recorded_at,
-        total: p.total,
-        cash_component: p.cash_component,
-        investment_component: p.investment_component,
-        physical_component: p.physical_component ?? 0,
-        debt_component: p.debt_component ?? 0,
-      }));
-    }
-    const isWeekday = (d: string) => { const day = new Date(d).getDay(); return day !== 0 && day !== 6; };
-    const base = period === 'All' ? allSnapshots : (() => {
-      const days = periodToDays(period);
-      const cutoff = new Date();
-      cutoff.setDate(cutoff.getDate() - days);
-      return allSnapshots.filter(s => new Date(s.date) >= cutoff);
-    })();
-    return [...base.filter(s => isWeekday(s.date))].reverse();
-  }, [allSnapshots, intradayPoints, period]);
-
-  const fmt = (n: number) =>
-    new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' }).format(n);
-
-  const chartOption = {
-    tooltip: {
-      trigger: 'axis' as const,
-      formatter: (params: unknown) => {
-        const p = params as { seriesName: string; data: number; dataIndex: number; color: string }[];
-        if (!Array.isArray(p) || p.length === 0) return '';
-        const snap = chartSnapshots[p[0].dataIndex];
-        const d = new Date(snap.date);
-        const fullDate = period === '1D'
-          ? d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
-          : d.toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
-        const total = p.reduce((sum, s) => sum + (s.data || 0), 0);
-        let html = `<strong>${fullDate}</strong><br/>`;
-        html += `Total: ${fmt(total)}<br/>`;
-        for (const s of p) {
-          html += `<span style="color:${s.color}">${s.seriesName}: ${fmt(s.data)}</span><br/>`;
-        }
-        return html;
-      },
-    },
-    xAxis: {
-      type: 'category' as const,
-      data: chartSnapshots.map((s) => formatChartDate(s.date, period)),
-      axisLabel: {
-        fontSize: 11,
-        color: tc.inkMuted,
-        rotate: 0,
-        interval: chartSnapshots.length > 30
-          ? Math.max(Math.floor(chartSnapshots.length / 8) - 1, 1)
-          : 'auto',
-      },
-      axisLine: { show: false },
-      axisTick: { show: false },
-    },
-    yAxis: {
-      type: 'value' as const,
-      axisLabel: {
-        formatter: (v: number) => `${(v / 1000).toFixed(0)}k`,
-        fontSize: 12,
-        color: tc.inkMuted,
-      },
-      splitLine: { lineStyle: { color: tc.divider } },
-    },
-    series: [
-      {
-        name: 'Cash',
-        type: 'line' as const,
-        stack: 'total',
-        areaStyle: { opacity: 0.3 },
-        data: chartSnapshots.map((s) => s.cash_component),
-        smooth: 0.4,
-        showSymbol: false,
-        lineStyle: { width: 2 },
-      },
-      {
-        name: 'Investments',
-        type: 'line' as const,
-        stack: 'total',
-        areaStyle: { opacity: 0.3 },
-        data: chartSnapshots.map((s) => s.investment_component),
-        smooth: 0.4,
-        showSymbol: false,
-        lineStyle: { width: 2 },
-      },
-      // What's yours in property & vehicles (value minus loans), so the
-      // stack adds up to net worth.
-      ...(chartSnapshots.some(s => (s.physical_component ?? 0) > 0) ? [{
-        name: 'Property & vehicles, after loans',
-        type: 'line' as const,
-        stack: 'total',
-        areaStyle: { opacity: 0.3 },
-        data: chartSnapshots.map((s) => (s.physical_component ?? 0) - (s.debt_component ?? 0)),
-        smooth: 0.4,
-        showSymbol: false,
-        lineStyle: { width: 2 },
-      }] : []),
-    ],
-    grid: { left: 55, right: 16, top: 16, bottom: 36 },
+  const saveScenario = () => {
+    if (savedScenarios.length >= 3) return;
+    const name = `${fmtEUR(contribNum)} a month at ${fmtPct(returnNum)}`;
+    const updated = [...savedScenarios, { name, contribution: contribNum, return_pct: returnNum || 7, projection: proj }];
+    setSavedScenarios(updated);
+    writeStored('proj_scenarios', JSON.stringify(updated));
+    setActiveScenarios(prev => new Set([...prev, updated.length - 1]));
+  };
+  const deleteScenario = async (i: number) => {
+    const ok = await confirm({ title: `Delete scenario “${savedScenarios[i].name}”?`, body: 'The saved comparison line is removed from this browser.', confirmLabel: 'Delete scenario' });
+    if (!ok) return;
+    const updated = savedScenarios.filter((_, j) => j !== i);
+    setSavedScenarios(updated);
+    writeStored('proj_scenarios', JSON.stringify(updated));
+    setActiveScenarios(prev => {
+      const next = new Set<number>();
+      prev.forEach(idx => { if (idx < i) next.add(idx); else if (idx > i) next.add(idx - 1); });
+      return next;
+    });
   };
 
-  if (loading) {
-    return <div role="status" aria-live="polite" className="flex items-center justify-center py-20 text-[16px] text-ink-muted">Loading<span className="sr-only">, please wait</span>...</div>;
-  }
-
-  // Backend-side failure is distinct from "no data yet" — don't render the
-  // welcome empty-state because that misleads users into thinking they need
-  // to import data when the server is just down.
-  if (loadError && allSnapshots.length === 0 && accounts.length === 0) {
-    return (
-      <div className="space-y-6">
-        <h1 className="font-serif text-title text-ink">Net Worth</h1>
-        <div role="alert" className="flex items-start gap-2.5 rounded-r-xl bg-inset px-3 py-3 border-l-[3px] border-claret">
-          <div className="min-w-0 flex-1">
-            <p className="text-[13px] font-medium text-ink">Couldn't load your data</p>
-            <p className="text-[12px] text-ink-muted">{loadError}</p>
-          </div>
-          <button onClick={loadData} className="text-forest text-[13px] font-medium shrink-0">Retry</button>
-        </div>
-      </div>
-    );
-  }
-
-  // Empty state: no data imported yet (or accounts exist but no snapshots/transactions)
-  if (allSnapshots.length === 0) {
-    const hasAccounts = accounts.length > 0;
-    return (
-      <div className="space-y-6">
-        <h1 className="font-serif text-title text-ink">Net Worth</h1>
-        <div className="py-16 text-center">
-          <svg className="w-16 h-16 mx-auto text-ink-muted/40 mb-4" fill="none" viewBox="0 0 24 24" strokeWidth={1} stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z" />
-          </svg>
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">{hasAccounts ? 'Import Your Data' : 'Welcome to Wealth'}</h2>
-          <p className="text-[16px] text-ink-muted mb-6 max-w-md mx-auto">
-            {hasAccounts
-              ? 'Your accounts are set up. Import a CSV file in Settings to start tracking your net worth.'
-              : 'Get started by creating an account and importing your first CSV file in Settings.'}
-          </p>
-          <a href="/settings" className="apple-btn-primary inline-block">Go to Settings</a>
-        </div>
-      </div>
-    );
-  }
-
-  // Compute key metrics for Rule of Three
-  // Same definition as the Wealth Attribution waterfall (RSU vests count as
-  // contributions at FMV), so Invested/Return reconcile with it.
-  const investedCapital = wfData ? wfData.net_contributions : 0;
-  const allTimeReturn = totalNetWorth - investedCapital;
-  const allTimeReturnPct = investedCapital > 0 ? (allTimeReturn / investedCapital) * 100 : 0;
-  const cashBalance = accounts.reduce((s, a) => s + (a.cash_balance ?? a.balance ?? 0), 0);
-
-  // When embedded via /planning route, skip hero + tab bar
-  const isEmbedded = !!defaultTab;
+  const legend: LegendItem[] = [
+    { label: 'Historical', color: tc.forest, style: 'solid' },
+    { label: 'Projected', color: tc.gold, style: 'dashed' },
+    ...(projData.has_confidence ? [{ label: 'Range, 10th to 90th percentile', color: tc.gold, style: 'band' as const }] : []),
+    ...(projData.target_amount > 0 ? [{ label: 'Target', color: tc.slate, style: 'dotted' as const }] : []),
+    ...shownScenarios.map(({ s }, k) => ({ label: s.name, color: scenarioColors[k % scenarioColors.length], style: 'dashed' as const })),
+  ];
 
   return (
-    <div className="space-y-6">
-      {!isEmbedded && <TabBar tabs={NW_TABS_DASHBOARD} activeTab={activeTab} onTabChange={setActiveTab} />}
-
-      {/* Hero: Net Worth — the focal point (hidden when embedded) */}
-      {!isEmbedded && <div className="py-6 md:py-8">
-        <p className="font-serif text-[11px] tracking-[0.1em] uppercase text-ink-muted mb-2" style={{ fontVariantCaps: 'small-caps' }}>Total Net Worth</p>
-        <p className={`font-serif text-[36px] md:text-[48px] font-normal tracking-tight leading-none transition-colors duration-[250ms] ease-out ${tick === 'up' ? 'text-sage' : tick === 'down' ? 'text-claret' : 'text-ink'}`} style={{ fontVariantNumeric: 'lining-nums tabular-nums' }}>{fmt(totalNetWorth)}</p>
-        {hasIlliquid && (
-          <p className="text-[13px] text-ink-muted mt-1.5">
-            Liquid: <span className="font-semibold text-forest">{fmt(liquidNetWorth)}</span>
-            {physicalValue > 0 && <> · In property &amp; vehicles, after loans: <span className="font-semibold text-ink">{fmt(physicalYours)}</span></>}
-          </p>
-        )}
-
-        {/* Daily change — subdued, with optional "Why?" */}
-        {allSnapshots.length > 1 && (
-          <div className="flex items-center gap-2 mt-3">
-            <span className={`text-[15px] font-medium tabular-nums ${dailyChange >= 0 ? 'text-sage' : 'text-claret'}`}>
-              {dailyChange >= 0 ? '+' : ''}{fmt(dailyChange)}
-              {dailyPrev >= 100 && <> ({dailyChangePct >= 0 ? '+' : ''}{dailyChangePct.toFixed(2)}%)</>}
-            </span>
-            <span className="text-[13px] text-ink-muted">today</span>
-            {attribution && (
-              <button onClick={() => setShowAttribution(prev => !prev)}
-                className="text-[13px] text-forest font-medium hover:underline ml-1 py-2 px-1">
-                {showAttribution ? 'Hide' : 'Why?'}
-              </button>
-            )}
-          </div>
-        )}
-        {showAttribution && attribution && (() => {
-          // Reconcile dailyChange (total ΔNW) vs market-only attribution. The
-          // remainder is cash flow during the day (deposits, withdrawals,
-          // dividends credited, fees). Surface it explicitly when it materially
-          // diverges so users don't read the market summary as the whole story.
-          const market = attributionTotal ?? 0;
-          const other = dailyChange - market;
-          const showGap = attributionTotal !== null && Math.abs(other) >= 1;
-          return (
-            <div className="mt-1.5 pl-0.5 space-y-0.5">
-              <p className="text-[12px] text-ink-muted">{attribution}</p>
-              {showGap && (
-                <p className="text-[11px] text-ink-muted">
-                  Market <span className="tabular-nums">{market >= 0 ? '+' : ''}{fmt(market)}</span>
-                  {' · '}
-                  Cash flow today <span className="tabular-nums">{other >= 0 ? '+' : ''}{fmt(other)}</span>
-                </p>
-              )}
-            </div>
-          );
-        })()}
-
-        {/* Period change — shown when period is not 1D */}
-        {period !== '1D' && snapshots.length > 1 && (
-          <p className={`text-[13px] mt-1 tabular-nums ${change >= 0 ? 'text-sage' : 'text-claret'}`}>
-            {change >= 0 ? '+' : ''}{fmt(change)}
-            {periodStart >= 100 && <> ({changePct >= 0 ? '+' : ''}{changePct.toFixed(2)}%)</>}
-            <span className="text-ink-muted ml-1.5">{periodLabel(period)}</span>
-          </p>
-        )}
-
-        {/* Data freshness — only surface when actually stale (≥2d). Fresh
-            snapshots don't need a chrome label; a quiet UI reads more confident
-            than one that constantly reassures the user "everything's fine." */}
-        {allSnapshots.length > 0 && (() => {
-          const snapshotDate = new Date(allSnapshots[0].date);
-          const daysOld = Math.max(0, Math.floor((Date.now() - snapshotDate.getTime()) / (1000 * 60 * 60 * 24)));
-          if (daysOld < 2) return null;
-          const dateStr = snapshotDate.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' });
-          const freshness = daysOld < 10
-            ? { label: `${daysOld} days old`, dot: 'bg-amber', text: 'text-amber' }
-            : { label: `Stale — ${daysOld}d old (${dateStr})`, dot: 'bg-claret', text: 'text-claret' };
-          return (
-            <p className={`flex items-center gap-1.5 text-[11px] mt-2 ${freshness.text}`}>
-              <span aria-hidden="true" className={`inline-block w-1.5 h-1.5 rounded-full ${freshness.dot}`} />
-              {freshness.label}
-            </p>
-          );
-        })()}
-      </div>}
-
-      {activeTab === 'overview' && (<>
-      {/* Sparkline Chart — clean, minimal, emotional anchor */}
-      {chartSnapshots.length > 1 && (
-        <div className="-mx-1">
-          <EChartWrapper option={{
-            tooltip: {
-              trigger: 'axis' as const,
-              formatter: (params: unknown) => {
-                const p = params as { data: number; dataIndex: number }[];
-                if (!Array.isArray(p) || p.length === 0) return '';
-                const snap = chartSnapshots[p[0].dataIndex];
-                const d = new Date(snap.date);
-                return `${d.toLocaleDateString('de-DE', { day: 'numeric', month: 'short', year: 'numeric' })}<br/><strong>${fmt(snap.total)}</strong>`;
-              },
-            },
-            xAxis: { type: 'category' as const, show: false, data: chartSnapshots.map(s => s.date) },
-            yAxis: { type: 'value' as const, show: false, min: 'dataMin' },
-            series: [{
-              type: 'line' as const,
-              data: chartSnapshots.map(s => s.total),
-              smooth: 0.4,
-              showSymbol: false,
-              lineStyle: { width: 2.5, color: change >= 0 ? tc.sage : tc.claret },
-              areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [
-                { offset: 0, color: change >= 0 ? tc.sage + '26' : tc.claret + '20' },
-                { offset: 1, color: 'rgba(255,255,255,0)' },
-              ]}},
-            }],
-            grid: { left: 0, right: 0, top: 8, bottom: 8 },
-          }} height="140px" />
+    <>
+      <Section
+        first
+        title="Wealth Projection"
+        subtitle={
+          <>
+            Liquid wealth (securities and cash) so far, and where it goes under the assumptions below. Property, vehicles and their loans are not projected.
+            {projData.target_amount > 0 && <> Target: <span data-privacy="blur">{fmtEUR(projData.target_amount)}</span>.</>}
+          </>
+        }
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 mb-4">
+          <Slider id="proj-contrib" label="Monthly contribution" min={0} max={5000} step={100} value={projContrib} onChange={setProjContrib}
+            display={<span data-privacy="blur">{fmtEUR(contribNum)}</span>} />
+          <Slider id="proj-return" label="Return" min={0} max={15} step={0.5} value={projReturn} onChange={setProjReturn}
+            display={`${fmtPct(returnNum)} per year`} />
+          <Slider id="proj-horizon" label="Horizon" min={1} max={50} step={1} value={projHorizon}
+            onChange={v => { setProjHorizon(v); writeStored('proj_horizon', v); }}
+            display={`${horizonNum} ${horizonNum === 1 ? 'year' : 'years'}`} />
+          <Slider id="proj-growth" label="Contribution growth" min={0} max={20} step={0.5} value={projContribGrowth}
+            onChange={v => { setProjContribGrowth(v); writeStored('proj_contrib_growth', v); }}
+            display={`${fmtPct(growthNum)} per year`} />
         </div>
-      )}
 
-      {/* Period selector */}
-      <div className="flex gap-1.5 -mt-4 overflow-x-auto scrollbar-hide" role="group" aria-label="Time period">
-        {PERIODS.map((p) => (
-          <button
-            key={p}
-            onClick={() => setPeriod(p)}
-            className={`rounded-full px-3 py-2.5 text-[12px] font-medium transition-all duration-150 min-w-[44px] min-h-[44px] md:min-w-0 md:min-h-0 ${
-              period === p
-                ? 'bg-forest text-white dark:text-parchment-deep'
-                : 'text-ink-muted hover:text-ink'
-            }`}
-          >
-            {p}
+        {/* Save and compare scenarios */}
+        <div className="flex flex-wrap items-center gap-2.5 mb-5">
+          <button type="button" onClick={saveScenario} disabled={savedScenarios.length >= 3} className="apple-btn-secondary min-h-[44px] md:min-h-[40px]">
+            Save scenario ({savedScenarios.length} of 3)
           </button>
-        ))}
-      </div>
-
-      {/* Rule of Three */}
-      <div className="grid grid-cols-3 gap-px bg-divider">
-        <div className="bg-parchment p-3 min-w-0">
-          <p className="font-serif text-[11px] tracking-[0.1em] uppercase text-ink-muted mb-1" style={{ fontVariantCaps: 'small-caps' }}>Invested</p>
-          <p className="text-[13px] md:text-[18px] font-medium tabular-nums text-ink truncate">{fmt(investedCapital)}</p>
-        </div>
-        <div className="bg-parchment p-3 min-w-0">
-          <p className="font-serif text-[11px] tracking-[0.1em] uppercase text-ink-muted mb-1" style={{ fontVariantCaps: 'small-caps' }}>Return</p>
-          <p className={`text-[13px] md:text-[18px] font-medium tabular-nums truncate ${allTimeReturn >= 0 ? 'text-sage' : 'text-claret'}`}>
-            {allTimeReturn >= 0 ? '+' : ''}{fmt(allTimeReturn)}
-          </p>
-          <p className="text-[11px] text-ink-muted">{allTimeReturnPct >= 0 ? '+' : ''}{allTimeReturnPct.toFixed(1)}%</p>
-        </div>
-        <div className="bg-parchment p-3 min-w-0">
-          <p className="font-serif text-[11px] tracking-[0.1em] uppercase text-ink-muted mb-1" style={{ fontVariantCaps: 'small-caps' }}>Cash</p>
-          <p className="text-[13px] md:text-[18px] font-medium tabular-nums text-ink truncate">{fmt(cashBalance)}</p>
-        </div>
-      </div>
-
-      {/* Status bar — compact alerts/system status */}
-      {(unreadAlerts > 0 || jobErrors > 0) && (
-        <div className="flex items-center gap-3 text-[12px]">
-          {unreadAlerts > 0 && (
-            <span className="text-amber font-medium">
-              {unreadAlerts} unread alert{unreadAlerts !== 1 ? 's' : ''}
-            </span>
-          )}
-          {jobErrors > 0 && (
-            <a href="/settings" className="text-claret font-medium hover:underline">
-              {jobErrors} job error{jobErrors !== 1 ? 's' : ''}
-            </a>
-          )}
-        </div>
-      )}
-
-      <UnvestedPanel mode="summary" />
-
-      {/* Next Actions — top 3 prioritized recommendations */}
-      {nextActions.length > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <div className="flex items-center justify-between mb-3 md:mb-4">
-            <h2 className="font-serif text-heading text-ink px-1 md:px-0">Recommended Actions</h2>
-            <span className="text-[11px] text-ink-muted tracking-wide">{nextActions.length}</span>
-          </div>
-          <div className="space-y-2">
-            {nextActions.slice(0, 3).map((a, i) => {
-              return (
-                <a key={i} href={a.link} className="flex items-start gap-3 rounded-[3px] bg-parchment-deep px-4 py-3 hover:bg-divider transition-colors duration-[250ms]">
-                  <span className={`mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 ${
-                    a.urgency === 'now' ? 'bg-claret' : a.urgency === 'this-month' ? 'bg-amber' : 'bg-forest'
-                  }`} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-baseline gap-2">
-                      <p className="text-[15px] font-medium text-ink truncate">{a.title}</p>
-                      <span className={`text-[11px] font-medium shrink-0 ${
-                        a.urgency === 'now' ? 'text-claret' : a.urgency === 'this-month' ? 'text-amber' : 'text-forest'
-                      }`}>
-                        {a.urgency === 'now' ? 'Act now' : a.urgency === 'this-month' ? 'This month' : 'This quarter'}
-                      </span>
-                    </div>
-                    <p className="text-[13px] text-ink-muted mt-0.5">{a.detail}</p>
-                  </div>
-                  {a.impact_eur > 0 && (
-                    <span className="text-sage text-[13px] font-medium tabular-nums shrink-0 mt-0.5">+{fmt(a.impact_eur)}</span>
-                  )}
-                </a>
-              );
-            })}
-          </div>
-          {nextActions.length > 3 && (
-            <a href="/analysis" className="block mt-2 text-center text-[13px] text-forest font-medium hover:text-forest-light">
-              View all {nextActions.length} recommendations
-            </a>
-          )}
-        </div>
-      )}
-
-      {/* Wealth Attribution — shows where the current net worth came from.
-          The waterfall visualizes the sources, the breakdown below it gives
-          the exact numbers, and the time series tracks the trajectory. */}
-      {wfData && wfData.waterfall && wfData.waterfall.length > 0 && wfData.current_nw > 0 && (() => {
-        // Filter out near-zero bars to reduce visual clutter — a 0 EUR row
-        // for Interest or Dividends adds no signal but eats x-axis space.
-        const bars = wfData.waterfall.filter(w => w.type === 'total' || Math.abs(w.value) >= 1);
-        if (bars.length < 2) return null;
-        return (
-          <div className="border-t border-divider pt-6 py-3 md:py-5">
-            <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Wealth Attribution</h2>
-            <EChartWrapper option={{
-              tooltip: { trigger: 'axis' as const, axisPointer: { type: 'shadow' as const }, formatter: (params: unknown) => {
-                const ps = params as { name: string; value: number | number[]; dataIndex: number }[];
-                if (!Array.isArray(ps) || ps.length === 0) return '';
-                const p = ps[0];
-                const bar = bars[p.dataIndex];
-                const displayValue = bar.value;
-                return `${p.name}<br/><strong>${bar.type === 'total' || displayValue < 0 ? '' : '+'}${fmt(displayValue)}</strong>`;
-              }},
-              grid: { top: 12, right: 10, bottom: 36, left: 56 },
-              xAxis: { type: 'category' as const, data: bars.map(w => w.label), axisLabel: { fontSize: 10, interval: 0, rotate: 0, color: tc.inkMuted }, axisLine: { lineStyle: { color: tc.divider } }, axisTick: { show: false } },
-              yAxis: { type: 'value' as const, axisLabel: { fontSize: 10, color: tc.inkMuted, formatter: (v: number) => v >= 1000 ? `${Math.round(v/1000)}K` : String(Math.round(v)) }, splitLine: { lineStyle: { color: tc.divider, type: 'dashed' as const } } },
-              // Classic waterfall: an invisible stacked base lifts each delta bar
-              // to its running start, so every bar is a plain number (ECharts
-              // reads [a, b] array values as [categoryIndex, value]).
-              series: (() => {
-                let cumulative = 0;
-                const base: number[] = [];
-                const delta: { value: number; itemStyle: { color: string; borderRadius: number | number[] } }[] = [];
-                for (const w of bars) {
-                  if (w.type === 'total') {
-                    base.push(0);
-                    delta.push({ value: w.value, itemStyle: { color: tc.forest, borderRadius: [2, 2, 0, 0] } });
-                    continue;
-                  }
-                  const start = cumulative;
-                  cumulative += w.value;
-                  base.push(Math.min(start, cumulative));
-                  delta.push({ value: Math.abs(w.value), itemStyle: { color: w.value >= 0 ? tc.sage : tc.claret, borderRadius: 2 } });
-                }
-                return [
-                  { type: 'bar' as const, stack: 'wf', barWidth: '60%', silent: true, itemStyle: { color: 'transparent' }, emphasis: { disabled: true }, data: base },
-                  { type: 'bar' as const, stack: 'wf', barWidth: '60%', data: delta },
-                ];
-              })(),
-            }} height="220px" />
-
-            {/* Breakdown summary — explicit numbers to make the chart readable
-                at a glance. Heritage style: serif numbers, sage/claret signs. */}
-            <div className="mt-4 grid grid-cols-2 md:grid-cols-3 gap-px bg-divider">
-              {bars.filter(w => w.type !== 'total').map(w => (
-                <div key={w.label} className="bg-parchment p-3">
-                  <p className="font-serif text-[10px] tracking-[0.1em] uppercase text-ink-muted mb-1" style={{ fontVariantCaps: 'small-caps' }}>{w.label}</p>
-                  <p className={`font-serif text-[18px] font-medium tabular-nums ${w.value >= 0 ? 'text-sage' : 'text-claret'}`}>
-                    {w.value >= 0 ? '+' : ''}{fmt(w.value)}
-                  </p>
-                  {wfData.current_nw > 0 && (
-                    <p className="text-[11px] text-ink-muted tabular-nums">{((w.value / wfData.current_nw) * 100).toFixed(1)}% of NW</p>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* Attribution Over Time — cumulative stacked area showing how each
-          source contributed to NW month-over-month. */}
-      {wfData && wfData.time_series && wfData.time_series.length > 1 && (() => {
-        const hasDiv = wfData.time_series.some(t => Math.abs(t.dividends) >= 1);
-        const hasInt = wfData.time_series.some(t => Math.abs(t.interest) >= 1);
-        const hasAssets = wfData.time_series.some(t => Math.abs(t.assets ?? 0) >= 1);
-        const hasPropertyCosts = wfData.time_series.some(t => Math.abs(t.property_costs ?? 0) >= 1);
-        const legendData = ['Contributions', 'Market Returns'];
-        if (hasDiv) legendData.push('Dividends');
-        if (hasInt) legendData.push('Interest');
-        if (hasAssets) legendData.push('Physical assets');
-        if (hasPropertyCosts) legendData.push('Purchase costs & loan interest');
-        return (
-          <div className="border-t border-divider pt-6 py-3 md:py-5">
-            <h3 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Growth Over Time</h3>
-            <EChartWrapper option={{
-              tooltip: { trigger: 'axis' as const, formatter: (params: unknown) => {
-                const ps = params as { name: string; seriesName: string; value: number; marker: string }[];
-                if (!Array.isArray(ps) || ps.length === 0) return '';
-                const total = ps.reduce((s, p) => s + (p.value || 0), 0);
-                const rows = ps.map(p => `${p.marker}${p.seriesName}: <strong>${fmt(p.value)}</strong>`).join('<br/>');
-                return `${ps[0].name}<br/>${rows}<br/>━━━<br/>Net Worth: <strong>${fmt(total)}</strong>`;
-              }},
-              legend: { data: legendData, bottom: 0, textStyle: { fontSize: 11, color: tc.inkBody }, icon: 'circle' as const, itemWidth: 8, itemHeight: 8, itemGap: 12 },
-              grid: { top: 12, right: 12, bottom: 36, left: 52 },
-              xAxis: { type: 'category' as const, data: wfData.time_series.map(t => { const d = new Date(t.month + '-01'); return d.toLocaleDateString('de-DE', { month: 'short', year: '2-digit' }); }), axisLabel: { fontSize: 10, color: tc.inkMuted, interval: Math.max(Math.floor(wfData.time_series.length / 8) - 1, 0) }, axisLine: { lineStyle: { color: tc.divider } }, axisTick: { show: false } },
-              yAxis: { type: 'value' as const, axisLabel: { fontSize: 10, color: tc.inkMuted, formatter: (v: number) => v >= 1000 ? `${Math.round(v/1000)}K` : String(Math.round(v)) }, splitLine: { lineStyle: { color: tc.divider, type: 'dashed' as const } } },
-              series: [
-                { name: 'Contributions', type: 'line' as const, stack: 'attr', areaStyle: { opacity: 0.45, color: tc.forest }, data: wfData.time_series.map(t => t.contributions), itemStyle: { color: tc.forest }, showSymbol: false, lineStyle: { width: 1, color: tc.forest } },
-                { name: 'Market Returns', type: 'line' as const, stack: 'attr', areaStyle: { opacity: 0.45, color: tc.sage }, data: wfData.time_series.map(t => t.market_return), itemStyle: { color: tc.sage }, showSymbol: false, lineStyle: { width: 1, color: tc.sage } },
-                ...(hasDiv ? [{ name: 'Dividends', type: 'line' as const, stack: 'attr', areaStyle: { opacity: 0.45, color: tc.gold }, data: wfData.time_series.map(t => t.dividends), itemStyle: { color: tc.gold }, showSymbol: false, lineStyle: { width: 1, color: tc.gold } }] : []),
-                ...(hasInt ? [{ name: 'Interest', type: 'line' as const, stack: 'attr', areaStyle: { opacity: 0.45, color: tc.walnut }, data: wfData.time_series.map(t => t.interest), itemStyle: { color: tc.walnut }, showSymbol: false, lineStyle: { width: 1, color: tc.walnut } }] : []),
-                // Vehicle value change is usually negative (depreciation), so
-                // it sits on its own stack below the zero line.
-                ...(hasAssets ? [{ name: 'Physical assets', type: 'line' as const, stack: 'assets', areaStyle: { opacity: 0.45, color: tc.amber }, data: wfData.time_series.map(t => t.assets ?? 0), itemStyle: { color: tc.amber }, showSymbol: false, lineStyle: { width: 1, color: tc.amber } }] : []),
-                ...(hasPropertyCosts ? [{ name: 'Purchase costs & loan interest', type: 'line' as const, stack: 'costs', areaStyle: { opacity: 0.45, color: tc.claret }, data: wfData.time_series.map(t => t.property_costs ?? 0), itemStyle: { color: tc.claret }, showSymbol: false, lineStyle: { width: 1, color: tc.claret } }] : []),
-              ],
-            }} height="220px" />
-            {wfData.crossover_month && (
-              <p className="text-[12px] text-ink-muted mt-2">
-                Returns surpassed contributions in <span className="font-medium text-sage">{new Date(wfData.crossover_month + '-01').toLocaleDateString('de-DE', { month: 'long', year: 'numeric' })}</span>
-              </p>
-            )}
-          </div>
-        );
-      })()}
-
-      {/* Asset Allocation Donut — holdings-aware: brokerage cash is split from
-          securities, and securities are binned by their asset_class (etf/stock/
-          fund collapse into Equities; bond/commodity/crypto/derivative stand
-          alone). Non-brokerage account balances bin by account type. */}
-      {accounts.length > 1 && totalNetWorth > 0 && (() => {
-        const classLabelByType: Record<string, string> = {
-          checking: 'Cash', savings: 'Cash',
-          real_estate: 'Real Estate', pension: 'Pension', precious_metals: 'Gold',
-          liability: 'Liabilities', credit: 'Credit',
-        };
-        const assetClassLabels: Record<string, string> = {
-          etf: 'Equities', stock: 'Equities', fund: 'Equities',
-          bond: 'Bonds', commodity: 'Commodities',
-          crypto: 'Crypto', derivative: 'Derivatives',
-        };
-        const byClass: Record<string, number> = {};
-        const add = (label: string, value: number) => {
-          if (value === 0) return;
-          byClass[label] = (byClass[label] || 0) + value;
-        };
-        for (const acc of accounts) {
-          if (acc.type === 'brokerage') {
-            // Cash leg of the brokerage — Morgan Stanley etc. typically zero,
-            // but Trade Republic / IBKR carry real cash balances.
-            add('Cash', acc.cash_balance ?? 0);
-            continue;
-          }
-          add(classLabelByType[acc.type] || 'Other', acc.balance ?? 0);
-        }
-        // Brokerage holdings — bin by asset_class via the securities table.
-        // value_eur falls back to cost basis for unpriced positions, matching
-        // account balances, so the donut total reconciles with net worth.
-        for (const h of holdings) {
-          add(assetClassLabels[h.asset_class] || 'Other', h.value_eur ?? h.market_value ?? 0);
-        }
-        add('Property & vehicles (yours)', physicalYours);
-        const entries = Object.entries(byClass).filter(([, v]) => v !== 0).sort(([, a], [, b]) => Math.abs(b) - Math.abs(a));
-        if (entries.length < 2) return null;
-        return (
-          <div className="border-t border-divider pt-6 py-3 md:py-5">
-            <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Asset Allocation</h2>
-            <EChartWrapper option={{
-              tooltip: {
-                trigger: 'item' as const,
-                formatter: (params: unknown) => {
-                  const p = params as { name: string; value: number; percent: number };
-                  return `${p.name}<br/>${fmt(p.value)} (${p.percent.toFixed(1)}%)`;
-                },
-              },
-              series: [{
-                type: 'pie' as const,
-                radius: ['40%', '70%'],
-                avoidLabelOverlap: true,
-                minAngle: 2,
-                data: entries.map(([name, value]) => ({ name, value: Math.round(Math.abs(value)) })),
-                label: { fontSize: 12, color: tc.inkBody, formatter: (p: unknown) => {
-                  const e = p as { name: string; percent: number };
-                  return `${e.name} ${e.percent.toFixed(0)}%`;
-                }},
-                labelLine: { length: 10, length2: 6 },
-                itemStyle: { borderColor: tc.parchmentDeep, borderWidth: 2 },
-              }],
-              // Center label is the sum of the donut bins (not the snapshot
-              // total) so the number always reconciles with what the slices
-              // show — important now that bins are holdings-aware and can
-              // diverge from a lagging net-worth snapshot.
-              graphic: [{ type: 'text', left: 'center', top: 'center', style: { text: fmt(entries.reduce((s, [, v]) => s + Math.abs(v), 0)), fontSize: 16, fontWeight: 600, fill: tc.ink } }],
-            }} height="260px" />
-          </div>
-        );
-      })()}
-
-      {/* Single-security concentration warning — surfaces any holding whose
-          market value exceeds 10% of net worth. Amber at 10–25%, claret beyond. */}
-      {holdings.length > 0 && totalNetWorth > 0 && (() => {
-        const concentrated = holdings
-          .filter(h => h.market_value != null && h.market_value > 0 && (h.market_value / totalNetWorth) > 0.10)
-          .map(h => ({
-            name: h.name || h.security_isin,
-            value: h.market_value as number,
-            pct: ((h.market_value as number) / totalNetWorth) * 100,
-            severity: ((h.market_value as number) / totalNetWorth) > 0.25 ? 'critical' as const : 'warning' as const,
-          }))
-          .sort((a, b) => b.pct - a.pct);
-        if (concentrated.length === 0) return null;
-        return (
-          <div className="border-t border-divider pt-6 py-3 md:py-5">
-            <div className="flex items-center justify-between mb-3 md:mb-4 px-1 md:px-0">
-              <h2 className="font-serif text-heading text-ink">Concentration Risk</h2>
-              <span className="text-[11px] text-ink-muted">&gt;10% of net worth</span>
-            </div>
-            <div className="space-y-1.5">
-              {concentrated.map((c, i) => (
-                <div key={i} className={`flex items-start gap-2.5 rounded-r-xl bg-inset px-3 py-2.5 border-l-[3px] ${
-                  c.severity === 'critical' ? 'border-claret' : 'border-amber'
-                }`}>
-                  <span aria-hidden="true" className={`w-2 h-2 rounded-full shrink-0 mt-1.5 ${
-                    c.severity === 'critical' ? 'bg-claret' : 'bg-amber'
-                  }`} />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[13px] font-medium text-ink truncate">
-                      <span className={`text-[10px] uppercase tracking-wide mr-1.5 ${c.severity === 'critical' ? 'text-claret' : 'text-amber'}`}>
-                        {c.severity === 'critical' ? 'Critical' : 'Warning'}
-                      </span>
-                      <span data-privacy="blur">{c.name}</span>
-                    </p>
-                    <p className="text-[12px] text-ink-muted">
-                      <span data-privacy="blur" className="tabular-nums">{c.pct.toFixed(1)}%</span> of net worth · <span data-privacy="blur" className="tabular-nums">{fmt(c.value)}</span>
-                    </p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* Goal Progress */}
-      {goals.length > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:p-5 space-y-3">
-          {goals.map(g => (
-            <div key={g.id} className="py-2 border-b border-divider last:border-0">
-              <div className="flex items-center justify-between mb-1.5">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className={`w-2 h-2 rounded-full shrink-0 ${
-                    g.status === 'complete' ? 'bg-sage' :
-                    g.status === 'ahead' ? 'bg-sage' :
-                    g.status === 'on_track' ? 'bg-forest' :
-                    'bg-amber'
-                  }`} />
-                  <span className="text-[15px] font-medium text-ink truncate">{g.name}</span>
-                </div>
-                <span className="text-[12px] text-ink-muted shrink-0 ml-2">
-                  {g.status === 'complete' ? 'Complete' :
-                   g.status === 'ahead' ? 'Ahead' :
-                   g.status === 'on_track' ? 'On track' :
-                   `Behind — projected ${fmt(g.projected_value)}`}
-                </span>
-              </div>
-              {(() => {
-                // Clamp the bar to [0, 100] — progress_pct can land outside
-                // when the model reports overshoot or pre-funded goals.
-                const clampedPct = Math.max(0, Math.min(g.progress_pct, 100));
-                // Estimated completion date = today + months_remaining, when
-                // we still have a finite trajectory. For complete/ahead goals
-                // we surface the user-set target_date instead so the tooltip
-                // stays useful.
-                let estimateLabel = '';
-                if (g.status === 'complete') {
-                  estimateLabel = 'Reached';
-                } else if (g.months_remaining > 0) {
-                  const est = new Date();
-                  est.setMonth(est.getMonth() + g.months_remaining);
-                  estimateLabel = `Estimated ${est.toLocaleDateString('de-DE', { month: 'short', year: 'numeric' })}`;
-                } else if (g.target_date) {
-                  estimateLabel = `Target ${new Date(g.target_date).toLocaleDateString('de-DE', { month: 'short', year: 'numeric' })} — past due`;
-                }
-                return (
-                  <div className="flex items-center gap-3" title={estimateLabel}>
-                    <div role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(clampedPct)} aria-label={`${g.name} progress: ${clampedPct.toFixed(1)}%${estimateLabel ? `, ${estimateLabel.toLowerCase()}` : ''}`} className="flex-1 h-2 rounded-full bg-parchment-deep overflow-hidden">
-                      <div
-                        className={`h-full rounded-full transition-all duration-500 ${
-                          g.status === 'complete' || g.status === 'ahead' ? 'bg-sage' :
-                          g.status === 'on_track' ? 'bg-forest' : 'bg-amber'
-                        }`}
-                        style={{ width: `${clampedPct}%` }}
-                      />
-                    </div>
-                    <span className="text-[12px] tabular-nums text-ink-muted shrink-0 w-24 text-right">
-                      {fmt(g.current_value)} / {fmt(g.target_amount)}
-                    </span>
-                  </div>
-                );
-              })()}
-              <div className="flex items-center justify-between mt-1">
-                <span className="text-[11px] text-ink-muted">
-                  {g.progress_pct.toFixed(1)}% — {g.months_remaining > 0 ? `${Math.floor(g.months_remaining / 12)}y ${g.months_remaining % 12}m remaining` : 'past due'}
-                </span>
-                {g.monthly_contribution > 0 && (
-                  <span className="text-[11px] text-ink-muted">
-                    {fmt(g.monthly_contribution)}/mo
-                  </span>
-                )}
-              </div>
-            </div>
-          ))}
-
-          {/* Goal-Asset Mismatch Detection */}
-          {(() => {
-            const mismatches: { goal: string; severity: 'critical' | 'moderate' | 'info'; message: string }[] = [];
-
-            goals.forEach(g => {
-              const fundingAccount = g.funding_account_id ? accounts.find(a => a.id === g.funding_account_id) : null;
-              const yearsLeft = g.months_remaining / 12;
-
-              // Critical: short-horizon goal (<3 years) funded by equities
-              if (yearsLeft > 0 && yearsLeft < 3 && fundingAccount?.type === 'brokerage') {
-                mismatches.push({ goal: g.name, severity: 'critical', message: `Due in ${Math.ceil(yearsLeft)}y but funded by brokerage (equities). A market crash could prevent reaching the target. Consider moving to cash or bonds.` });
-              }
-              // Moderate: long-horizon goal (>10 years) sitting in cash
-              if (yearsLeft > 10 && fundingAccount && (fundingAccount.type === 'checking' || fundingAccount.type === 'savings')) {
-                mismatches.push({ goal: g.name, severity: 'moderate', message: `${Math.floor(yearsLeft)}y horizon but funded by ${fundingAccount.type}. Cash returns may not keep pace with inflation. Consider equities for long-term growth.` });
-              }
-              // Over-funded
-              if (g.progress_pct > 110) {
-                mismatches.push({ goal: g.name, severity: 'info', message: `${g.progress_pct.toFixed(0)}% funded (${fmt(g.current_value - g.target_amount)} above target). Consider reallocating excess to other goals.` });
-              }
-              // Shortfall probability: behind schedule and less than half the time remaining
-              if (g.status === 'behind' && g.months_remaining > 0 && g.progress_pct < 50 && yearsLeft < 5) {
-                const shortfall = g.target_amount - g.projected_value;
-                if (shortfall > 0) {
-                  mismatches.push({ goal: g.name, severity: 'critical', message: `Projected ${fmt(shortfall)} shortfall. Increase contributions by ${fmt(shortfall / g.months_remaining)}/mo to close the gap.` });
-                }
-              }
-            });
-
-            if (mismatches.length === 0) return null;
-
+          {savedScenarios.map((s, i) => {
+            const on = activeScenarios.has(i);
             return (
-              <div className="mt-3 pt-3 border-t border-divider">
-                <p className="font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em] mb-2">Mismatch Alerts</p>
-                <div className="space-y-1.5">
-                  {mismatches.map((m, i) => (
-                    <div key={i} className={`flex items-start gap-2.5 rounded-xl px-3 py-2 ${
-                      m.severity === 'critical' ? 'bg-inset border-l-[3px] border-claret' : m.severity === 'moderate' ? 'bg-inset border-l-[3px] border-amber' : 'bg-inset border-l-[3px] border-sage'
-                    }`}>
-                      <span className={`w-2 h-2 rounded-full shrink-0 mt-1.5 ${
-                        m.severity === 'critical' ? 'bg-claret' : m.severity === 'moderate' ? 'bg-amber' : 'bg-sage'
-                      }`} />
-                      <div>
-                        <p className="text-[13px] font-medium text-ink">{m.goal}</p>
-                        <p className="text-[12px] text-ink-muted">{m.message}</p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            );
-          })()}
-        </div>
-      )}
-
-      {/* Glide Path — recommended allocation per goal */}
-      {goals.length > 0 && goals.some(g => g.months_remaining > 0) && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-1 px-1 md:px-0">Glide Path</h2>
-          <p className="text-[13px] text-ink-muted mb-3 md:mb-4 px-1 md:px-0">
-            Recommended equity allocation decreases as each goal approaches its target date.
-          </p>
-
-          {(() => {
-            // Glide path formula: equity% = min(100, max(0, (years - 2) / 18 * 100))
-            const glideEquity = (yearsLeft: number) => Math.min(100, Math.max(0, Math.round((yearsLeft - 2) / 18 * 100)));
-
-            const goalPaths = goals.filter(g => g.months_remaining > 0).map(g => {
-              const yearsLeft = g.months_remaining / 12;
-              const recommended = glideEquity(yearsLeft);
-              const fundingAccount = g.funding_account_id ? accounts.find(a => a.id === g.funding_account_id) : null;
-              // Approximate: brokerage ~90% equity, savings 0%, other 50%
-              const actual = fundingAccount?.type === 'brokerage' ? 90 : fundingAccount?.type === 'savings' ? 0 : fundingAccount?.type === 'checking' ? 0 : 50;
-              const drift = actual - recommended;
-
-              return { name: g.name, yearsLeft, recommended, actual, drift, targetDate: g.target_date };
-            });
-
-            // Chart: glide path curve + goal positions
-            const chartData: number[][] = [];
-            for (let y = 0; y <= 30; y++) {
-              chartData.push([y, glideEquity(y)]);
-            }
-
-            return (
-              <>
-                <EChartWrapper option={{
-                  tooltip: { trigger: 'axis' as const },
-                  xAxis: { type: 'value' as const, name: 'Years to Goal', nameLocation: 'middle' as const, nameGap: 25, min: 0, max: 30, axisLabel: { fontSize: 11, color: tc.inkMuted }, splitLine: { show: false } },
-                  yAxis: { type: 'value' as const, name: 'Equity %', min: 0, max: 100, axisLabel: { formatter: (v: number) => `${v}%`, fontSize: 11, color: tc.inkMuted }, splitLine: { lineStyle: { color: tc.divider } } },
-                  series: [
-                    { name: 'Recommended', type: 'line' as const, data: chartData, smooth: 0.4, showSymbol: false, lineStyle: { color: tc.forest, width: 2 }, areaStyle: { opacity: 0.06, color: tc.forest } },
-                    { name: 'Your Goals', type: 'scatter' as const, data: goalPaths.map(g => [Math.round(g.yearsLeft * 10) / 10, g.actual]), symbolSize: 12, itemStyle: { color: tc.gold } },
-                  ],
-                  grid: { left: 50, right: 20, top: 10, bottom: 40 },
-                  legend: { data: ['Recommended', 'Your Goals'], bottom: 0, textStyle: { fontSize: 11, color: tc.inkMuted } },
-                }} height="220px" />
-
-                <div className="mt-3 space-y-1 px-1 md:px-0">
-                  {goalPaths.map(g => (
-                    <div key={g.name} className="flex items-center justify-between rounded-lg bg-parchment-deep px-3 py-1.5">
-                      <div className="min-w-0 flex-1">
-                        <p className="text-[13px] text-ink truncate">{g.name}</p>
-                        <p className="text-[11px] text-ink-muted">{g.yearsLeft.toFixed(1)}y remaining</p>
-                      </div>
-                      <div className="flex items-center gap-3 shrink-0 ml-3">
-                        <div className="text-right">
-                          <p className="text-[11px] text-ink-muted">Recommended</p>
-                          <p className="text-[13px] tabular-nums text-forest font-medium">{g.recommended}% equity</p>
-                        </div>
-                        <div className="text-right">
-                          <p className="text-[11px] text-ink-muted">Actual</p>
-                          <p className={`text-[13px] tabular-nums font-medium ${Math.abs(g.drift) > 20 ? 'text-claret' : Math.abs(g.drift) > 10 ? 'text-amber' : 'text-sage'}`}>{g.actual}% equity</p>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </>
-            );
-          })()}
-        </div>
-      )}
-
-      {/* Goal Priority & Shortfall — budget is set on the Planning page
-          (Contribution Router); read it from localStorage so the shortfall
-          check works without dragging that state into NetWorth. */}
-      {goals.length > 1 && (() => {
-        const totalNeeded = goals.reduce((s, g) => s + g.monthly_contribution, 0);
-        const budget = parseFloat(localStorage.getItem('monthly_invest_budget') || '') || 0;
-        const hasShortfall = budget > 0 && totalNeeded > budget;
-
-        if (!hasShortfall && goals.every(g => g.status !== 'behind')) return null;
-
-        // Priority order: lower number = higher priority
-        const priorityLabels: Record<number, string> = { 10: 'Emergency', 20: 'Employer Match', 30: 'Debt Payoff', 40: 'Time-Sensitive', 50: 'Long-Term' };
-        const sorted = [...goals].sort((a, b) => (a.priority || 50) - (b.priority || 50));
-
-        let remaining = budget;
-        const allocations = sorted.map(g => {
-          const needed = g.monthly_contribution;
-          const allocated = hasShortfall ? Math.min(needed, Math.max(0, remaining)) : needed;
-          remaining -= allocated;
-          const shortfall = needed - allocated;
-          const priorityLabel = priorityLabels[g.priority] || `Priority ${g.priority}`;
-          return { ...g, allocated, shortfall, priorityLabel };
-        });
-
-        return (
-          <div className="border-t border-divider pt-6 py-3 md:py-5">
-            <h2 className="font-serif text-heading text-ink mb-1 px-1 md:px-0">Goal Priority</h2>
-            <p className="text-[13px] text-ink-muted mb-3 md:mb-4 px-1 md:px-0">
-              {hasShortfall
-                ? `Budget shortfall: ${fmt(totalNeeded)}/mo needed but only ${fmt(budget)}/mo available. Contributions allocated by priority.`
-                : 'Goals ranked by priority. Adjust priority in Settings to control allocation order.'}
-            </p>
-
-            <div className="space-y-1.5 px-1 md:px-0">
-              {allocations.map((g, i) => (
-                <div key={g.id} className="flex items-center justify-between rounded-xl bg-parchment-deep px-3 py-2">
-                  <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                    <span className="text-[12px] text-ink-muted w-5 shrink-0">{i + 1}.</span>
-                    <div className="min-w-0">
-                      <p className="text-[14px] text-ink truncate">{g.name}</p>
-                      <p className="text-[11px] text-ink-muted">{g.priorityLabel} · {g.months_remaining > 0 ? `${Math.ceil(g.months_remaining / 12)}y left` : 'past due'}</p>
-                    </div>
-                  </div>
-                  <div className="text-right shrink-0 ml-3">
-                    {hasShortfall ? (
-                      <>
-                        <p className={`text-[13px] tabular-nums font-medium ${g.shortfall > 0 ? 'text-claret' : 'text-sage'}`}>
-                          {fmt(g.allocated)}/mo
-                        </p>
-                        {g.shortfall > 0 && (
-                          <p className="text-[11px] text-claret tabular-nums">-{fmt(g.shortfall)} unfunded</p>
-                        )}
-                      </>
-                    ) : (
-                      <p className={`text-[13px] tabular-nums font-medium ${g.status === 'behind' ? 'text-amber' : 'text-sage'}`}>
-                        {fmt(g.monthly_contribution)}/mo
-                      </p>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            {hasShortfall && (
-              <p className="text-[12px] text-claret mt-3 px-1 md:px-0">
-                Increase monthly budget by {fmt(totalNeeded - budget)} to fully fund all goals.
-              </p>
-            )}
-          </div>
-        );
-      })()}
-
-      </>)}
-
-      {activeTab === 'projection' && (<>
-      {/* Wealth Projection */}
-      {projData && (projData.history.length > 0 || projData.projection.length > 0) && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Wealth Projection</h2>
-          <p className="text-[13px] text-ink-muted mb-4">
-            Historical trend + projected growth{projData.target_amount > 0 ? ` toward ${fmt(projData.target_amount)} goal` : ''}
-          </p>
-
-          {/* What-if sliders */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
-            <div className="flex items-center gap-2">
-              <label className="text-[12px] text-ink-muted shrink-0 w-28">Monthly</label>
-              <input aria-label="Monthly contribution" type="range" min="0" max="5000" step="100" value={projContrib}
-                onChange={e => setProjContrib(e.target.value)}
-                className="flex-1 accent-forest" />
-              <span className="text-[13px] tabular-nums w-16 text-right">{fmt(parseFloat(projContrib) || 0)}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <label className="text-[12px] text-ink-muted shrink-0 w-28">Return</label>
-              <input aria-label="Expected return" type="range" min="0" max="15" step="0.5" value={projReturn}
-                onChange={e => setProjReturn(e.target.value)}
-                className="flex-1 accent-forest" />
-              <span className="text-[13px] tabular-nums w-12 text-right">{projReturn}%</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <label className="text-[12px] text-ink-muted shrink-0 w-28">Horizon</label>
-              <input aria-label="Time horizon in years" type="range" min="1" max="50" step="1" value={projHorizon}
-                onChange={e => { setProjHorizon(e.target.value); localStorage.setItem('proj_horizon', e.target.value); }}
-                className="flex-1 accent-forest" />
-              <span className="text-[13px] tabular-nums w-16 text-right">{projHorizon} {parseInt(projHorizon) === 1 ? 'year' : 'years'}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <label className="text-[12px] text-ink-muted shrink-0 w-28">Contrib growth</label>
-              <input aria-label="Annual contribution growth rate" type="range" min="0" max="20" step="0.5" value={projContribGrowth}
-                onChange={e => { setProjContribGrowth(e.target.value); localStorage.setItem('proj_contrib_growth', e.target.value); }}
-                className="flex-1 accent-forest" />
-              <span className="text-[13px] tabular-nums w-12 text-right">{projContribGrowth}%/yr</span>
-            </div>
-          </div>
-
-          {/* Save / Compare Scenarios */}
-          <div className="flex flex-wrap items-center gap-2 mb-4">
-            <button
-              onClick={() => {
-                if (savedScenarios.length >= 3) return;
-                const name = `${fmt(parseFloat(projContrib) || 0)}/mo @ ${projReturn}%`;
-                const scenario = { name, contribution: parseFloat(projContrib) || 0, return_pct: parseFloat(projReturn) || 7, projection: projData?.projection || [] };
-                const updated = [...savedScenarios, scenario];
-                setSavedScenarios(updated);
-                localStorage.setItem('proj_scenarios', JSON.stringify(updated));
-                setActiveScenarios(prev => new Set([...prev, updated.length - 1]));
-              }}
-              disabled={savedScenarios.length >= 3}
-              className="rounded-[8px] bg-parchment-deep text-ink-body px-3 py-1.5 text-[12px] font-medium hover:bg-divider disabled:opacity-40"
-            >
-              Save Scenario ({savedScenarios.length}/3)
-            </button>
-            {savedScenarios.map((s, i) => (
-              <div key={i} className="flex items-center gap-1">
+              <span key={i} className="inline-flex items-stretch rounded-[4px] border border-field">
                 <button
+                  type="button"
+                  aria-pressed={on}
                   onClick={() => setActiveScenarios(prev => {
                     const next = new Set(prev);
-                    next.has(i) ? next.delete(i) : next.add(i);
+                    if (next.has(i)) next.delete(i); else next.add(i);
                     return next;
                   })}
-                  className={`rounded-[8px] px-2 py-1 text-[11px] font-medium transition-colors ${
-                    activeScenarios.has(i)
-                      ? 'bg-parchment-deep border border-forest text-forest'
-                      : 'bg-parchment-deep text-ink-muted'
-                  }`}
+                  className={`min-h-[44px] md:min-h-[36px] px-3 text-[13px] rounded-l-[3px] transition-colors ${on ? 'bg-forest text-parchment font-semibold' : 'text-ink-body font-medium hover:text-ink'}`}
                 >
-                  {s.name}
+                  <span data-privacy="blur">{s.name}</span>{on ? ' · shown' : ''}
                 </button>
                 <button
-                  onClick={() => {
-                    const updated = savedScenarios.filter((_, j) => j !== i);
-                    setSavedScenarios(updated);
-                    localStorage.setItem('proj_scenarios', JSON.stringify(updated));
-                    setActiveScenarios(prev => {
-                      const next = new Set<number>();
-                      prev.forEach(idx => { if (idx < i) next.add(idx); else if (idx > i) next.add(idx - 1); });
-                      return next;
-                    });
-                  }}
-                  className="text-ink-muted hover:text-claret text-[11px]"
+                  type="button"
+                  onClick={() => deleteScenario(i)}
+                  aria-label={`Delete scenario ${s.name}…`}
+                  className="min-h-[44px] md:min-h-[36px] min-w-[44px] md:min-w-[36px] inline-flex items-center justify-center border-l border-field text-ink-muted hover:text-claret"
                 >
-                  ×
+                  <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
                 </button>
-              </div>
-            ))}
-          </div>
+              </span>
+            );
+          })}
+        </div>
 
-          <EChartWrapper option={{
+        <ChartLegend items={legend} className="mb-2" />
+        <EChartWrapper
+          height="340px"
+          option={{
             tooltip: {
               trigger: 'axis' as const,
               formatter: (params: unknown) => {
-                const ps = params as { seriesName: string; data: number; axisValue: string; marker: string }[];
+                const ps = params as { seriesName: string; data: number | null; dataIndex: number; marker: string }[];
                 if (!Array.isArray(ps) || ps.length === 0) return '';
-                return `${ps[0].axisValue}<br/>${ps.filter(p => p.data != null).map(p => `${p.marker} ${p.seriesName}: ${fmt(p.data)}`).join('<br/>')}`;
+                const idx = ps[0].dataIndex;
+                const dateKey = idx < hist.length ? hist[idx].date : proj[idx - hist.length]?.date ?? '';
+                const projPt = idx >= hist.length ? proj[idx - hist.length] : undefined;
+                const rows = ps.filter(p => p.data != null).map(p => {
+                  const val = p.seriesName === '90th percentile' && projPt?.p90 != null ? projPt.p90 : (p.data as number);
+                  return `${p.marker} ${escapeHtml(p.seriesName)}: ${fmtEUR(val)}`;
+                });
+                return `${escapeHtml(fmtMonth(monthDate(dateKey)))}<br/>${rows.join('<br/>')}`;
               },
             },
-            legend: {
-              data: ['Historical', 'Projected', ...(projData.target_amount > 0 ? ['Target'] : []), ...savedScenarios.filter((_, i) => activeScenarios.has(i)).map(s => s.name)],
-              bottom: 0, textStyle: { fontSize: 11, color: tc.inkMuted },
-            },
+            grid: { left: 4, right: 30, top: 12, bottom: 4, containLabel: true },
             xAxis: {
               type: 'category' as const,
-              data: [...projData.history.map(h => h.date), ...projData.projection.map(p => p.date)],
-              axisLabel: {
-                fontSize: 11, color: tc.inkMuted,
-                interval: Math.max(Math.floor((projData.history.length + projData.projection.length) / 10) - 1, 1),
-              },
-              axisLine: { show: false }, axisTick: { show: false }, boundaryGap: false,
+              boundaryGap: false,
+              data: [...hist.map(h => fmtMonthShort(monthDate(h.date))), ...proj.map(p => fmtMonthShort(monthDate(p.date)))],
             },
-            yAxis: {
-              type: 'value' as const,
-              axisLabel: { formatter: (v: number) => v >= 1000000 ? `${(v/1000000).toFixed(1)}M` : v >= 1000 ? `${(v/1000).toFixed(0)}k` : `${v}`, fontSize: 11, color: tc.inkMuted },
-              splitLine: { lineStyle: { color: tc.divider } },
-            },
+            yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
             series: [
               {
-                name: 'Historical',
-                type: 'line' as const,
-                data: [...projData.history.map(h => h.value), ...projData.projection.map(() => null)],
-                smooth: 0.3,
-                showSymbol: false,
-                lineStyle: { color: tc.forest, width: 2 },
-                areaStyle: { color: 'rgba(0, 122, 255, 0.08)' },
+                name: 'Historical', type: 'line' as const, color: tc.forest,
+                data: [...hist.map(h => h.value), ...proj.map(() => null)],
+                showSymbol: false, lineStyle: { width: 2 },
               },
               {
-                name: 'Projected',
-                type: 'line' as const,
-                data: [...projData.history.map(() => null), ...projData.projection.map(p => p.value)],
-                smooth: 0.3,
-                showSymbol: false,
-                lineStyle: { color: tc.sage, width: 2, type: 'dashed' as const },
-                areaStyle: { color: 'rgba(52, 199, 89, 0.06)' },
+                name: 'Projected', type: 'line' as const, color: tc.gold,
+                data: [...hist.map(() => null), ...proj.map(p => p.value)],
+                showSymbol: false, lineStyle: { width: 2, type: 'dashed' as const },
               },
               ...(projData.has_confidence ? [
                 {
-                  name: 'P90 (optimistic)',
-                  type: 'line' as const,
-                  data: [...projData.history.map(() => null), ...projData.projection.map(p => p.p90 ?? null)],
-                  smooth: 0.3, showSymbol: false,
-                  lineStyle: { width: 0 },
-                  areaStyle: { color: 'rgba(52, 199, 89, 0.10)' },
-                  stack: 'confidence',
+                  name: '10th percentile', type: 'line' as const, color: tc.gold, stack: 'confidence',
+                  data: [...hist.map(() => null), ...proj.map(p => p.p10 ?? null)],
+                  showSymbol: false, lineStyle: { width: 0 },
                 },
                 {
-                  name: 'P10 (pessimistic)',
-                  type: 'line' as const,
-                  data: [...projData.history.map(() => null), ...projData.projection.map(p => {
-                    if (p.p10 != null && p.p90 != null) return p.p90 - p.p10;
-                    return null;
-                  })],
-                  smooth: 0.3, showSymbol: false,
-                  lineStyle: { width: 0 },
-                  areaStyle: { color: 'rgba(52, 199, 89, 0.10)' },
-                  stack: 'confidence',
+                  name: '90th percentile', type: 'line' as const, color: tc.gold, stack: 'confidence',
+                  data: [...hist.map(() => null), ...proj.map(p => (p.p10 != null && p.p90 != null ? Math.max(0, p.p90 - p.p10) : null))],
+                  showSymbol: false, lineStyle: { width: 0 }, areaStyle: { color: tc.gold, opacity: 0.16 },
                 },
               ] : []),
               ...(projData.target_amount > 0 ? [{
-                name: 'Target',
-                type: 'line' as const,
-                data: [...projData.history.map(() => null), ...projData.projection.map(() => projData.target_amount)],
-                showSymbol: false,
-                lineStyle: { color: tc.gold, width: 1.5, type: 'dotted' as const },
+                name: 'Target', type: 'line' as const, color: tc.slate,
+                data: [...hist.map(() => null), ...proj.map(() => projData.target_amount)],
+                showSymbol: false, lineStyle: { width: 1.5, type: 'dotted' as const },
               }] : []),
-              // Saved scenarios overlay
-              ...savedScenarios.filter((_, i) => activeScenarios.has(i)).map((s, i) => {
-                const colors = [tc.walnut, tc.claret, tc.slate];
-                const projDates = projData.projection.map(p => p.date);
-                const scenarioMap = new Map(s.projection.map(p => [p.date, p.value]));
+              ...shownScenarios.map(({ s }, k) => {
+                const byDate = new Map(s.projection.map(p => [p.date, p.value]));
                 return {
-                  name: s.name,
-                  type: 'line' as const,
-                  data: [...projData.history.map(() => null), ...projDates.map(d => scenarioMap.get(d) ?? null)],
-                  smooth: 0.3, showSymbol: false,
-                  lineStyle: { color: colors[i % colors.length], width: 1.5, type: 'dashed' as const },
+                  name: s.name, type: 'line' as const, color: scenarioColors[k % scenarioColors.length],
+                  data: [...hist.map(() => null), ...proj.map(p => byDate.get(p.date) ?? null)],
+                  showSymbol: false, lineStyle: { width: 1.5, type: 'dashed' as const },
                 };
               }),
             ],
-            grid: { left: 55, right: 16, top: 16, bottom: 40 },
-          }} height="320px" />
-        </div>
-      )}
+          }}
+        />
+      </Section>
 
-      {/* Projection Milestones */}
-      {projData?.milestones && projData.milestones.length > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Projection Milestones</h2>
-          <p className="text-[13px] text-ink-muted mb-3">
-            Projected net worth at key milestones, assuming {projData.return_pct}% annual return and {fmt(projData.contribution)}/mo contributions.
-          </p>
-          {/* Mobile: card layout */}
-          <div className="md:hidden space-y-2">
-            {(showAllMilestones ? projData.milestones : projData.milestones.slice(0, 2)).map(m => (
-              <div key={m.year} className="rounded-lg bg-parchment-deep px-3 py-2">
-                <div className="flex items-baseline justify-between mb-1">
-                  <span className="text-[13px] font-semibold text-ink">{m.year} <span className="text-ink-muted font-normal">+{m.years_from_now}y</span></span>
-                  <span className="text-[13px] font-semibold tabular-nums">{fmt(m.projected_value)}</span>
-                </div>
-                <div className="grid grid-cols-3 gap-x-3 text-[11px] tabular-nums">
-                  <div><span className="text-ink-muted">Contributed</span><br/><span>{fmt(m.contributions)}</span></div>
-                  <div><span className="text-ink-muted">Growth</span><br/><span className="text-sage font-medium">{fmt(m.growth)}</span></div>
-                  <div><span className="text-ink-muted">Real</span><br/><span>{fmt(m.real_value)}</span></div>
-                </div>
-              </div>
-            ))}
-          </div>
-          {/* Desktop: table */}
-          <div className="hidden md:block overflow-x-auto">
-            <table className="w-full text-[13px]">
-              <thead>
-                <tr className="text-ink-muted border-b border-divider">
-                  <th className="px-2 py-2 text-left font-medium">Year</th>
-                  <th className="px-2 py-2 text-right font-medium">Projected</th>
-                  <th className="px-2 py-2 text-right font-medium">Contributed</th>
-                  <th className="px-2 py-2 text-right font-medium">Growth</th>
-                  <th className="px-2 py-2 text-right font-medium">Real (2% infl.)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(showAllMilestones ? projData.milestones : projData.milestones.slice(0, 2)).map(m => (
-                  <tr key={m.year} className="border-b border-divider">
-                    <td className="px-2 py-2 tabular-nums">
-                      <span className="font-medium">{m.year}</span>
-                      <span className="text-ink-muted ml-1">+{m.years_from_now}y</span>
-                    </td>
-                    <td className="px-2 py-2 text-right tabular-nums font-medium">{fmt(m.projected_value)}</td>
-                    <td className="px-2 py-2 text-right tabular-nums text-ink-muted">{fmt(m.contributions)}</td>
-                    <td className="px-2 py-2 text-right tabular-nums text-sage font-medium">{fmt(m.growth)}</td>
-                    <td className="px-2 py-2 text-right tabular-nums text-ink-muted">{fmt(m.real_value)}</td>
+      {milestones.length > 0 && (
+        <SectionBoundary>
+          <Section
+            title="Projection Milestones"
+            subtitle={<>Projected liquid wealth, assuming a return of {fmtPct(projData.return_pct)} per year and <span data-privacy="blur">{fmtEUR(projData.contribution)}</span> paid in each month. “Real” is in today’s money at 2 % inflation.</>}
+          >
+            {/* Phones: cards */}
+            <ul className="md:hidden flex flex-col gap-2.5">
+              {shownMilestones.map(m => (
+                <li key={m.year} className="apple-card px-4 py-3">
+                  <div className="flex items-baseline justify-between gap-3 mb-1.5">
+                    <span className="text-[14px] font-semibold text-ink">{m.year} <span className="text-ink-muted font-normal">in {m.years_from_now} years</span></span>
+                    <span className="text-[14px] font-semibold text-ink" data-privacy="blur">{fmtEUR(m.projected_value)}</span>
+                  </div>
+                  <dl className="grid grid-cols-3 gap-x-3 text-[12px]">
+                    <div><dt className="text-ink-muted">Contributed</dt><dd className="text-ink" data-privacy="blur">{fmtEUR(m.contributions)}</dd></div>
+                    <div><dt className="text-ink-muted">Growth</dt><dd className="text-ink" data-privacy="blur">{fmtEUR(m.growth, { sign: true })}</dd></div>
+                    <div><dt className="text-ink-muted">Real</dt><dd className="text-ink" data-privacy="blur">{fmtEUR(m.real_value)}</dd></div>
+                  </dl>
+                </li>
+              ))}
+            </ul>
+            <div className="hidden md:block apple-card overflow-x-auto" role="region" tabIndex={0} aria-label="Projection milestones">
+              <table className="apple-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Year</th>
+                    <th scope="col" className="num">Projected</th>
+                    <th scope="col" className="num">Contributed</th>
+                    <th scope="col" className="num">Growth</th>
+                    <th scope="col" className="num">Real</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {projData.milestones.length > 2 && (
-            <button onClick={() => setShowAllMilestones(prev => !prev)}
-              className="w-full mt-2 py-1.5 text-[13px] text-forest font-medium">
-              {showAllMilestones ? 'Show less' : `Show all ${projData.milestones.length} milestones`}
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* Projection Accuracy */}
-      {projData?.projection_accuracy && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Projection Accuracy</h2>
-          <p className="text-[13px] text-ink-muted mb-3">
-            {projData.projection_accuracy.diff_pct >= 0
-              ? `You are outperforming your ${projData.projection_accuracy.months_ago}-month-ago projection by ${projData.projection_accuracy.diff_pct}%.`
-              : `Your portfolio is ${Math.abs(projData.projection_accuracy.diff_pct)}% below the ${projData.projection_accuracy.months_ago}-month-ago projection.`}
-          </p>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <div className="rounded-xl bg-parchment-deep p-3 text-center">
-              <p className="text-[12px] text-ink-muted mb-1">Then</p>
-              <p className="text-[13px] md:text-[15px] font-semibold tabular-nums">{fmt(projData.projection_accuracy.past_value)}</p>
-            </div>
-            <div className="rounded-xl bg-parchment-deep p-3 text-center">
-              <p className="text-[12px] text-ink-muted mb-1">Projected</p>
-              <p className="text-[13px] md:text-[15px] font-semibold tabular-nums">{fmt(projData.projection_accuracy.projected_value)}</p>
-            </div>
-            <div className="rounded-xl bg-parchment-deep p-3 text-center">
-              <p className="text-[12px] text-ink-muted mb-1">Actual</p>
-              <p className="text-[13px] md:text-[15px] font-semibold tabular-nums">{fmt(projData.projection_accuracy.actual_value)}</p>
-            </div>
-            <div className={`rounded-xl p-3 text-center ${Math.abs(projData.projection_accuracy.diff_pct) <= 5 ? 'bg-inset border-l-[3px] border-sage' : Math.abs(projData.projection_accuracy.diff_pct) <= 15 ? 'bg-inset border-l-[3px] border-amber' : 'bg-inset border-l-[3px] border-claret'}`}>
-              <p className="text-[12px] text-ink-muted mb-1">Difference</p>
-              <p className={`text-[13px] md:text-[15px] font-semibold tabular-nums ${projData.projection_accuracy.diff_eur >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {projData.projection_accuracy.diff_eur >= 0 ? '+' : ''}{fmt(projData.projection_accuracy.diff_eur)}
-              </p>
-              <p className="text-[11px] text-ink-muted mt-0.5">
-                {projData.projection_accuracy.diff_pct >= 0 ? '+' : ''}{projData.projection_accuracy.diff_pct}%
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Sensitivity Analysis */}
-      {projData?.sensitivity && projData.sensitivity.length > 0 && projData.projection_end && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Sensitivity Analysis</h2>
-          <p className="text-[13px] text-ink-muted mb-3">
-            How changing each assumption affects your projected outcome ({fmt(projData.projection_end)} baseline).
-          </p>
-          <EChartWrapper option={{
-            tooltip: {
-              trigger: 'axis' as const,
-              formatter: (params: unknown) => {
-                const ps = params as { seriesName: string; data: number; name: string; marker: string }[];
-                if (!Array.isArray(ps)) return '';
-                return `${ps[0].name}<br/>${ps.map(p => `${p.marker} ${p.seriesName}: ${fmt(p.data)}`).join('<br/>')}`;
-              },
-            },
-            legend: { data: ['Pessimistic', 'Optimistic'], bottom: 0, textStyle: { fontSize: 11, color: tc.inkMuted } },
-            xAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => v >= 1000000 ? `${(v/1000000).toFixed(1)}M` : v >= 1000 ? `${(v/1000).toFixed(0)}k` : `${v}`, fontSize: 11, color: tc.inkMuted }, splitLine: { lineStyle: { color: tc.divider } } },
-            yAxis: { type: 'category' as const, data: projData.sensitivity.map(s => s.label), axisLabel: { fontSize: 12, color: tc.inkBody } },
-            series: [
-              { name: 'Pessimistic', type: 'bar' as const, data: projData.sensitivity.map(s => s.low), itemStyle: { color: tc.claret, borderRadius: [4, 0, 0, 4] }, barMaxWidth: 24 },
-              { name: 'Optimistic', type: 'bar' as const, data: projData.sensitivity.map(s => s.high), itemStyle: { color: tc.sage, borderRadius: [0, 4, 4, 0] }, barMaxWidth: 24 },
-            ],
-            grid: { left: 120, right: 20, top: 10, bottom: 40 },
-          }} height="180px" />
-        </div>
-      )}
-      </>)}
-
-
-      {activeTab === 'assets' && <AssetsTab onNetWorthChanged={loadData} />}
-
-      {activeTab === 'accounts' && (<>
-      {/* Net Worth Chart — detailed stacked view */}
-      {chartSnapshots.length > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Breakdown Over Time</h2>
-          <EChartWrapper option={chartOption} height="280px" />
-        </div>
-      )}
-
-      {/* Counterparty Exposure */}
-      {accounts.length > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Counterparty Exposure</h2>
-          {(() => {
-            const institutions: Record<string, { cash: number; securities: number; scheme: string; accounts: string[] }> = {};
-            accounts.forEach(a => {
-              const inst = a.institution;
-              if (!institutions[inst]) {
-                institutions[inst] = { cash: 0, securities: 0, scheme: inst === 'sparkasse' ? 'Institutssicherung' : 'Einlagensicherung', accounts: [] };
-              }
-              institutions[inst].accounts.push(a.name);
-              if (a.type === 'checking' || a.type === 'savings') {
-                institutions[inst].cash += a.balance ?? 0;
-              } else if (a.type === 'brokerage') {
-                institutions[inst].securities += a.holdings_value ?? 0;
-                institutions[inst].cash += a.cash_balance ?? 0;
-              }
-            });
-            const rows = Object.entries(institutions).sort((a, b) => (b[1].cash + b[1].securities) - (a[1].cash + a[1].securities));
-            return (
-              <div className="overflow-x-auto px-1 md:px-0">
-                <table className="w-full text-[13px] min-w-[500px]">
-                  <thead>
-                    <tr className="font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em] border-b border-divider">
-                      <th className="text-left py-2 font-medium">Institution</th>
-                      <th className="text-right py-2 font-medium">Cash Deposits</th>
-                      <th className="text-right py-2 font-medium">Securities</th>
-                      <th className="text-left py-2 font-medium">Scheme</th>
-                      <th className="text-right py-2 font-medium">Status</th>
+                </thead>
+                <tbody>
+                  {shownMilestones.map(m => (
+                    <tr key={m.year}>
+                      <td><span className="font-medium text-ink">{m.year}</span> <span className="text-ink-muted">in {m.years_from_now} years</span></td>
+                      <td className="num font-medium text-ink" data-privacy="blur">{fmtEUR(m.projected_value)}</td>
+                      <td className="num" data-privacy="blur">{fmtEUR(m.contributions)}</td>
+                      <td className="num" data-privacy="blur">{fmtEUR(m.growth, { sign: true })}</td>
+                      <td className="num" data-privacy="blur">{fmtEUR(m.real_value)}</td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map(([inst, data]) => {
-                      const pct = data.cash / 100_000 * 100;
-                      const status = pct >= 100 ? 'Over limit' : pct >= 80 ? 'Near limit' : 'Covered';
-                      const statusColor = pct >= 100 ? 'text-claret' : pct >= 80 ? 'text-amber' : 'text-sage';
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {milestones.length > 2 && (
+              <button type="button" onClick={() => setShowAllMilestones(prev => !prev)} aria-expanded={showAllMilestones}
+                className="apple-btn-secondary apple-btn-sm min-h-[44px] md:min-h-[36px] mt-3">
+                {showAllMilestones ? 'Show fewer' : `Show all ${milestones.length} milestones`}
+              </button>
+            )}
+          </Section>
+        </SectionBoundary>
+      )}
+
+      {acc && (
+        <SectionBoundary>
+          <Section
+            title="Projection Accuracy"
+            subtitle={acc.diff_pct >= 0
+              ? `Liquid wealth is ${fmtPct(acc.diff_pct)} above what was projected ${acc.months_ago} months ago.`
+              : `Liquid wealth is ${fmtPct(Math.abs(acc.diff_pct))} below what was projected ${acc.months_ago} months ago.`}
+          >
+            <MetricGrid>
+              <MetricCard label={`${acc.months_ago} months ago`} value={fmtEUR(acc.past_value)} sublabel="Starting value" />
+              <MetricCard label="Projected" value={fmtEUR(acc.projected_value)} sublabel="For today" />
+              <MetricCard label="Actual" value={fmtEUR(acc.actual_value)} sublabel="Today" />
+              <MetricCard label="Difference" value={fmtEUR(acc.diff_eur, { sign: true })}
+                tone={acc.diff_eur > 0 ? 'positive' : acc.diff_eur < 0 ? 'negative' : 'neutral'}
+                sublabel={`${fmtPct(acc.diff_pct, { sign: true })} against the projection`} />
+            </MetricGrid>
+          </Section>
+        </SectionBoundary>
+      )}
+
+      {projData.sensitivity && projData.sensitivity.length > 0 && projData.projection_end ? (
+        <SectionBoundary>
+          <SensitivitySection bars={projData.sensitivity} baseline={projData.projection_end} />
+        </SectionBoundary>
+      ) : null}
+      {confirmDialog}
+    </>
+  );
+}
+
+function SensitivitySection({ bars, baseline }: { bars: NonNullable<ProjectionData['sensitivity']>; baseline: number }) {
+  const tc = useThemeColors();
+  const narrow = useIsNarrow();
+  // Bars start at the baseline outcome and run to the pessimistic / optimistic outcome.
+  const lowD = bars.map(s => s.low - (s.base ?? baseline));
+  const highD = bars.map(s => s.high - (s.base ?? baseline));
+  const reach = Math.max(1, ...lowD.map(Math.abs), ...highD.map(Math.abs));
+  const pad = reach * (narrow ? 0.55 : 0.3);
+  return (
+    <Section
+      title="Sensitivity Analysis"
+      subtitle={<>Projected liquid wealth at the end of the horizon when one assumption changes. Bars start at the baseline of <span data-privacy="blur">{fmtEUR(baseline)}</span>; the labels show the resulting value.</>}
+      actions={<ChartLegend items={[{ label: 'Pessimistic', color: tc.claret, style: 'box' }, { label: 'Optimistic', color: tc.forest, style: 'box' }]} />}
+    >
+      <EChartWrapper
+        height={`${bars.length * 56 + 44}px`}
+        option={{
+          tooltip: {
+            trigger: 'axis' as const,
+            axisPointer: { type: 'shadow' as const },
+            formatter: (params: unknown) => {
+              const ps = params as { dataIndex: number }[];
+              if (!Array.isArray(ps) || ps.length === 0) return '';
+              const s = bars[ps[0].dataIndex];
+              return `${escapeHtml(s.label)}<br/>Pessimistic: <strong>${fmtEUR(s.low)}</strong><br/>Baseline: ${fmtEUR(s.base ?? baseline)}<br/>Optimistic: <strong>${fmtEUR(s.high)}</strong>`;
+            },
+          },
+          grid: { left: 4, right: 8, top: 8, bottom: 4, containLabel: true },
+          xAxis: {
+            type: 'value' as const,
+            min: -(reach + pad),
+            max: reach + pad,
+            splitNumber: narrow ? 2 : 4,
+            axisLabel: { showMinLabel: false, showMaxLabel: false, formatter: (v: number) => (v === 0 ? 'Baseline' : (v > 0 ? '+' : '') + fmtAxis(v)) },
+          },
+          yAxis: {
+            type: 'category' as const,
+            inverse: true,
+            data: bars.map(s => s.label),
+            axisLabel: { interval: 0, hideOverlap: false, width: narrow ? 92 : 170, overflow: 'break' as const, color: tc.inkBody, fontSize: 12, lineHeight: 15 },
+          },
+          series: [
+            {
+              name: 'Pessimistic', type: 'bar' as const, stack: 'range', color: tc.claret, barMaxWidth: 22,
+              data: lowD,
+              label: { show: true, position: 'left' as const, color: tc.ink, fontSize: 12, formatter: (p: unknown) => fmtAxis(bars[(p as { dataIndex: number }).dataIndex].low) },
+            },
+            {
+              name: 'Optimistic', type: 'bar' as const, stack: 'range', color: tc.forest, barMaxWidth: 22,
+              data: highD,
+              label: { show: true, position: 'right' as const, color: tc.ink, fontSize: 12, formatter: (p: unknown) => fmtAxis(bars[(p as { dataIndex: number }).dataIndex].high) },
+            },
+          ],
+        }}
+      />
+      <p className="text-[12px] text-ink-muted mt-2">
+        Ranges: return 3 percentage points lower or higher, contribution 500 € a month lower or higher, starting value 20 % lower or higher.
+      </p>
+    </Section>
+  );
+}
+
+/* ───────────────────────────────── Accounts tab ───────────────────────────────── */
+
+function AccountsTab({ accounts, allSnapshots }: { accounts: Account[]; allSnapshots: NetWorthSnapshot[] }) {
+  const tc = useThemeColors();
+  const [period, setPeriod] = useState<Period>('1Y');
+
+  // Weekday snapshots within the period, oldest first
+  const chartSnapshots = useMemo(() => {
+    const isWeekday = (d: string) => { const day = new Date(d).getDay(); return day !== 0 && day !== 6; };
+    const cutoff = periodCutoff(period);
+    const base = cutoff ? allSnapshots.filter(s => new Date(s.date) >= cutoff) : allSnapshots;
+    return base.filter(s => isWeekday(s.date)).reverse();
+  }, [allSnapshots, period]);
+  const breakdownLabels = chartSnapshots.map(s => formatDateForPeriod(s.date, period));
+  const hasPhysical = chartSnapshots.some(s => (s.physical_component ?? 0) > 0);
+  const bands: { name: string; color: string; pick: (s: NetWorthSnapshot) => number }[] = [
+    { name: 'Cash', color: tc.slate, pick: s => s.cash_component },
+    { name: 'Investments', color: tc.forest, pick: s => s.investment_component },
+    // What's yours in property and vehicles (value minus loans), so the stack adds up to net worth.
+    ...(hasPhysical ? [{ name: 'Property and vehicles, after loans', color: tc.gold, pick: (s: NetWorthSnapshot) => (s.physical_component ?? 0) - (s.debt_component ?? 0) }] : []),
+  ];
+
+  const assetClassLabels: Record<string, string> = {
+    brokerage: 'Investments', checking: 'Cash', savings: 'Cash',
+    real_estate: 'Real estate', pension: 'Pension', precious_metals: 'Precious metals',
+    liability: 'Liabilities', credit: 'Credit',
+  };
+  const groups: Record<string, Account[]> = {};
+  for (const acc of accounts) {
+    const label = assetClassLabels[acc.type] || 'Other';
+    (groups[label] ??= []).push(acc);
+  }
+  const groupOrder = ['Investments', 'Cash', 'Real estate', 'Pension', 'Precious metals', 'Liabilities', 'Credit', 'Other'];
+
+  // Per-institution cash totals for the deposit insurance indicator
+  const instCashTotals: Record<string, number> = {};
+  accounts.forEach(a => {
+    if (a.type === 'checking' || a.type === 'savings') {
+      instCashTotals[a.institution] = (instCashTotals[a.institution] || 0) + (a.balance ?? 0);
+    } else if (a.type === 'brokerage' && a.cash_balance) {
+      instCashTotals[a.institution] = (instCashTotals[a.institution] || 0) + a.cash_balance;
+    }
+  });
+  // 90-day trend lines. Snapshots only split cash and investments in total, so the
+  // line is the total for that kind of account — labelled as such on the card.
+  const sparkSnaps = useMemo(() => {
+    const cutoff90 = new Date();
+    cutoff90.setDate(cutoff90.getDate() - 90);
+    return allSnapshots.filter(s => new Date(s.date) >= cutoff90).reverse();
+  }, [allSnapshots]);
+  const investSpark = sparkSnaps.map(s => s.investment_component);
+  const cashSpark = sparkSnaps.map(s => s.cash_component);
+
+  return (
+    <>
+      <SectionBoundary>
+        <Section
+          first
+          title="Breakdown Over Time"
+          subtitle={`Cash, investments${hasPhysical ? ' and property after loans' : ''}, stacked so the top edge is net worth. Showing ${PERIOD_PHRASE[period] === 'all time' ? 'all recorded history' : `the change ${PERIOD_PHRASE[period]}`}.`}
+          actions={<PeriodSelector value={period} onChange={setPeriod} periods={PERIODS} />}
+        >
+          {chartSnapshots.length < 2 ? (
+            <p className="text-[14px] text-ink-body">There are not enough snapshots in this period yet. Choose a longer period.</p>
+          ) : (
+            <>
+              <ChartLegend items={bands.map(b => ({ label: b.name, color: b.color, style: 'box' as const }))} className="mb-2" />
+              <EChartWrapper
+                height="300px"
+                option={{
+                  tooltip: {
+                    trigger: 'axis' as const,
+                    formatter: (params: unknown) => {
+                      const p = params as { seriesName: string; data: number; dataIndex: number; marker: string }[];
+                      if (!Array.isArray(p) || p.length === 0) return '';
+                      const snap = chartSnapshots[p[0].dataIndex];
+                      const total = p.reduce((sum, s) => sum + (s.data || 0), 0);
+                      const rows = p.map(s => `${s.marker} ${escapeHtml(s.seriesName)}: ${fmtEUR(s.data)}`).join('<br/>');
+                      return `<strong>${escapeHtml(fmtDateLong(snap.date))}</strong><br/>${rows}<br/>Net worth: <strong>${fmtEUR(total)}</strong>`;
+                    },
+                  },
+                  grid: { left: 4, right: 30, top: 12, bottom: 4, containLabel: true },
+                  xAxis: { type: 'category' as const, boundaryGap: false, data: breakdownLabels, axisLabel: { interval: (i: number) => i === 0 || breakdownLabels[i] !== breakdownLabels[i - 1] } },
+                  yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
+                  series: bands.map(b => ({
+                    name: b.name, type: 'line' as const, stack: 'total', color: b.color,
+                    data: chartSnapshots.map(b.pick),
+                    showSymbol: false, lineStyle: { width: 1 }, areaStyle: { color: b.color, opacity: 0.55 },
+                  })),
+                }}
+              />
+            </>
+          )}
+        </Section>
+      </SectionBoundary>
+
+      <SectionBoundary>
+        <Section title="Accounts" subtitle="Balances in euros, grouped by kind of account.">
+          {accounts.length === 0 ? (
+            <EmptyState title="No accounts yet" message="Create an account in Settings and import its transactions to see it here." action={{ label: 'Go to Settings', href: '/settings?tab=accounts' }} />
+          ) : (
+            <div className="space-y-7">
+              {groupOrder.filter(g => groups[g]).map(group => (
+                <div key={group}>
+                  <div className="flex flex-wrap items-baseline justify-between gap-x-3 mb-3">
+                    <h3 className="label-caps">{group}</h3>
+                    {Object.keys(groups).length > 1 && (
+                      <span className="text-[13px] text-ink-muted" data-privacy="blur">
+                        {fmtEUR(groups[group].reduce((s, a) => s + (a.balance ?? 0), 0))}
+                      </span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-1 gap-x-8 gap-y-5 sm:grid-cols-2 lg:grid-cols-3">
+                    {groups[group].map(acc => {
+                      const isCash = acc.type === 'checking' || acc.type === 'savings';
+                      const isBroker = acc.type === 'brokerage';
                       return (
-                        <tr key={inst} className="border-b border-divider">
-                          <td className="py-2 text-ink font-medium">{inst.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}</td>
-                          <td className="py-2 text-right tabular-nums">{fmt(data.cash)}</td>
-                          <td className="py-2 text-right tabular-nums text-ink-muted">{data.securities > 0 ? fmt(data.securities) : '—'}</td>
-                          <td className="py-2 text-ink-muted">{data.securities > 0 ? `Sondervermögen + ${data.scheme}` : data.scheme}</td>
-                          <td className={`py-2 text-right font-medium ${statusColor}`}>{status}{data.securities > 0 ? ' (cash)' : ''}</td>
-                        </tr>
+                        <AccountCard
+                          key={acc.id}
+                          account={acc}
+                          sparklineData={isBroker ? investSpark : isCash ? cashSpark : undefined}
+                          sparklineLabel={isBroker ? 'All investments, 90 days' : isCash ? 'All cash, 90 days' : undefined}
+                          institutionCashTotal={instCashTotals[acc.institution]}
+                        />
                       );
                     })}
-                  </tbody>
-                </table>
-                <p className="text-[11px] text-ink-muted mt-2">Securities held in brokerage accounts are Sondervermögen (segregated assets), protected regardless of institution solvency. Cash deposits covered up to 100.000 EUR per institution.</p>
-              </div>
-            );
-          })()}
-        </div>
-      )}
-
-      {/* Account Cards grouped by asset class */}
-      {accounts.length > 0 && (() => {
-        const assetClassLabels: Record<string, string> = {
-          brokerage: 'Investments', checking: 'Cash', savings: 'Cash',
-          real_estate: 'Real Estate', pension: 'Pension', precious_metals: 'Precious Metals',
-          liability: 'Liabilities', credit: 'Credit',
-        };
-        const groups: Record<string, typeof accounts> = {};
-        for (const acc of accounts) {
-          const label = assetClassLabels[acc.type] || 'Other';
-          (groups[label] ??= []).push(acc);
-        }
-        const groupOrder = ['Investments', 'Cash', 'Real Estate', 'Pension', 'Precious Metals', 'Liabilities', 'Credit', 'Other'];
-        return (
-          <div className="space-y-4">
-            {groupOrder.filter(g => groups[g]).map(group => (
-              <div key={group}>
-                <h2 className="font-serif text-heading text-ink mb-3 flex items-baseline gap-2">
-                  <span>{group}</span>
-                  {Object.keys(groups).length > 1 && (
-                    <span className="text-[13px] text-ink-muted font-normal">
-                      {fmt(groups[group].reduce((s, a) => s + (a.balance ?? 0), 0))}
-                    </span>
-                  )}
-                </h2>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                  {(() => {
-                    // Compute per-institution cash totals for deposit insurance
-                    const instCashTotals: Record<string, number> = {};
-                    accounts.forEach(a => {
-                      if (a.type === 'checking' || a.type === 'savings') {
-                        instCashTotals[a.institution] = (instCashTotals[a.institution] || 0) + (a.balance ?? 0);
-                      } else if (a.type === 'brokerage' && a.cash_balance) {
-                        instCashTotals[a.institution] = (instCashTotals[a.institution] || 0) + a.cash_balance;
-                      }
-                    });
-                    return groups[group].map((acc) => {
-                      const cutoff90 = new Date();
-                      cutoff90.setDate(cutoff90.getDate() - 90);
-                      const sparkSnaps = allSnapshots.filter(s => new Date(s.date) >= cutoff90).reverse();
-                      const sparkline = sparkSnaps.map((s) =>
-                        acc.type === 'brokerage' ? s.investment_component : s.cash_component
-                      );
-                      return <AccountCard key={acc.id} account={acc} sparklineData={sparkline} institutionCashTotal={instCashTotals[acc.institution]} />;
-                    });
-                  })()}
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
-        );
-      })()}
-      </>)}
-
-    </div>
+              ))}
+            </div>
+          )}
+        </Section>
+      </SectionBoundary>
+    </>
   );
 }

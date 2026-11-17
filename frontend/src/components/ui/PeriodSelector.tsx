@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import { fmtDayMonth, fmtMonthShort } from '../../utils/format';
 
 export type Period = '1M' | '3M' | '6M' | 'YTD' | '1Y' | '3Y' | 'All';
 
@@ -12,60 +12,26 @@ interface PeriodSelectorProps {
 }
 
 export default function PeriodSelector({ value, onChange, periods = PERIODS, className = '' }: PeriodSelectorProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [indicator, setIndicator] = useState({ left: 0, width: 0 });
-  const [ready, setReady] = useState(false);
-
-  // Position the sliding indicator behind the active button
-  const updateIndicator = () => {
-    if (!containerRef.current) return;
-    const active = containerRef.current.querySelector('[data-active="true"]') as HTMLElement | null;
-    if (active) {
-      setIndicator({
-        left: active.offsetLeft,
-        width: active.offsetWidth,
-      });
-      setReady(true);
-    }
-  };
-
-  useLayoutEffect(updateIndicator, [value, periods]);
-  useEffect(() => {
-    // Recalculate on resize (font loading, etc.)
-    window.addEventListener('resize', updateIndicator);
-    return () => window.removeEventListener('resize', updateIndicator);
-  }, []);
-
   return (
-    <div
-      ref={containerRef}
-      className={`relative inline-flex items-center gap-0.5 rounded-full bg-parchment-deep dark:bg-ink/10 p-0.5 ${className}`}
-      role="group"
-      aria-label="Time period"
-    >
-      {/* Sliding indicator */}
-      <span
-        className="absolute top-0.5 h-[calc(100%-4px)] rounded-full bg-inset border-l-[3px] border-forest dark:bg-inset border-l-[3px] border-forest border border-forest dark:border-forest transition-all duration-200 ease-out"
-        style={{
-          left: indicator.left,
-          width: indicator.width,
-          opacity: ready ? 1 : 0,
-        }}
-      />
-      {periods.map((p) => (
-        <button
-          key={p}
-          data-active={value === p}
-          onClick={() => onChange(p)}
-          className={`relative z-10 rounded-full px-3 md:px-3 py-2.5 md:py-1.5 text-[11px] md:text-[12px] font-medium transition-colors duration-150 min-h-[40px] md:min-h-[32px] ${
-            value === p
-              ? 'text-forest dark:text-sage'
-              : 'text-ink-muted hover:text-ink-body'
-          }`}
-        >
-          {p}
-        </button>
-      ))}
+    <div className={`inline-flex flex-wrap items-center gap-1.5 ${className}`} role="group" aria-label="Time period">
+      {periods.map((p) => {
+        const active = value === p;
+        return (
+          <button
+            key={p}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onChange(p)}
+            className={`min-h-[44px] md:min-h-[32px] min-w-[44px] md:min-w-[40px] px-2.5 rounded-[4px] border text-[12px] transition-colors ${
+              active
+                ? 'bg-forest border-forest text-parchment font-semibold'
+                : 'border-field text-ink-body font-medium hover:border-forest hover:text-ink'
+            }`}
+          >
+            {p}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -101,18 +67,15 @@ export function filterByPeriod<T extends { date: string }>(data: T[], period: Pe
  * Format a date string for chart x-axis labels, adapting to the selected period.
  */
 export function formatDateForPeriod(dateStr: string, period: Period): string {
-  const d = new Date(dateStr);
   switch (period) {
     case '1M':
-      return d.toLocaleDateString('de-DE', { day: 'numeric', month: 'short' });
     case '3M':
     case '6M':
     case 'YTD':
-      return d.toLocaleDateString('de-DE', { day: 'numeric', month: 'short' });
+      return fmtDayMonth(dateStr);
     case '1Y':
-      return d.toLocaleDateString('de-DE', { month: 'short', year: '2-digit' });
     case '3Y':
     case 'All':
-      return d.toLocaleDateString('de-DE', { month: 'short', year: '2-digit' });
+      return fmtMonthShort(dateStr);
   }
 }

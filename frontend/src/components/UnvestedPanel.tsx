@@ -1,9 +1,13 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { api, type UnvestedResponse, type UnvestedAccount } from '../api/client';
+import { Section, MetricCard, MetricGrid, ErrorState, Chip } from './ui';
+import { fmtEUR, fmtMoney, fmtPct, fmtQty, fmtDate } from '../utils/format';
 
 interface Props {
   mode: 'summary' | 'detail';
 }
+
+const DEFAULT_ROWS = 12;
 
 export default function UnvestedPanel({ mode }: Props) {
   const [data, setData] = useState<UnvestedResponse | null>(null);
@@ -11,174 +15,130 @@ export default function UnvestedPanel({ mode }: Props) {
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState(false);
 
-  useEffect(() => {
+  const load = useCallback(() => {
+    setError(null);
+    setLoading(true);
     api.getUnvested()
       .then(setData)
       .catch(e => setError(e.message || 'Failed to load unvested RSUs'))
       .finally(() => setLoading(false));
   }, []);
 
+  useEffect(() => { load(); }, [load]);
+
+  // People without RSU accounts never see this section, so it stays out of the way while loading.
   if (loading) return null;
   if (error) {
     return (
-      <div className="border-t border-divider pt-6 py-3 md:py-5">
-        <div className="flex items-center justify-between">
-          <p className="text-[13px] text-claret">{error}</p>
-          <button
-            onClick={() => {
-              setError(null);
-              setLoading(true);
-              api.getUnvested()
-                .then(setData)
-                .catch(e => setError(e.message || 'Failed to load unvested RSUs'))
-                .finally(() => setLoading(false));
-            }}
-            className="text-forest text-[13px] font-medium"
-          >
-            Retry
-          </button>
-        </div>
-      </div>
+      <Section title="Unvested RSUs">
+        <ErrorState message="Unvested RSUs couldn’t be loaded." details={error} onRetry={load} />
+      </Section>
     );
   }
   if (!data || data.accounts.length === 0) return null;
 
-  const fmt = (n: number, currency = 'EUR') =>
-    new Intl.NumberFormat('de-DE', { style: 'currency', currency }).format(n);
-
-  const fmtCompact = (n: number) =>
-    new Intl.NumberFormat('de-DE', {
-      style: 'currency',
-      currency: 'EUR',
-      maximumFractionDigits: 0,
-    }).format(n);
-
-  const fmtQty = (n: number) =>
-    new Intl.NumberFormat('de-DE', { minimumFractionDigits: 0, maximumFractionDigits: 3 }).format(n);
-
-  // Summary mode: compact display for NetWorth page
+  // Summary mode: compact display for the Net Worth page
   if (mode === 'summary') {
     return (
-      <div className="border-t border-divider pt-6 py-3 md:py-5">
+      <Section title="Unvested RSUs" subtitle="Estimated net value after withholding, converted to EUR at the latest ECB reference rate.">
         {data.accounts.map((acc, i) => (
-          <UnvestedSummaryCard
-            key={acc.account_id}
-            acc={acc}
-            isFirst={i === 0}
-            fmt={fmt}
-            fmtCompact={fmtCompact}
-            fmtQty={fmtQty}
-          />
+          <UnvestedSummaryCard key={acc.account_id} acc={acc} isFirst={i === 0} />
         ))}
-      </div>
+      </Section>
     );
   }
 
-  const totalValue = data.total_value_eur;
+  const currencies = Object.keys(data.total_value_by_currency);
+  const foreign = currencies.filter(c => c.toUpperCase() !== 'EUR');
 
-  // Detail mode: full table for Portfolio page
-  const DEFAULT_ROWS = 12;
-
+  // Detail mode: full vesting schedule for the Portfolio page
   return (
-    <div className="border-t border-divider pt-6 py-3 md:py-5">
-      <div className="flex items-center justify-between mb-3 md:mb-4 px-1 md:px-0">
-        <div>
-          <h2 className="font-serif text-heading text-ink">Unvested RSUs</h2>
-          <p className="text-[13px] text-ink-muted mt-0.5">
-            Estimated net value after withholding
-          </p>
-        </div>
-        <span className="font-serif text-[20px] md:text-[22px] text-ink tabular-nums">
-          {fmt(totalValue)}
-        </span>
-      </div>
+    <Section
+      title="Unvested RSUs"
+      subtitle="Estimated net value after withholding. Not part of the holdings above until the shares vest."
+    >
+      <MetricGrid className="mb-6">
+        <MetricCard
+          label="Total · in EUR"
+          value={fmtEUR(data.total_value_eur)}
+          sublabel={foreign.length > 0 ? 'Converted at the latest ECB reference rate' : 'Estimated net value'}
+        />
+        {foreign.map(cur => (
+          <MetricCard
+            key={cur}
+            label={`Of which · in ${cur.toUpperCase()}`}
+            value={fmtMoney(data.total_value_by_currency[cur], cur, { cents: false })}
+            sublabel="Before conversion, at the current share price"
+          />
+        ))}
+      </MetricGrid>
 
       {data.accounts.map(acc => {
         const vests = acc.by_vest || [];
         const visibleVests = expanded ? vests : vests.slice(0, DEFAULT_ROWS);
+        const cur = (acc.current_price_currency || acc.currency || 'EUR').toUpperCase();
 
         return (
-          <div key={acc.account_id} className="mb-4 px-1 md:px-0">
+          <div key={acc.account_id} className="mb-6 last:mb-0">
             {/* Account header */}
-            <div className="flex items-center justify-between mb-2">
-              <div>
-                <p className="text-[15px] font-medium text-ink">{acc.account_name}</p>
-                <p className="text-[12px] text-ink-muted">
-                  {acc.symbol || acc.security_isin}
-                  <span className="mx-1.5">&middot;</span>
-                  Net/Gross ratio: {(acc.ratio * 100).toFixed(0)}%
-                  {acc.default_ratio_used && (
-                    <span className="text-amber ml-1">(estimated)</span>
-                  )}
+            <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-1 mb-3">
+              <div className="min-w-0">
+                <h3 className="text-[15px] font-medium text-ink">{acc.account_name}</h3>
+                <p className="text-[12px] text-ink-muted flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                  <span>{acc.symbol || acc.security_isin}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>Net shares ≈ {fmtPct(acc.ratio * 100, { digits: 0 })} of gross</span>
+                  {acc.default_ratio_used && <Chip tone="warning">Estimated ratio</Chip>}
                 </p>
               </div>
-              <div className="text-right shrink-0 ml-3">
-                <p className="text-[15px] font-medium tabular-nums">
-                  {fmt(acc.total_value_estimate, acc.current_price_currency)}
+              <div className="text-right shrink-0">
+                <p className="text-[15px] font-medium text-ink" data-privacy="blur">
+                  {fmtMoney(acc.total_value_estimate, cur, { cents: false })}
                 </p>
-                <p className="text-[12px] text-ink-muted tabular-nums">
-                  {fmtQty(acc.total_net_estimate)} net @ {fmt(acc.current_price, acc.current_price_currency)}
+                <p className="text-[12px] text-ink-muted">
+                  {fmtQty(acc.total_net_estimate)} net shares at {fmtMoney(acc.current_price, cur, { cents: true })}
                 </p>
               </div>
             </div>
 
             {/* Mobile: card layout */}
-            <div className="md:hidden space-y-2">
+            <ul className="md:hidden flex flex-col gap-2">
               {visibleVests.map((v, i) => (
-                <div key={i} className="rounded-apple bg-parchment-deep px-3 py-2.5">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <p className="text-[13px] font-medium text-ink">
-                        {new Date(v.vest_date).toLocaleDateString('de-DE', {
-                          day: '2-digit', month: 'short', year: 'numeric',
-                        })}
-                      </p>
-                      <p className="text-[11px] text-ink-muted">{v.grant_number}</p>
-                    </div>
-                    <div className="text-right">
-                      <p className="text-[13px] font-medium tabular-nums">
-                        {fmt(v.value_estimate, acc.current_price_currency)}
-                      </p>
-                      <p className="text-[11px] text-ink-muted tabular-nums">
-                        {fmtQty(v.gross_quantity)} gross &rarr; {fmtQty(v.net_estimate)} net
-                      </p>
-                    </div>
+                <li key={i} className="rounded-apple border border-divider px-3 py-2.5 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-[14px] font-medium text-ink">{fmtDate(v.vest_date)}</p>
+                    <p className="text-[12px] text-ink-muted truncate">Grant {v.grant_number}</p>
                   </div>
-                </div>
+                  <div className="text-right shrink-0">
+                    <p className="text-[14px] font-medium text-ink" data-privacy="blur">{fmtMoney(v.value_estimate, cur, { cents: false })}</p>
+                    <p className="text-[12px] text-ink-muted">
+                      {fmtQty(v.gross_quantity)} gross → {fmtQty(v.net_estimate)} net shares
+                    </p>
+                  </div>
+                </li>
               ))}
-            </div>
+            </ul>
 
             {/* Desktop: table layout */}
-            <div className="hidden md:block overflow-x-auto">
-              <table className="w-full min-w-[600px]">
+            <div className="hidden md:block overflow-x-auto rounded-apple border border-divider" role="region" tabIndex={0} aria-label={`Vesting schedule, ${acc.account_name}`}>
+              <table className="apple-table">
                 <thead>
-                  <tr className="text-left font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em]">
-                    <th className="pb-2 font-medium">Vest Date</th>
-                    <th className="pb-2 font-medium">Grant</th>
-                    <th className="pb-2 font-medium text-right">Gross Shares</th>
-                    <th className="pb-2 font-medium text-right">Net Estimate</th>
-                    <th className="pb-2 font-medium text-right">Value Estimate</th>
+                  <tr>
+                    <th scope="col">Vest date</th>
+                    <th scope="col">Grant</th>
+                    <th scope="col" className="num">Gross shares</th>
+                    <th scope="col" className="num">Net shares (est.)</th>
+                    <th scope="col" className="num">Value (est.) · {cur}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {visibleVests.map((v, i) => (
-                    <tr
-                      key={i}
-                      className={`transition-colors hover:bg-parchment-deep ${
-                        i < visibleVests.length - 1 ? 'border-b border-divider' : ''
-                      }`}
-                    >
-                      <td className="py-2.5 text-[15px] text-ink tabular-nums">
-                        {new Date(v.vest_date).toLocaleDateString('de-DE', {
-                          day: '2-digit', month: '2-digit', year: 'numeric',
-                        })}
-                      </td>
-                      <td className="py-2.5 text-[13px] text-ink-muted">{v.grant_number}</td>
-                      <td className="py-2.5 text-[15px] text-right tabular-nums">{fmtQty(v.gross_quantity)}</td>
-                      <td className="py-2.5 text-[15px] text-right tabular-nums">{fmtQty(v.net_estimate)}</td>
-                      <td className="py-2.5 text-[15px] text-right tabular-nums font-medium">
-                        {fmt(v.value_estimate, acc.current_price_currency)}
-                      </td>
+                    <tr key={i}>
+                      <td className="whitespace-nowrap">{fmtDate(v.vest_date)}</td>
+                      <td>{v.grant_number}</td>
+                      <td className="num">{fmtQty(v.gross_quantity)}</td>
+                      <td className="num">{fmtQty(v.net_estimate)}</td>
+                      <td className="num whitespace-nowrap"><span className="text-ink" data-privacy="blur">{fmtMoney(v.value_estimate, cur, { cents: false })}</span></td>
                     </tr>
                   ))}
                 </tbody>
@@ -188,44 +148,27 @@ export default function UnvestedPanel({ mode }: Props) {
             {/* Show more / less toggle */}
             {vests.length > DEFAULT_ROWS && (
               <button
+                type="button"
                 onClick={() => setExpanded(prev => !prev)}
-                className="w-full mt-2 py-2 text-[13px] text-forest font-medium"
+                aria-expanded={expanded}
+                className="apple-btn-secondary w-full mt-3 min-h-[44px]"
               >
-                {expanded
-                  ? 'Show less'
-                  : `Show all ${vests.length} vests`}
+                {expanded ? 'Show fewer vests' : `Show all ${vests.length} vests`}
               </button>
             )}
           </div>
         );
       })}
-
-      {/* Total by currency */}
-      {Object.keys(data.total_value_by_currency).length > 1 && (
-        <div className="border-t border-divider pt-3 mt-2 px-1 md:px-0">
-          <p className="text-[12px] text-ink-muted mb-1">Total by Currency</p>
-          <div className="flex gap-4">
-            {Object.entries(data.total_value_by_currency).map(([cur, val]) => (
-              <span key={cur} className="text-[13px] font-medium tabular-nums text-ink">
-                {fmt(val, cur)}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
+    </Section>
   );
 }
 
 interface SummaryCardProps {
   acc: UnvestedAccount;
   isFirst: boolean;
-  fmt: (n: number, currency?: string) => string;
-  fmtCompact: (n: number) => string;
-  fmtQty: (n: number) => string;
 }
 
-function UnvestedSummaryCard({ acc, isFirst, fmt, fmtCompact, fmtQty }: SummaryCardProps) {
+function UnvestedSummaryCard({ acc, isFirst }: SummaryCardProps) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const oneYear = new Date(today);
@@ -256,86 +199,58 @@ function UnvestedSummaryCard({ acc, isFirst, fmt, fmtCompact, fmtQty }: SummaryC
   const yearEntries = Array.from(byYear.entries()).sort((a, b) => a[0].localeCompare(b[0]));
   const maxYearValue = yearEntries.reduce((m, [, v]) => Math.max(m, v), 0);
 
+  const share = acc.total_value_eur > 0 ? (next12Total / acc.total_value_eur) * 100 : 0;
+
   return (
-    <div className={isFirst ? '' : 'mt-5 pt-5 border-t border-divider'}>
+    <div className={isFirst ? '' : 'mt-6 pt-5 border-t border-divider'}>
       {/* Header row */}
-      <div className="flex items-baseline justify-between gap-3 mb-1 px-1 md:px-0">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 mb-4">
         <div className="min-w-0">
-          <h2 className="font-serif text-heading text-ink truncate">
-            {isFirst ? 'Unvested RSUs' : acc.account_name}
-          </h2>
-          <p className="text-[12px] text-ink-muted mt-0.5">
-            {isFirst && <span className="truncate">{acc.account_name} · </span>}
-            {acc.symbol && <>{acc.symbol} · </>}
-            {fmtQty(acc.total_net_estimate)} net shares · Net/Gross ~{Math.round(acc.ratio * 100)}%
-            {acc.default_ratio_used && <span className="text-amber ml-1">(estimated)</span>}
+          <h3 className="text-[15px] font-medium text-ink truncate">{acc.account_name}</h3>
+          <p className="text-[12px] text-ink-muted flex flex-wrap items-center gap-x-1.5 gap-y-1">
+            {acc.symbol && <><span>{acc.symbol}</span><span aria-hidden="true">·</span></>}
+            <span>{fmtQty(acc.total_net_estimate)} net shares</span>
+            <span aria-hidden="true">·</span>
+            <span>≈ {fmtPct(acc.ratio * 100, { digits: 0 })} of gross</span>
+            {acc.default_ratio_used && <Chip tone="warning">Estimated ratio</Chip>}
           </p>
         </div>
-        <span className="font-serif text-[20px] md:text-[22px] text-ink tabular-nums shrink-0">
-          {fmt(acc.total_value_eur)}
+        <span className="font-serif text-[22px] leading-7 text-ink shrink-0" data-privacy="blur">
+          {fmtEUR(acc.total_value_eur)}
         </span>
       </div>
 
-      {/* Stat tiles */}
-      <div className="grid grid-cols-3 gap-px bg-divider mt-3 rounded-apple overflow-hidden">
-        <div className="bg-parchment-deep px-3 py-2.5 min-w-0">
-          <p className="font-serif text-[10px] tracking-[0.1em] uppercase text-ink-muted mb-1" style={{ fontVariantCaps: 'small-caps' }}>
-            Next vest
-          </p>
-          {nextVest ? (
-            <>
-              <p className="text-[15px] font-medium tabular-nums text-ink truncate">
-                {new Date(nextVest.vest_date).toLocaleDateString('de-DE', { day: '2-digit', month: 'short', year: '2-digit' })}
-              </p>
-              <p className="text-[11px] text-ink-muted tabular-nums mt-0.5 truncate">
-                ~{fmtCompact(nextVest.value_estimate_eur)}
-              </p>
-            </>
-          ) : (
-            <p className="text-[15px] text-ink-muted">—</p>
-          )}
-        </div>
-        <div className="bg-parchment-deep px-3 py-2.5 min-w-0">
-          <p className="font-serif text-[10px] tracking-[0.1em] uppercase text-ink-muted mb-1" style={{ fontVariantCaps: 'small-caps' }}>
-            Next 12 months
-          </p>
-          <p className="text-[15px] font-medium tabular-nums text-ink truncate">
-            {fmtCompact(next12Total)}
-          </p>
-          <p className="text-[11px] text-ink-muted mt-0.5">
-            {Math.round((next12Total / Math.max(acc.total_value_eur, 1)) * 100)}% of total
-          </p>
-        </div>
-        <div className="bg-parchment-deep px-3 py-2.5 min-w-0">
-          <p className="font-serif text-[10px] tracking-[0.1em] uppercase text-ink-muted mb-1" style={{ fontVariantCaps: 'small-caps' }}>
-            Beyond 12 mo
-          </p>
-          <p className="text-[15px] font-medium tabular-nums text-ink truncate">
-            {fmtCompact(remainingTotal)}
-          </p>
-          <p className="text-[11px] text-ink-muted mt-0.5">
-            over {remainingYears.size} {remainingYears.size === 1 ? 'year' : 'years'}
-          </p>
-        </div>
-      </div>
+      <MetricGrid>
+        <MetricCard
+          label="Next vest"
+          value={nextVest ? fmtEUR(nextVest.value_estimate_eur) : '—'}
+          money={!!nextVest}
+          sublabel={nextVest ? `on ${fmtDate(nextVest.vest_date)}` : 'No vest scheduled'}
+        />
+        <MetricCard
+          label="Next 12 months"
+          value={fmtEUR(next12Total)}
+          sublabel={`${fmtPct(share, { digits: 0 })} of total`}
+        />
+        <MetricCard
+          label="Beyond 12 months"
+          value={fmtEUR(remainingTotal)}
+          sublabel={`over ${remainingYears.size} ${remainingYears.size === 1 ? 'year' : 'years'}`}
+        />
+      </MetricGrid>
 
       {/* Year timeline */}
       {yearEntries.length > 1 && (
-        <div className="mt-4 space-y-1.5 px-1 md:px-0">
+        <div className="mt-5 flex flex-col gap-2">
           {yearEntries.map(([yr, val]) => {
             const pct = maxYearValue > 0 ? (val / maxYearValue) * 100 : 0;
             return (
-              <div key={yr} className="flex items-center gap-3 text-[12px]">
-                <span className="w-10 shrink-0 text-ink-muted tabular-nums">{yr}</span>
-                <div className="flex-1 h-2.5 bg-divider rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-forest rounded-full transition-all"
-                    style={{ width: `${pct}%` }}
-                  />
+              <div key={yr} className="flex items-center gap-3 text-[13px]">
+                <span className="w-10 shrink-0 text-ink-muted">{yr}</span>
+                <div className="flex-1 h-2 bg-divider rounded-[2px] overflow-hidden" aria-hidden="true">
+                  <div className="h-full bg-forest" style={{ width: `${pct}%` }} />
                 </div>
-                <span className="w-20 shrink-0 text-right tabular-nums text-ink">
-                  {fmtCompact(val)}
-                </span>
+                <span className="w-20 shrink-0 text-right text-ink" data-privacy="blur">{fmtEUR(val)}</span>
               </div>
             );
           })}

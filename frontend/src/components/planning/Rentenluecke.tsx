@@ -1,24 +1,47 @@
 import { useState } from 'react';
-import { usePlanning } from './PlanningContext';
+import { usePlanning, type PensionSource } from './PlanningContext';
 import { useThemeColors } from '../../hooks/useThemeColors';
 import EChartWrapper from '../charts/EChartWrapper';
+import {
+  Section, SubHeading, MetricCard, MetricGrid, NumberField, AddChip, RankedBars,
+  EmptyState, ErrorState, useConfirm, type RankedBarItem,
+} from '../ui';
+import { fmtEUR, fmtPct, fmtAxis } from '../../utils/format';
+import { ItemCard, RemoveButton, toNum } from './shared';
 
 type PensionResult = {
   sources: { type: string; label: string; monthly_gross: number; monthly_net: number; start_age: number }[];
   total_monthly_net: number; portfolio_net: number; projected_portfolio: number;
   monthly_contrib: number; gap: number; gap_annual: number; sparplan_to_close: number;
-  sensitivity: { age: number; pension_net: number; portfolio_net: number; total_net: number; gap: number }[];
+  sensitivity?: { age: number; pension_net: number; portfolio_net: number; total_net: number; gap: number }[];
   rentenwert: number;
 };
 
+// English labels; the German legal term stays as a gloss where it is the name on the paperwork.
 const PENSION_TEMPLATES = [
-  { type: 'gesetzliche', label: 'Gesetzliche Rente', rp: 30 },
-  { type: 'bav', label: 'bAV', rp: 0 },
-  { type: 'riester', label: 'Riester', rp: 0 },
-  { type: 'ruerup', label: 'Rürup', rp: 0 },
-  { type: 'private', label: 'Private RV', rp: 0 },
-  { type: 'other', label: 'Sonstige', rp: 0 },
+  { type: 'gesetzliche', label: 'Statutory pension', rp: 30 },
+  { type: 'bav', label: 'Company pension (bAV)', rp: 0 },
+  { type: 'riester', label: 'Riester pension', rp: 0 },
+  { type: 'ruerup', label: 'Rürup pension', rp: 0 },
+  { type: 'private', label: 'Private pension', rp: 0 },
+  { type: 'other', label: 'Other', rp: 0 },
 ];
+const TYPE_LABEL: Record<string, string> = Object.fromEntries(PENSION_TEMPLATES.map(t => [t.type, t.label]));
+const sourceLabel = (s: { type: string; label: string }) => TYPE_LABEL[s.type] ?? s.label;
+// Short names for the narrow label column of the income bars.
+const SHORT_LABEL: Record<string, string> = { gesetzliche: 'Statutory', bav: 'Company', riester: 'Riester', ruerup: 'Rürup', private: 'Private', other: 'Other' };
+const shortLabel = (s: { type: string; label: string }) => SHORT_LABEL[s.type] ?? s.label;
+
+/** The response is only stored when it has the shape the result view maps over. */
+function isPensionResult(body: unknown): body is PensionResult {
+  if (!body || typeof body !== 'object') return false;
+  const b = body as Record<string, unknown>;
+  return Array.isArray(b.sources)
+    && typeof b.gap === 'number'
+    && typeof b.total_monthly_net === 'number'
+    && typeof b.portfolio_net === 'number'
+    && (b.sensitivity === undefined || b.sensitivity === null || Array.isArray(b.sensitivity));
+}
 
 // "Pension gap" — Germany's standard retirement-planning lens. Compares
 // projected income from gesetzliche Rente / bAV / Riester / Rürup against
@@ -26,181 +49,227 @@ const PENSION_TEMPLATES = [
 // the private portfolio. Backend at POST /api/portfolio/pension-gap does
 // the actuarial math (Rentenwert, Besteuerungsanteil, …).
 export default function Rentenluecke() {
-  const { pensionCurrentAge, setPensionCurrentAge, pensionAge, setPensionAge, pensionNeed, setPensionNeed, pensionContrib, setPensionContrib, pensionSources, setPensionSources, fmt } = usePlanning();
+  const { pensionCurrentAge, pensionAge, pensionNeed, setPensionNeed, pensionContrib, setPensionContrib, pensionSources, setPensionSources } = usePlanning();
   const tc = useThemeColors();
-  const [pensionResult, setPensionResult] = useState<PensionResult | null>(null);
-  const [pensionLoading, setPensionLoading] = useState(false);
+  const [confirm, confirmDialog] = useConfirm();
+  const [result, setResult] = useState<PensionResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const addSource = (t: typeof PENSION_TEMPLATES[number]) => {
+    setPensionSources([...pensionSources, {
+      type: t.type, label: t.label, monthly_gross: t.type === 'gesetzliche' ? 0 : 500,
+      rentenpunkte: t.rp, start_age: pensionAge, tax_portion_pct: 0,
+    }]);
+  };
+  const updateSource = (i: number, patch: Partial<PensionSource>) => {
+    setPensionSources(pensionSources.map((s, j) => (j === i ? { ...s, ...patch } : s)));
+  };
+  const removeSource = async (i: number) => {
+    const name = sourceLabel(pensionSources[i]);
+    if (!(await confirm({ title: `Remove “${name}”?`, body: 'The values you entered for this pension source will be lost.', confirmLabel: 'Remove source' }))) return;
+    setPensionSources(pensionSources.filter((_, j) => j !== i));
+  };
+
+  const calculate = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/portfolio/pension-gap', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sources: pensionSources, retirement_age: pensionAge, monthly_need: pensionNeed, current_age: pensionCurrentAge, monthly_contrib: parseFloat(pensionContrib) || 0 }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body: unknown = await res.json();
+      if (!isPensionResult(body)) throw new Error('Unexpected response from the server');
+      setResult(body);
+    } catch (e) {
+      setResult(null);
+      setError(e instanceof Error ? e.message : 'Request failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const incomeBars: RankedBarItem[] = result
+    ? [
+      ...result.sources.map((s, i) => ({
+        label: `${shortLabel(s)}${result.sources.filter(o => shortLabel(o) === shortLabel(s)).length > 1 ? ` ${i + 1}` : ''}`,
+        value: s.monthly_net,
+        display: fmtEUR(s.monthly_net),
+        share: pensionNeed > 0 ? fmtPct((s.monthly_net / pensionNeed) * 100, { digits: 0 }) : undefined,
+      })),
+      {
+        label: 'Portfolio',
+        value: result.portfolio_net,
+        display: fmtEUR(result.portfolio_net),
+        share: pensionNeed > 0 ? fmtPct((result.portfolio_net / pensionNeed) * 100, { digits: 0 }) : undefined,
+      },
+    ]
+    : [];
+  const sensitivity = result?.sensitivity ?? [];
 
   return (
-    <div className="border-t border-divider pt-6 py-3 md:py-5">
-      <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Rentenlücke</h2>
-      <p className="text-[13px] text-ink-muted mb-3">Compare your retirement income sources against your target spending.</p>
-
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
-        <div>
-          <label className="text-[11px] text-ink-muted">Current age</label>
-          <input aria-label="Current age" type="number" value={pensionCurrentAge} onChange={e => { const v = parseInt(e.target.value) || 35; setPensionCurrentAge(v); localStorage.setItem('pension_current_age', String(v)); }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-        </div>
-        <div>
-          <label className="text-[11px] text-ink-muted">Retire at</label>
-          <input aria-label="Retirement age" type="number" value={pensionAge} onChange={e => { const v = parseInt(e.target.value) || 67; setPensionAge(v); localStorage.setItem('pension_age', String(v)); }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-        </div>
-        <div>
-          <label className="text-[11px] text-ink-muted">Need/mo</label>
-          <input aria-label="Monthly need" type="number" value={pensionNeed} onChange={e => { const v = parseInt(e.target.value) || 3000; setPensionNeed(v); localStorage.setItem('pension_need', String(v)); }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-        </div>
-        <div>
-          <label className="text-[11px] text-ink-muted">Invest/mo</label>
-          <input aria-label="Monthly investment" type="number" placeholder="auto" value={pensionContrib} onChange={e => { setPensionContrib(e.target.value); localStorage.setItem('pension_contrib', e.target.value); }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-        </div>
+    <Section
+      id="pension-gap"
+      title="Pension Gap"
+      subtitle="In German, Rentenlücke: the monthly shortfall between your pensions and the income you want in retirement."
+    >
+      <div className="grid grid-cols-1 gap-x-3 gap-y-4 md:grid-cols-2">
+        <NumberField
+          label="Desired retirement income"
+          unit="€ / month"
+          integer
+          value={pensionNeed}
+          onValueChange={v => setPensionNeed(Math.max(0, v))}
+          hint="What you want to live on, after tax."
+        />
+        <NumberField
+          label="Monthly investment until retirement"
+          unit="€ / month"
+          value={toNum(pensionContrib)}
+          onValueChange={v => setPensionContrib(v > 0 ? String(v) : '')}
+          hint="Leave at 0 to use your average deposits over the last 12 months."
+        />
       </div>
+      <p className="mt-3 text-[13px] text-ink-muted">
+        Uses age {pensionCurrentAge} and retirement age {pensionAge} from Your Profile.
+      </p>
 
-      <div className="flex flex-wrap gap-1.5 mb-3">
+      <SubHeading className="mt-6">Pension sources</SubHeading>
+      <div className="mt-3 flex flex-wrap gap-2">
         {PENSION_TEMPLATES.map(t => (
-          <button key={t.type} onClick={() => {
-            const updated = [...pensionSources, { type: t.type, label: t.label, monthly_gross: t.type === 'gesetzliche' ? 0 : 500, rentenpunkte: t.rp, start_age: pensionAge, tax_portion_pct: 0 }];
-            setPensionSources(updated);
-            localStorage.setItem('pension_sources', JSON.stringify(updated));
-          }} className="rounded-[6px] bg-parchment-deep px-2.5 py-1 text-[12px] font-medium text-ink-body hover:bg-divider">
-            + {t.label}
-          </button>
+          <AddChip key={t.type} onClick={() => addSource(t)}>{t.label}</AddChip>
         ))}
       </div>
 
+      {pensionSources.length === 0 && !result && (
+        <div className="mt-4">
+          <EmptyState
+            title="No pension sources yet"
+            message="Add the pensions you expect, then calculate the gap. Your yearly pension statement (Renteninformation) lists your pension points."
+            action={{ label: 'Add statutory pension', onClick: () => addSource(PENSION_TEMPLATES[0]) }}
+          />
+        </div>
+      )}
+
       {pensionSources.length > 0 && (
-        <div className="space-y-2 mb-3">
+        <div className="mt-4 flex flex-col gap-3">
           {pensionSources.map((src, i) => (
-            <div key={i} className="rounded-xl bg-parchment-deep px-3 py-2">
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="text-[15px] font-medium text-ink">{src.label}</span>
-                <button onClick={() => {
-                  const updated = pensionSources.filter((_, j) => j !== i);
-                  setPensionSources(updated);
-                  localStorage.setItem('pension_sources', JSON.stringify(updated));
-                }} className="text-claret text-[12px]">Remove</button>
+            <ItemCard key={i}>
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <span className="min-w-0 text-[15px] font-medium text-ink">{sourceLabel(src)}</span>
+                <RemoveButton name={sourceLabel(src)} onClick={() => removeSource(i)} />
               </div>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-1 gap-x-3 gap-y-4 sm:grid-cols-2">
                 {src.type === 'gesetzliche' ? (
-                  <div>
-                    <label className="text-[11px] text-ink-muted">Rentenpunkte</label>
-                    <input aria-label="Rentenpunkte" type="number" step="0.1" value={src.rentenpunkte} onChange={e => {
-                      const updated = [...pensionSources]; updated[i] = { ...src, rentenpunkte: parseFloat(e.target.value) || 0 };
-                      setPensionSources(updated); localStorage.setItem('pension_sources', JSON.stringify(updated));
-                    }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-                  </div>
+                  <NumberField
+                    label="Pension points"
+                    value={src.rentenpunkte}
+                    onValueChange={v => updateSource(i, { rentenpunkte: Math.max(0, v) })}
+                    hint="Rentenpunkte (Entgeltpunkte) from your Renteninformation."
+                  />
                 ) : (
-                  <div>
-                    <label className="text-[11px] text-ink-muted">Monthly gross</label>
-                    <input aria-label="Monthly gross pension" type="number" value={src.monthly_gross} onChange={e => {
-                      const updated = [...pensionSources]; updated[i] = { ...src, monthly_gross: parseFloat(e.target.value) || 0 };
-                      setPensionSources(updated); localStorage.setItem('pension_sources', JSON.stringify(updated));
-                    }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-                  </div>
+                  <NumberField
+                    label="Monthly pension, before tax"
+                    unit="€ / month"
+                    value={src.monthly_gross}
+                    onValueChange={v => updateSource(i, { monthly_gross: Math.max(0, v) })}
+                  />
                 )}
-                <div>
-                  <label className="text-[11px] text-ink-muted">Start age</label>
-                  <input aria-label="Start age" type="number" value={src.start_age} onChange={e => {
-                    const updated = [...pensionSources]; updated[i] = { ...src, start_age: parseInt(e.target.value) || 67 };
-                    setPensionSources(updated); localStorage.setItem('pension_sources', JSON.stringify(updated));
-                  }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-                </div>
+                <NumberField
+                  label="Starts at age"
+                  unit="years"
+                  integer
+                  value={src.start_age}
+                  onValueChange={v => updateSource(i, { start_age: Math.max(0, v) })}
+                />
               </div>
-            </div>
+            </ItemCard>
           ))}
 
-          <button onClick={async () => {
-            setPensionLoading(true);
-            try {
-              const res = await fetch('/api/portfolio/pension-gap', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sources: pensionSources, retirement_age: pensionAge, monthly_need: pensionNeed, current_age: pensionCurrentAge, monthly_contrib: parseFloat(pensionContrib) || 0 }),
-              });
-              setPensionResult(await res.json());
-            } catch { /* ignore */ } finally { setPensionLoading(false); }
-          }} className="w-full apple-btn-primary" disabled={pensionLoading}>
-            {pensionLoading ? 'Calculating...' : 'Calculate Rentenlücke'}
+          <button type="button" onClick={calculate} className="apple-btn-primary min-h-[44px] w-full md:w-auto md:self-start" disabled={loading}>
+            {loading ? 'Calculating…' : 'Calculate pension gap'}
           </button>
         </div>
       )}
 
-      {pensionResult && (
-        <div className="space-y-3">
-          <div className="rounded-xl bg-parchment-deep p-3">
-            <div className="flex items-baseline justify-between mb-2">
-              <span className="text-[15px] font-medium text-ink">Monthly Income vs Need</span>
-              <span className="text-[12px] text-ink-muted">Target: {fmt(pensionResult.gap + pensionResult.total_monthly_net + pensionResult.portfolio_net)}/mo</span>
-            </div>
-            <div className="w-full h-6 rounded-full bg-divider overflow-hidden flex">
-              {pensionResult.sources.map((s, i) => {
-                const total = pensionNeed;
-                const pct = Math.min((s.monthly_net / total) * 100, 100);
-                const colors = ['bg-forest', 'bg-slate', 'bg-walnut', 'bg-amber', 'bg-sage', 'bg-claret'];
-                return <div key={i} className={`${colors[i % colors.length]} h-full`} style={{ width: `${pct}%` }} title={`${s.label}: ${fmt(s.monthly_net)}`} />;
-              })}
-              {pensionResult.portfolio_net > 0 && (
-                <div className="bg-sage h-full" style={{ width: `${Math.min((pensionResult.portfolio_net / pensionNeed) * 100, 100)}%` }} title={`Portfolio: ${fmt(pensionResult.portfolio_net)}`} />
-              )}
-            </div>
-            <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-[11px]">
-              {pensionResult.sources.map((s, i) => {
-                const colors = ['text-forest', 'text-slate', 'text-walnut', 'text-amber', 'text-sage', 'text-claret'];
-                return <span key={i} className={colors[i % colors.length]}>{s.label}: {fmt(s.monthly_net)}</span>;
-              })}
-              <span className="text-sage">Portfolio: {fmt(pensionResult.portfolio_net)}</span>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-2">
-            <div className="rounded-lg bg-parchment-deep p-2.5">
-              <p className="text-[11px] text-ink-muted">Monthly Gap</p>
-              <p className={`text-[13px] font-semibold tabular-nums ${pensionResult.gap <= 0 ? 'text-sage' : 'text-claret'}`}>
-                {pensionResult.gap <= 0 ? 'Covered!' : `${fmt(pensionResult.gap)}/mo`}
-              </p>
-            </div>
-            <div className="rounded-lg bg-parchment-deep p-2.5">
-              <p className="text-[11px] text-ink-muted">Extra Sparplan</p>
-              <p className="text-[13px] font-semibold tabular-nums text-ink">
-                {pensionResult.sparplan_to_close <= 0 ? '—' : `${fmt(pensionResult.sparplan_to_close)}/mo`}
-              </p>
-            </div>
-            <div className="rounded-lg bg-parchment-deep p-2.5">
-              <p className="text-[11px] text-ink-muted">Projected Portfolio</p>
-              <p className="text-[13px] font-semibold tabular-nums text-ink">{fmt(pensionResult.projected_portfolio)}</p>
-              {pensionResult.monthly_contrib > 0 && (
-                <p className="text-[11px] text-ink-muted">@ {fmt(pensionResult.monthly_contrib)}/mo</p>
-              )}
-            </div>
-            <div className="rounded-lg bg-parchment-deep p-2.5">
-              <p className="text-[11px] text-ink-muted">Portfolio Withdrawal</p>
-              <p className="text-[13px] font-semibold tabular-nums text-ink">{fmt(pensionResult.portfolio_net)}/mo net</p>
-            </div>
-          </div>
-
-          {pensionResult.sensitivity && pensionResult.sensitivity.length > 0 && (
-            <div className="rounded-xl bg-parchment-deep p-3">
-              <p className="text-[12px] font-medium text-ink mb-2">Retirement Age Sensitivity</p>
-              <EChartWrapper option={{
-                tooltip: { trigger: 'axis' as const },
-                legend: { data: ['Pension', 'Portfolio', 'Gap'], bottom: 0, textStyle: { fontSize: 10 } },
-                grid: { top: 10, right: 10, bottom: 30, left: 40 },
-                xAxis: { type: 'category' as const, data: pensionResult.sensitivity.map(s => String(s.age)), axisLabel: { fontSize: 10 } },
-                yAxis: { type: 'value' as const, axisLabel: { fontSize: 10, formatter: (v: number) => `${Math.round(v/1000)}K` } },
-                series: [
-                  { name: 'Pension', type: 'bar' as const, stack: 'income', data: pensionResult.sensitivity.map(s => s.pension_net), itemStyle: { color: tc.forest } },
-                  { name: 'Portfolio', type: 'bar' as const, stack: 'income', data: pensionResult.sensitivity.map(s => s.portfolio_net), itemStyle: { color: tc.sage } },
-                  { name: 'Gap', type: 'line' as const, data: pensionResult.sensitivity.map(s => Math.max(s.gap, 0)), itemStyle: { color: tc.claret }, lineStyle: { type: 'dashed' as const } },
-                ],
-              }} height="200px" />
-            </div>
-          )}
+      {error && (
+        <div className="mt-4">
+          <ErrorState message="The pension gap couldn’t be calculated." details={error} onRetry={calculate} />
         </div>
       )}
 
-      {pensionSources.length === 0 && !pensionResult && (
-        <p className="text-[13px] text-ink-muted">
-          Add pension sources to calculate your Rentenlücke. Your Renteninformation shows your Rentenpunkte.
-        </p>
+      {result && (
+        <div className="mt-6">
+          <MetricGrid>
+            <MetricCard
+              label="Monthly gap, after tax"
+              money={result.gap > 0}
+              tone={result.gap > 0 ? 'negative' : 'positive'}
+              value={result.gap > 0 ? fmtEUR(result.gap) : 'Covered'}
+              sublabel={<>Against <span data-privacy="blur">{fmtEUR(pensionNeed)}</span> a month from age {pensionAge}</>}
+            />
+            <MetricCard
+              label="Extra savings needed"
+              money={result.sparplan_to_close > 0}
+              value={result.sparplan_to_close > 0 ? fmtEUR(result.sparplan_to_close) : 'None'}
+              sublabel="A month until retirement, to close the gap"
+            />
+            <MetricCard
+              label="Projected portfolio"
+              value={fmtEUR(result.projected_portfolio)}
+              sublabel={result.monthly_contrib > 0
+                ? <>At retirement, investing <span data-privacy="blur">{fmtEUR(result.monthly_contrib)}</span> a month</>
+                : 'At retirement, without further investing'}
+            />
+            <MetricCard
+              label="Portfolio withdrawal"
+              value={fmtEUR(result.portfolio_net)}
+              sublabel="A month, after tax"
+            />
+          </MetricGrid>
+
+          <SubHeading className="mt-6">Monthly income after tax, against your target</SubHeading>
+          <p className="mt-1 mb-3 text-[13px] text-ink-muted">Share of the desired retirement income each source covers.</p>
+          <RankedBars items={incomeBars} scale="max" />
+
+          {sensitivity.length > 0 && (
+            <div className="mt-6">
+              <SubHeading>If you retired at a different age</SubHeading>
+              <p className="mt-1 text-[13px] text-ink-muted">Monthly income after tax by retirement age; the dashed line is the remaining gap.</p>
+              <EChartWrapper
+                option={{
+                  tooltip: { trigger: 'axis' as const, valueFormatter: (v: unknown) => fmtEUR(Number(v)) },
+                  legend: {
+                    bottom: 0,
+                    itemWidth: 16,
+                    data: [
+                      { name: 'Pensions', icon: 'rect' },
+                      { name: 'Portfolio withdrawals', icon: 'rect' },
+                      { name: 'Remaining gap', icon: 'path://M0 4h5v2h-5zM7 4h5v2h-5zM14 4h5v2h-5z' },
+                    ],
+                  },
+                  grid: { top: 28, right: 12, bottom: 76, left: 48 },
+                  xAxis: { type: 'category' as const, data: sensitivity.map(s => String(s.age)), axisLabel: { fontSize: 11 } },
+                  yAxis: { type: 'value' as const, name: '€ / month', min: 0, axisLabel: { fontSize: 11, formatter: (v: number) => fmtAxis(v) } },
+                  series: [
+                    { name: 'Pensions', type: 'bar' as const, stack: 'income', data: sensitivity.map(s => s.pension_net), color: tc.forest, itemStyle: { color: tc.forest } },
+                    { name: 'Portfolio withdrawals', type: 'bar' as const, stack: 'income', data: sensitivity.map(s => s.portfolio_net), color: tc.gold, itemStyle: { color: tc.gold } },
+                    { name: 'Remaining gap', type: 'line' as const, data: sensitivity.map(s => Math.max(s.gap, 0)), color: tc.claret, itemStyle: { color: tc.claret }, lineStyle: { color: tc.claret, type: 'dashed' as const, width: 2 }, symbol: 'none' },
+                  ],
+                }}
+                height="260px"
+              />
+            </div>
+          )}
+
+          <p className="mt-4 text-[13px] text-ink-muted">
+            Estimate only: pensions are taxed with a simplified progressive rate and about 7,7 % health insurance; the result reflects the inputs at the time you pressed Calculate.
+          </p>
+        </div>
       )}
-    </div>
+      {confirmDialog}
+    </Section>
   );
 }

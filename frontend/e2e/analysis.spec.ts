@@ -1,4 +1,21 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
+
+/** Analysis is grouped into tabs; each keeps its state in the URL (?tab=…). */
+async function openTab(page: Page, name: 'Risk' | 'Costs' | 'Exposure' | 'Performance' | 'Spending') {
+  const tab = page.getByRole('tab', { name, exact: true });
+  await tab.click();
+  await expect(tab).toHaveAttribute('aria-selected', 'true');
+  const panel = page.getByRole('tabpanel', { name });
+  await expect(panel).toBeVisible();
+  return panel;
+}
+
+/** Tax moved out of Analysis to its own page with Overview / Tools / Filing tabs. */
+async function openTaxTab(page: Page, tab: '' | 'tools' | 'filing') {
+  await page.goto(tab ? `/tax?tab=${tab}` : '/tax');
+  await expect(page.getByRole('heading', { name: 'Tax', level: 1 })).toBeVisible();
+  return page.getByRole('tabpanel');
+}
 
 test.describe('Analysis page', () => {
   test.beforeEach(async ({ page }) => {
@@ -9,25 +26,33 @@ test.describe('Analysis page', () => {
   });
 
   test('loads the analysis page', async ({ page }) => {
-    // Tab bar should be visible (Risk, Costs, etc.)
-    await expect(page.getByRole('tab', { name: 'Risk' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Analysis', level: 1 })).toBeVisible();
+    // Tab bar: Risk (default), Costs, Exposure, Performance, Spending
+    await expect(page.getByRole('tab')).toHaveText(['Risk', 'Costs', 'Exposure', 'Performance', 'Spending']);
+    await expect(page.getByRole('tab', { name: 'Risk' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  test('tab choice is kept in the URL and survives a reload', async ({ page }) => {
+    await openTab(page, 'Costs');
+    await expect(page).toHaveURL(/\/analysis\?tab=costs$/);
+    await page.reload();
+    await expect(page.getByRole('tab', { name: 'Costs' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('heading', { name: 'Fund Costs by Holding' })).toBeVisible();
+    for (const id of ['exposure', 'performance', 'spending']) {
+      await page.goto(`/analysis?tab=${id}`);
+      await expect(page.getByRole('tab', { selected: true })).toHaveText(new RegExp(id, 'i'));
+    }
   });
 
   test('displays sector allocation chart when data exists', async ({ page }) => {
-    const sectorHeading = page.getByRole('heading', { name: 'Sector Allocation' });
-    const count = await sectorHeading.count();
-    if (count > 0) {
-      await expect(sectorHeading.first()).toBeVisible();
-    }
+    const panel = await openTab(page, 'Exposure');
+    await expect(panel.getByRole('heading', { name: 'Sector Allocation' })).toBeVisible();
+    await expect(panel.getByText('Look-through exposure by sector')).toBeVisible();
   });
 
   test('displays sector drift chart when history data exists', async ({ page }) => {
-    const driftHeading = page.getByRole('heading', { name: 'Sector Drift Over Time' });
-    const count = await driftHeading.count();
-    if (count > 0) {
-      await expect(driftHeading.first()).toBeVisible();
-      await expect(page.getByText('How your sector exposure has shifted month by month')).toBeVisible();
-    }
+    const panel = await openTab(page, 'Exposure');
+    await expect(panel.getByRole('heading', { name: 'Sector Drift Over Time' })).toBeVisible();
   });
 
   test('sector history API returns valid response', async ({ request }) => {
@@ -159,27 +184,22 @@ test.describe('Analysis page', () => {
   });
 
   test('displays currency exposure section when data exists', async ({ page }) => {
-    const heading = page.getByRole('heading', { name: 'Currency Exposure' });
-    const count = await heading.count();
-    if (count > 0) {
-      await expect(heading.first()).toBeVisible();
-      await expect(page.getByText('Underlying currency exposure')).toBeVisible();
-      // Should show USD in the bar list
-      await expect(page.getByText('USD')).toBeVisible();
-    }
+    const panel = await openTab(page, 'Exposure');
+    await expect(panel.getByRole('heading', { name: 'Currency Exposure' })).toBeVisible();
+    await expect(panel.getByText('Underlying currency exposure')).toBeVisible();
+    // Should show USD in the bar list
+    await expect(panel.getByRole('listitem').filter({ hasText: /^USD/ }).first()).toBeVisible();
   });
 
   test('displays risk analytics section when data exists', async ({ page }) => {
-    const riskHeading = page.getByRole('heading', { name: 'Risk Analytics' });
-    const count = await riskHeading.count();
-    if (count > 0) {
-      await expect(riskHeading.first()).toBeVisible();
-      await expect(page.getByText('Volatility (ann.)')).toBeVisible();
-      await expect(page.getByText('Sharpe Ratio')).toBeVisible();
-      await expect(page.getByText('Max Drawdown')).toBeVisible();
-      await expect(page.getByText('VaR (95%, 1-day)')).toBeVisible();
-      await expect(page.getByText('Drawdown Over Time')).toBeVisible();
-    }
+    // Risk is the default tab
+    const panel = page.getByRole('tabpanel', { name: 'Risk' });
+    await expect(panel.getByRole('heading', { name: 'Risk Analytics' })).toBeVisible();
+    await expect(panel.getByText('Volatility (annualised)', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Sharpe ratio', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Max drawdown', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Value at risk (95 %, 1 day)', { exact: true })).toBeVisible();
+    await expect(panel.getByRole('heading', { name: 'Drawdown Over Time' })).toBeVisible();
   });
 
   test('tax API returns valid response', async ({ request }) => {
@@ -235,14 +255,23 @@ test.describe('Analysis page', () => {
   });
 
   test('displays tax overview section when data exists', async ({ page }) => {
-    const heading = page.getByRole('heading', { name: 'Tax Overview' });
-    const count = await heading.count();
-    if (count > 0) {
-      await expect(heading.first()).toBeVisible();
-      await expect(page.getByText('Realized Gains')).toBeVisible();
-      await expect(page.getByText('Estimated Tax')).toBeVisible();
-      await expect(page.getByText('Sparerpauschbetrag')).toBeVisible();
-    }
+    // Tax is its own page now, linked from the main navigation
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('link', { name: 'Tax', exact: true }).click();
+    await page.waitForURL('**/tax');
+    const panel = page.getByRole('tabpanel', { name: 'Overview' });
+    await expect(panel.getByRole('heading', { name: 'Tax Overview' })).toBeVisible();
+    await expect(panel.getByText('Realised gains', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Estimated tax', { exact: true })).toBeVisible();
+    await expect(panel.getByRole('heading', { name: /Sparer-Pauschbetrag/ })).toBeVisible();
+  });
+
+  test('tax tabs are kept in the URL and survive a reload', async ({ page }) => {
+    await page.goto('/tax');
+    await page.getByRole('tab', { name: 'Filing' }).click();
+    await expect(page).toHaveURL(/\/tax\?tab=filing$/);
+    await page.reload();
+    await expect(page.getByRole('tab', { name: 'Filing' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('heading', { name: /^Tax Calendar/ })).toBeVisible();
   });
 
   test('costs API returns valid response', async ({ request }) => {
@@ -336,13 +365,11 @@ test.describe('Analysis page', () => {
   });
 
   test('displays portfolio costs section when data exists', async ({ page }) => {
-    const heading = page.getByRole('heading', { name: 'Portfolio Costs' });
-    const count = await heading.count();
-    if (count > 0) {
-      await expect(heading.first()).toBeVisible();
-      await expect(page.getByText('Weighted Avg TER')).toBeVisible();
-      await expect(page.getByText('Annual Cost')).toBeVisible();
-    }
+    // "Portfolio Costs" became the Costs tab; its summary tiles replace the old labels
+    const panel = await openTab(page, 'Costs');
+    await expect(panel.getByText('Weighted ongoing charge', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Annual fund costs', { exact: true })).toBeVisible();
+    await expect(panel.getByRole('heading', { name: 'Fund Costs by Holding' })).toBeVisible();
   });
 
   test('tax-lots API returns FIFO lot inventory', async ({ request }) => {
@@ -364,20 +391,14 @@ test.describe('Analysis page', () => {
   });
 
   test('displays FIFO Tax Lot Inventory section', async ({ page }) => {
-    const heading = page.getByRole('heading', { name: 'FIFO Tax Lot Inventory' });
-    const count = await heading.count();
-    if (count > 0) {
-      await expect(heading.first()).toBeVisible();
-      await expect(page.getByText('Unrealized P&L')).toBeVisible();
-    }
+    const panel = await openTaxTab(page, 'tools');
+    await expect(panel.getByRole('heading', { name: 'FIFO Tax Lot Inventory' })).toBeVisible();
+    await expect(panel.getByText('Unrealised gain or loss', { exact: true })).toBeVisible();
   });
 
   test('displays cumulative fee drag chart in Portfolio Costs', async ({ page }) => {
-    const heading = page.getByText('Cumulative Fee Drag');
-    const count = await heading.count();
-    if (count > 0) {
-      await expect(heading.first()).toBeVisible();
-    }
+    const panel = await openTab(page, 'Costs');
+    await expect(panel.getByRole('heading', { name: 'Cumulative Fee Drag' })).toBeVisible();
   });
 
   test('health score API returns distinct subscore names', async ({ request }) => {
@@ -403,13 +424,12 @@ test.describe('Analysis page', () => {
     expect(['A+', 'A', 'B+', 'B', 'C', 'D']).toContain(data.benchmark.grade);
   });
 
-  test('displays cost efficiency benchmark card', async ({ page }) => {
-    const card = page.getByText('Cost Efficiency');
-    const count = await card.count();
-    if (count > 0) {
-      await expect(card.first()).toBeVisible();
-      await expect(page.getByText('avg German investor')).toBeVisible();
-    }
+  test('displays cost efficiency benchmark card', async ({ page, request }) => {
+    const { benchmark } = await (await request.get('/api/analysis/costs')).json();
+    const panel = await openTab(page, 'Costs');
+    // The benchmark card shows the grade from the API and the comparison with a typical investor
+    await expect(panel.getByText(`Cost grade ${benchmark.grade}`, { exact: true })).toBeVisible();
+    await expect(panel.getByText(/typical German fund investor/)).toBeVisible();
   });
 
   test('sell simulator API returns tax breakdown', async ({ request }) => {
@@ -436,11 +456,8 @@ test.describe('Analysis page', () => {
   });
 
   test('displays sell simulator section', async ({ page }) => {
-    const heading = page.getByRole('heading', { name: 'What-If Sell Simulator' });
-    const count = await heading.count();
-    if (count > 0) {
-      await expect(heading.first()).toBeVisible();
-      await expect(page.getByText('Preview Tax Impact')).toBeVisible();
-    }
+    const panel = await openTaxTab(page, 'tools');
+    await expect(panel.getByRole('heading', { name: 'What-If Sell Simulator' })).toBeVisible();
+    await expect(panel.getByRole('button', { name: 'Preview tax impact' })).toBeVisible();
   });
 });

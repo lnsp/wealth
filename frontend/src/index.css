@@ -22,6 +22,9 @@
   --color-amber: #7A5520;
   --color-walnut: #7A5C3A;
   --color-slate: #5E626C;
+  /* Control boundaries (inputs, selects, pills): ≥3:1 on every surface (WCAG 1.4.11). */
+  --color-field: color-mix(in srgb, var(--color-ink-muted) 70%, var(--color-divider));
+  color-scheme: light;
 }
 
 /* Dark mode — the club at midnight.
@@ -42,6 +45,7 @@
   --color-amber: #D4AA50;
   --color-walnut: #B89870;
   --color-slate: #9AA0AD;
+  color-scheme: dark;
 }
 
 @layer base {
@@ -63,6 +67,13 @@
   :focus-visible {
     outline: 2px solid var(--color-forest);
     outline-offset: 2px;
+  }
+
+  /* Placeholders use the muted ink token, never the browser's cool grey. */
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-ink-muted);
+    opacity: 1;
   }
 
   /* Paper-grain texture — subtle warmth, almost imperceptible */
@@ -120,12 +131,14 @@
     border-radius: 6px;
     background-color: var(--color-parchment-deep);
     padding: 0.625rem 0.875rem;
+    min-height: 44px;
     font-size: 16px;
-    border: 1px solid var(--color-divider);
-    transition: all 250ms cubic-bezier(0.16, 1, 0.3, 1);
-    color: var(--color-ink-body);
+    border: 1px solid var(--color-field);
+    transition: all 350ms cubic-bezier(0.16, 1, 0.3, 1);
+    color: var(--color-ink);
   }
-  .apple-input::placeholder { color: var(--color-ink-muted); opacity: 0.4; }
+  .apple-input::placeholder { color: var(--color-ink-muted); opacity: 1; }
+  .apple-input[aria-invalid="true"] { border-color: var(--color-claret); }
   .apple-input:focus { border-color: var(--color-forest); background-color: var(--color-parchment); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-forest) 20%, transparent); }
 
   .apple-select {
@@ -133,15 +146,19 @@
     border-radius: 6px;
     background-color: var(--color-parchment-deep);
     padding: 0.625rem 0.875rem;
+    min-height: 44px;
     font-size: 16px;
-    border: 1px solid var(--color-divider);
+    border: 1px solid var(--color-field);
     appearance: none;
-    transition: all 250ms cubic-bezier(0.16, 1, 0.3, 1);
-    color: var(--color-ink-body);
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238E8E93' d='M6 8.825a.6.6 0 01-.424-.176l-3.6-3.6a.6.6 0 01.848-.849L6 7.376 9.176 4.2a.6.6 0 01.848.849l-3.6 3.6A.6.6 0 016 8.825z'/%3E%3C/svg%3E");
+    transition: all 350ms cubic-bezier(0.16, 1, 0.3, 1);
+    color: var(--color-ink);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%235E5853' d='M6 8.825a.6.6 0 01-.424-.176l-3.6-3.6a.6.6 0 01.848-.849L6 7.376 9.176 4.2a.6.6 0 01.848.849l-3.6 3.6A.6.6 0 016 8.825z'/%3E%3C/svg%3E");
     background-repeat: no-repeat;
     background-position: right 12px center;
     padding-right: 32px;
+  }
+  .dark .apple-select {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239C968E' d='M6 8.825a.6.6 0 01-.424-.176l-3.6-3.6a.6.6 0 01.848-.849L6 7.376 9.176 4.2a.6.6 0 01.848.849l-3.6 3.6A.6.6 0 016 8.825z'/%3E%3C/svg%3E");
   }
   .apple-select:focus { border-color: var(--color-forest); background-color: var(--color-parchment); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-forest) 20%, transparent); }
 
@@ -150,33 +167,126 @@
     align-items: center;
     justify-content: center;
     border-radius: 4px;
+    border: 1px solid var(--color-forest);
     background-color: var(--color-forest);
-    padding: 0.625rem 1.25rem;
-    font-size: 15px;
+    min-height: 40px;
+    white-space: nowrap;
+    padding: 0.5rem 1.125rem;
+    font-size: 14px;
     font-weight: 600;
     color: var(--color-parchment);
     transition: all 350ms cubic-bezier(0.16, 1, 0.3, 1);
   }
-  .apple-btn-primary:hover { background-color: var(--color-forest-light); }
+  .apple-btn-primary:hover { background-color: var(--color-forest-light); border-color: var(--color-forest-light); }
   .apple-btn-primary:active { opacity: 0.8; }
-  .apple-btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+  .apple-btn-primary:disabled { background-color: var(--color-inset); color: var(--color-ink-muted); border: 1px dashed var(--color-field); cursor: not-allowed; }
 
   .apple-btn-secondary {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     border-radius: 4px;
-    border: 1px solid color-mix(in srgb, var(--color-forest) 30%, transparent);
+    border: 1px solid var(--color-forest);
     background-color: transparent;
-    padding: 0.625rem 1.25rem;
-    font-size: 15px;
-    font-weight: 500;
+    min-height: 40px;
+    white-space: nowrap;
+    padding: 0.5rem 1.125rem;
+    font-size: 14px;
+    font-weight: 600;
     color: var(--color-forest);
     transition: all 350ms cubic-bezier(0.16, 1, 0.3, 1);
   }
   .apple-btn-secondary:hover { background-color: color-mix(in srgb, var(--color-forest) 5%, transparent); }
   .apple-btn-secondary:active { background-color: color-mix(in srgb, var(--color-forest) 10%, transparent); }
-  .apple-btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
+  .apple-btn-secondary:disabled { background-color: var(--color-inset); color: var(--color-ink-muted); border: 1px dashed var(--color-field); cursor: not-allowed; }
+
+  /* Destructive actions: outlined by default, solid only inside a confirm dialog. */
+  .apple-btn-danger,
+  .apple-btn-danger-solid {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    border: 1px solid var(--color-claret);
+    min-height: 40px;
+    white-space: nowrap;
+    padding: 0.5rem 1.125rem;
+    font-size: 14px;
+    font-weight: 600;
+    transition: all 350ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .apple-btn-danger { background-color: transparent; color: var(--color-claret); }
+  .apple-btn-danger:hover { background-color: color-mix(in srgb, var(--color-claret) 6%, transparent); }
+  .apple-btn-danger-solid { background-color: var(--color-claret); color: var(--color-parchment); }
+  .apple-btn-danger-solid:hover { opacity: 0.9; }
+  .apple-btn-danger:disabled,
+  .apple-btn-danger-solid:disabled { background-color: var(--color-inset); color: var(--color-ink-muted); border: 1px dashed var(--color-field); cursor: not-allowed; }
+
+  /* Compact button height for inline rows (desktop only; keep 44px targets on touch). */
+  .apple-btn-sm { min-height: 44px; padding: 0.375rem 0.875rem; font-size: 13px; }
+  @media (min-width: 768px) {
+    .apple-btn-sm { min-height: 36px; }
+  }
+
+  /* All-caps Garamond eyebrow: KPI labels, table heads, group headers. */
+  .label-caps {
+    font-family: "EB Garamond", Georgia, "Times New Roman", serif;
+    font-size: 13px;
+    line-height: 16px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--color-ink-muted);
+  }
+
+  /* Outlined chip: status and type labels. Tone via border-{color} text-{color}. */
+  .apple-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border-radius: 9999px;
+    border: 1px solid var(--color-divider);
+    background-color: var(--color-parchment-deep);
+    padding: 1px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
+    color: var(--color-ink-body);
+  }
+
+  /* Table primitives */
+  .apple-table { width: 100%; border-collapse: collapse; }
+  .apple-table th {
+    text-align: left;
+    padding: 10px 12px;
+    font-family: "EB Garamond", Georgia, "Times New Roman", serif;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: var(--color-ink-muted);
+    background-color: var(--color-inset);
+    border-bottom: 1px solid var(--color-divider);
+  }
+  .apple-table td {
+    padding: 12px;
+    font-size: 14px;
+    color: var(--color-ink-body);
+    border-bottom: 1px solid var(--color-divider);
+  }
+  .apple-table tr:last-child td { border-bottom: 0; }
+  .apple-table .num { text-align: right; }
+
+  /* Horizontal scroll with an edge fade so off-screen tabs/columns are hinted. */
+  .scroll-fade-x {
+    overflow-x: auto;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+  }
+  @media (min-width: 768px) {
+    .scroll-fade-x { -webkit-mask-image: none; mask-image: none; }
+  }
 
   .apple-badge {
     display: inline-flex;
@@ -232,7 +342,7 @@
     filter: blur(4px);
     user-select: none;
   }
-  .privacy .font-serif.text-\[20px\] {
+  .privacy .font-serif.text-\[20px\]:not(h1):not(h2):not(h3):not(p) {
     filter: blur(5px);
     user-select: none;
   }

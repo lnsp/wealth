@@ -1,14 +1,23 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import type { ReactNode } from 'react';
 import { api, type HoldingRow, type PerformanceData, type DividendData, type PerformanceHistoryPoint, type AllocationData, type RebalanceTrade, type Account, type Security, type GoalProgress, type PriceAlertEntry, type NotificationEntry } from '../api/client';
 import EChartWrapper from '../components/charts/EChartWrapper';
-import HoldingsTable from '../components/HoldingsTable';
-import { TabBar, PeriodSelector, filterByPeriod, formatDateForPeriod } from '../components/ui';
+import HoldingsTable, { holdingKey } from '../components/HoldingsTable';
+import {
+  PageHeader, TabBar, TabPanel, useTabParam, Section, SubHeading, MetricCard, MetricGrid,
+  Field, NumberField, SelectField, PeriodSelector, filterByPeriod,
+  LoadingState, ErrorState, EmptyState, SectionBoundary, useConfirm, Chip, RankedBars, ProgressBar,
+} from '../components/ui';
 import type { Period } from '../components/ui';
 import { useThemeColors } from '../hooks/useThemeColors';
 import { useMarketRefresh } from '../hooks/useMarketRefresh';
 import UnvestedPanel from '../components/UnvestedPanel';
+import {
+  escapeHtml, fmtEUR, fmtPct, fmtQty, fmtNum, fmtDate, fmtDateLong, fmtMonth, fmtMonthShort, fmtDayMonth, fmtAxis, labelFor,
+} from '../utils/format';
 
 type PortfolioTab = 'overview' | 'dividends' | 'allocation' | 'holdings' | 'goals';
+const TAB_IDS: readonly PortfolioTab[] = ['overview', 'dividends', 'allocation', 'holdings', 'goals'];
 const PORTFOLIO_TABS: { id: PortfolioTab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'dividends', label: 'Dividends' },
@@ -17,56 +26,434 @@ const PORTFOLIO_TABS: { id: PortfolioTab; label: string }[] = [
   { id: 'goals', label: 'Goals & Alerts' },
 ];
 
+const IMPORT_HREF = '/settings?tab=data';
+/** Alert types a person sets on this page. Everything else (digests, tax reminders) lives under the bell. */
+const PRICE_ALERT_TYPES = new Set(['price_above', 'price_below', 'daily_change', 'portfolio_milestone']);
+
+type Tone = 'neutral' | 'positive' | 'negative';
+const toneOf = (n: number): Tone => (n > 0 ? 'positive' : n < 0 ? 'negative' : 'neutral');
+const toneText = (n: number) => (n > 0 ? 'text-sage' : n < 0 ? 'text-claret' : 'text-ink');
+
+type SecurityDetail = Awaited<ReturnType<typeof api.getSecurityDetail>>;
+type HealthScore = Awaited<ReturnType<typeof api.getHealthScore>>;
+type SavingsPlans = Awaited<ReturnType<typeof api.getSavingsPlans>>;
+type AllocationHistory = Awaited<ReturnType<typeof api.getAllocationHistory>>;
+
+interface SwitchResult {
+  current_name: string; total_invested: number; current_value: number; alternative_value: number;
+  difference_eur: number; difference_pct: number; correlation: number; low_correlation_warning: boolean;
+  unrealized_gain: number; teilfreistellung: number; taxable_gain: number; freibetrag_used: number;
+  tax_on_switch: number; net_proceeds: number; break_even_years: number; is_equity: boolean;
+}
+
+interface TimeMachineData {
+  date: string;
+  holdings: { isin: string; name: string; quantity: number; value: number; weight_pct: number }[];
+  net_worth: number;
+  current: { net_worth: number };
+  change: { net_worth_change: number; net_worth_pct: number; contributions: number; market_return: number; dividends: number; assets?: number; purchase_costs?: number; loan_interest?: number };
+}
+
+/** One independently loaded resource with loading / error / retry. */
+function useLoad<T>(fn: () => Promise<T>) {
+  const [state, setState] = useState<{ data: T | null; error: string | null; loading: boolean }>({ data: null, error: null, loading: true });
+  const fnRef = useRef(fn);
+  fnRef.current = fn;
+  const reload = useCallback(() => {
+    setState(s => ({ ...s, loading: true, error: null }));
+    return fnRef.current()
+      .then(data => setState({ data, error: null, loading: false }))
+      .catch((e: unknown) => setState(s => ({ data: s.data, error: e instanceof Error ? e.message : 'Request failed', loading: false })));
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+  return { ...state, reload };
+}
+
+function Money({ children, className }: { children: ReactNode; className?: string }) {
+  return <span data-privacy="blur" className={className}>{children}</span>;
+}
+
+/** "2026-11" → "Nov ’26"; anything else is passed through. */
+function monthLabel(m: string, long = false): string {
+  if (/^\d{4}-\d{2}$/.test(m)) return long ? fmtMonth(`${m}-01`) : fmtMonthShort(`${m}-01`);
+  return m;
+}
+
+/**
+ * Category time axis whose labels never repeat: short ranges label days, longer ranges label the
+ * first point of each month, multi-year ranges the first point of each year.
+ */
+function timeAxis(dates: string[], period: Period) {
+  const shortRange = period === '1M' || period === '3M' || period === '6M' || period === 'YTD';
+  const spanDays = dates.length > 1 ? (new Date(dates[dates.length - 1]).getTime() - new Date(dates[0]).getTime()) / 86_400_000 : 0;
+  const byYear = spanDays > 900;
+  const bucket = (d: string) => (byYear ? d.slice(0, 4) : d.slice(0, 7));
+  const useDays = shortRange || new Set(dates.map(bucket)).size <= 2;
+  return {
+    type: 'category' as const,
+    data: dates,
+    boundaryGap: false,
+    axisLabel: useDays
+      ? { formatter: (v: string) => fmtDayMonth(v), hideOverlap: true }
+      : {
+          interval: (i: number) => i > 0 && bucket(dates[i]) !== bucket(dates[i - 1]),
+          formatter: (v: string) => (byYear ? v.slice(0, 4) : fmtMonthShort(v)),
+          hideOverlap: true,
+        },
+  };
+}
+
+interface TipParam { seriesName: string; data: number | null | [string, number]; axisValue: string; marker: string }
+function axisTooltip(fmtValue: (v: number, series: string) => string, fmtHead: (axisValue: string) => string = fmtDateLong) {
+  return {
+    trigger: 'axis' as const,
+    formatter: (params: unknown) => {
+      const ps = params as TipParam[];
+      if (!Array.isArray(ps) || ps.length === 0) return '';
+      const rows = ps
+        .filter(p => p.data != null)
+        .map(p => {
+          const v = Array.isArray(p.data) ? p.data[1] : (p.data as number);
+          return `${p.marker} ${escapeHtml(p.seriesName)}: <strong>${escapeHtml(fmtValue(v, p.seriesName))}</strong>`;
+        });
+      return `${escapeHtml(fmtHead(ps[0].axisValue))}<br/>${rows.join('<br/>')}`;
+    },
+  };
+}
+
+const LEGEND = { bottom: 0, itemGap: 16, itemWidth: 28, itemHeight: 10, textStyle: { fontSize: 12 } };
+/** Legend swatches that show the line style, so two lines are never told apart by colour alone. */
+const LINE_ICON = {
+  solid: 'path://M0 4h28v2.5H0z',
+  dashed: 'path://M0 4h7v2.5H0zM10.5 4h7v2.5h-7zM21 4h7v2.5h-7z',
+  dotted: 'path://M0 4h3v2.5H0zM6.25 4h3v2.5h-3zM12.5 4h3v2.5h-3zM18.75 4h3v2.5h-3zM25 4h3v2.5h-3z',
+};
+const lineLegend = (items: [string, keyof typeof LINE_ICON][]) => ({ ...LEGEND, data: items.map(([name, style]) => ({ name, icon: LINE_ICON[style] })) });
+const GRID = { left: 4, right: 16, top: 16, bottom: 44, containLabel: true };
+
+/** Two-or-more-way view switch with pressed state (not tabs: it changes one chart). */
+function ViewToggle<T extends string>({ value, options, onChange, label }: { value: T; options: { id: T; label: string }[]; onChange: (v: T) => void; label: string }) {
+  return (
+    <div className="inline-flex flex-wrap gap-1.5" role="group" aria-label={label}>
+      {options.map(o => {
+        const active = o.id === value;
+        return (
+          <button
+            key={o.id}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onChange(o.id)}
+            className={`min-h-[44px] md:min-h-[32px] px-3 rounded-[4px] border text-[13px] transition-colors ${
+              active ? 'bg-forest border-forest text-parchment font-semibold' : 'border-field text-ink-body font-medium hover:border-forest hover:text-ink'
+            }`}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function Rows({ children, className = '' }: { children: ReactNode; className?: string }) {
+  return <ul className={`border-y border-divider divide-y divide-divider ${className}`}>{children}</ul>;
+}
+
+/* ───────────────────────────── Security detail ───────────────────────────── */
+
+function SecurityDetailPanel({ detail }: { detail: SecurityDetail }) {
+  const tc = useThemeColors();
+  const [altISIN, setAltISIN] = useState('');
+  const [switchResult, setSwitchResult] = useState<SwitchResult | null>(null);
+  const [switchLoading, setSwitchLoading] = useState(false);
+  const [switchError, setSwitchError] = useState<string | null>(null);
+
+  const compare = async () => {
+    if (!altISIN) return;
+    setSwitchLoading(true);
+    setSwitchResult(null);
+    setSwitchError(null);
+    try {
+      const res = await fetch(`/api/portfolio/switch-compare?current=${encodeURIComponent(detail.isin)}&alternative=${encodeURIComponent(altISIN)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setSwitchResult(await res.json());
+    } catch (e) {
+      setSwitchError(e instanceof Error ? e.message : 'Request failed');
+    } finally {
+      setSwitchLoading(false);
+    }
+  };
+
+  // Buy/sell markers aligned to sparkline dates. The x-axis is category-based, so a marker only
+  // renders when its x-value matches an existing category; transactions on weekends/holidays are
+  // snapped to the first price date on or after the transaction date.
+  const sparkDates = detail.sparkline.map(s => s.date);
+  const sparkSet = new Set(sparkDates);
+  const priceMap = new Map(detail.sparkline.map(s => [s.date, s.price]));
+  const snap = (d: string): string | null => {
+    if (sparkSet.has(d)) return d;
+    if (sparkDates.length === 0 || d < sparkDates[0] || d > sparkDates[sparkDates.length - 1]) return null;
+    return sparkDates.find(x => x >= d) ?? null;
+  };
+  const buyMarkers: [string, number][] = [];
+  const sellMarkers: [string, number][] = [];
+  detail.transactions.forEach(t => {
+    const s = snap(t.date);
+    if (!s) return;
+    const price = priceMap.get(s) || 0;
+    if (t.type === 'buy' || t.type === 'savings_plan') buyMarkers.push([s, price]);
+    else if (t.type === 'sell') sellMarkers.push([s, price]);
+  });
+  const avgCost = detail.total_quantity > 0 ? detail.total_cost / detail.total_quantity : 0;
+
+  return (
+    <div className="flex flex-col gap-6">
+      <p className="text-[13px] text-ink-muted">
+        {[detail.symbol, labelFor(detail.asset_class), detail.ter > 0 ? `Ongoing charge (TER) ${fmtPct(detail.ter, { digits: 2 })} p.a.` : null,
+          detail.first_buy ? `First bought ${fmtDateLong(detail.first_buy)}` : null].filter(Boolean).join(' · ')}
+      </p>
+
+      <MetricGrid>
+        <MetricCard label="Market value" value={fmtEUR(detail.total_value)} sublabel={`Cost basis ${fmtEUR(detail.total_cost)}`} />
+        <MetricCard label="Unrealised gain" value={fmtEUR(detail.unrealized_pl, { sign: true })} tone={toneOf(detail.unrealized_pl)} sublabel="Market value minus cost, in EUR" />
+        <MetricCard label="Weight" value={fmtPct(detail.weight_pct)} money={false} sublabel="Share of all holdings" />
+        <MetricCard label="Units" value={fmtQty(detail.total_quantity)} money={false} sublabel="Across all accounts" />
+      </MetricGrid>
+
+      {detail.sparkline.length > 2 && (
+        <div>
+          <SubHeading>Price, last {detail.sparkline.length} trading days · EUR</SubHeading>
+          <p className="text-[12px] text-ink-muted mt-1 mb-2">
+            {[avgCost > 0 ? `Dashed line: average cost ${fmtEUR(avgCost, { cents: true })}` : null,
+              buyMarkers.length > 0 ? '● purchases' : null,
+              sellMarkers.length > 0 ? '◆ sales' : null].filter(Boolean).join(' · ') || 'Converted at the latest ECB reference rate.'}
+          </p>
+          <EChartWrapper option={{
+            grid: { left: 4, right: 16, top: 12, bottom: 4, containLabel: true },
+            xAxis: { type: 'category' as const, data: sparkDates, boundaryGap: false, axisLabel: { formatter: (v: string) => fmtDayMonth(v), hideOverlap: true } },
+            yAxis: { type: 'value' as const, scale: true, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
+            series: [
+              {
+                type: 'line' as const, name: 'Price', data: detail.sparkline.map(s => s.price), showSymbol: false,
+                color: tc.forest, lineStyle: { color: tc.forest, width: 1.75 }, itemStyle: { color: tc.forest },
+                ...(avgCost > 0 ? { markLine: { silent: true, symbol: 'none', data: [{ yAxis: avgCost }], lineStyle: { color: tc.gold, type: 'dashed' as const, width: 1 }, label: { show: false } } } : {}),
+              },
+              ...(buyMarkers.length > 0 ? [{ type: 'scatter' as const, name: 'Purchase', data: buyMarkers, symbol: 'circle', symbolSize: 8, color: tc.sage, itemStyle: { color: tc.sage } }] : []),
+              ...(sellMarkers.length > 0 ? [{ type: 'scatter' as const, name: 'Sale', data: sellMarkers, symbol: 'diamond', symbolSize: 10, color: tc.claret, itemStyle: { color: tc.claret } }] : []),
+            ],
+            tooltip: axisTooltip(v => fmtEUR(v, { cents: true })),
+          }} height="200px" />
+        </div>
+      )}
+
+      {detail.positions.length > 1 && (
+        <div>
+          <SubHeading className="mb-2">By account</SubHeading>
+          <Rows>
+            {detail.positions.map((p, i) => (
+              <li key={i} className="flex items-center justify-between gap-3 py-2.5 text-[14px]">
+                <span className="text-ink min-w-0 truncate">{p.account}</span>
+                <span className="text-ink-body shrink-0">{fmtQty(p.quantity)} units · <Money className="text-ink">{fmtEUR(p.value)}</Money></span>
+              </li>
+            ))}
+          </Rows>
+        </div>
+      )}
+
+      {detail.transactions.length > 0 && (
+        <div>
+          <SubHeading className="mb-2">
+            Recent transactions{detail.transactions.length > 10 ? ` · last 10 of ${detail.transactions.length}` : ''}
+          </SubHeading>
+          <div className="overflow-x-auto rounded-apple border border-divider" role="region" tabIndex={0} aria-label={`Recent transactions, ${detail.name}`}>
+            <table className="apple-table min-w-[420px]">
+              <thead>
+                <tr>
+                  <th scope="col">Date</th>
+                  <th scope="col">Type</th>
+                  <th scope="col" className="num">Units</th>
+                  <th scope="col" className="num">Amount</th>
+                  <th scope="col" className="num">Units held after</th>
+                </tr>
+              </thead>
+              <tbody>
+                {detail.transactions.slice(-10).reverse().map((t, i) => (
+                  <tr key={i}>
+                    <td className="whitespace-nowrap">{fmtDate(t.date)}</td>
+                    <td>{labelFor(t.type)}</td>
+                    <td className="num">{t.quantity > 0 ? fmtQty(t.quantity) : '—'}</td>
+                    <td className="num whitespace-nowrap"><Money>{fmtEUR(t.amount, { cents: true })}</Money></td>
+                    <td className="num">{fmtQty(t.running_qty)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Product switch comparison */}
+      <div>
+        <SubHeading>What if I had bought a different product?</SubHeading>
+        <p className="text-[12px] text-ink-muted mt-1 mb-3">Replays your purchases of this holding into another security and estimates the tax cost of switching today.</p>
+        <form className="flex flex-wrap items-end gap-3" onSubmit={e => { e.preventDefault(); compare(); }}>
+          <Field
+            label="Alternative ISIN"
+            className="flex-1 basis-56 max-w-sm"
+            value={altISIN}
+            onChange={e => setAltISIN(e.target.value.toUpperCase().trim())}
+            placeholder="e.g. IE00B4L5Y983"
+            autoCapitalize="characters"
+            spellCheck={false}
+          />
+          <button type="submit" disabled={switchLoading || !altISIN} className="apple-btn-secondary min-h-[44px]">
+            {switchLoading ? 'Comparing…' : 'Compare'}
+          </button>
+        </form>
+        {switchError && <div className="mt-3"><ErrorState message="The comparison couldn’t be computed. Check the ISIN and try again." details={switchError} onRetry={compare} /></div>}
+
+        {switchResult && (
+          <div className="mt-4 flex flex-col gap-4">
+            <MetricGrid>
+              <MetricCard label="This holding" value={fmtEUR(switchResult.current_value)} sublabel="Value today" />
+              <MetricCard label="Alternative" value={fmtEUR(switchResult.alternative_value)} sublabel="Same purchases, value today" />
+              <MetricCard
+                label="Difference"
+                value={fmtEUR(switchResult.difference_eur, { sign: true })}
+                tone={toneOf(switchResult.difference_eur)}
+                sublabel={`${fmtPct(switchResult.difference_pct, { sign: true })} · correlation ${fmtNum(switchResult.correlation, 2)}`}
+              />
+            </MetricGrid>
+            {switchResult.low_correlation_warning && (
+              <p className="text-[13px] text-ink-body flex flex-wrap items-center gap-2">
+                <Chip tone="warning">Low correlation</Chip>
+                These two products track different markets, so the comparison may not be meaningful.
+              </p>
+            )}
+
+            {switchResult.unrealized_gain !== 0 && (
+              <div>
+                <SubHeading className="mb-2">Tax cost of switching</SubHeading>
+                <dl className="grid grid-cols-[1fr_auto] gap-x-6 gap-y-1.5 text-[14px] max-w-md">
+                  <dt className="text-ink-body">Unrealised gain</dt>
+                  <dd className={`text-right ${toneText(switchResult.unrealized_gain)}`}><Money>{fmtEUR(switchResult.unrealized_gain, { sign: true })}</Money></dd>
+                  {switchResult.is_equity && switchResult.teilfreistellung > 0 && (<>
+                    <dt className="text-ink-body">Teilfreistellung (partial exemption, 30 %)</dt>
+                    <dd className="text-right text-ink"><Money>{fmtEUR(-switchResult.teilfreistellung)}</Money></dd>
+                  </>)}
+                  {switchResult.freibetrag_used > 0 && (<>
+                    <dt className="text-ink-body">Freibetrag (tax-free allowance used)</dt>
+                    <dd className="text-right text-ink"><Money>{fmtEUR(-switchResult.freibetrag_used)}</Money></dd>
+                  </>)}
+                  <dt className="text-ink font-medium">Tax due on switching</dt>
+                  <dd className="text-right text-ink font-medium"><Money>{fmtEUR(switchResult.tax_on_switch)}</Money></dd>
+                  <dt className="text-ink-body">Net proceeds</dt>
+                  <dd className="text-right text-ink"><Money>{fmtEUR(switchResult.net_proceeds)}</Money></dd>
+                </dl>
+                {switchResult.break_even_years > 0 ? (
+                  <p className="text-[13px] text-ink-muted mt-2">Break-even: about {fmtNum(switchResult.break_even_years, switchResult.break_even_years % 1 === 0 ? 0 : 1)} {switchResult.break_even_years === 1 ? 'year' : 'years'} for the alternative to recover the tax cost.</p>
+                ) : switchResult.difference_eur < 0 && switchResult.tax_on_switch > 0 ? (
+                  <p className="text-[13px] text-ink-body mt-2 flex flex-wrap items-center gap-2"><Chip tone="danger">No break-even</Chip> The alternative has historically underperformed, so the tax cost would not be recovered.</p>
+                ) : null}
+              </div>
+            )}
+
+            <div>
+              <SubHeading className="mb-2">Ways to switch</SubHeading>
+              {switchResult.difference_eur < 0 && switchResult.unrealized_gain >= 0 ? (
+                <p className="text-[13px] text-ink-body">No switch suggested: the alternative has historically underperformed by <Money>{fmtEUR(Math.abs(switchResult.difference_eur))}</Money>.</p>
+              ) : (
+                <ol className="list-decimal pl-5 flex flex-col gap-2 text-[13px] text-ink-body">
+                  <li>
+                    <span className="font-medium text-ink">Redirect future contributions.</span>{' '}
+                    Stop buying the current product and invest new money in the alternative. No tax event; the transition happens gradually.
+                  </li>
+                  {switchResult.tax_on_switch > 1000 && (
+                    <li>
+                      <span className="font-medium text-ink">Split the sale across two tax years.</span>{' '}
+                      Sell about <Money>{fmtEUR(switchResult.current_value / 2)}</Money> per year to use the Sparer-Pauschbetrag (saver’s allowance) twice, saving roughly <Money>{fmtEUR(Math.min(1000, switchResult.taxable_gain) * 0.26375)}</Money>.
+                    </li>
+                  )}
+                  {switchResult.unrealized_gain < 0 && (
+                    <li>
+                      <span className="font-medium text-ink">Harvest the loss.</span>{' '}
+                      The holding carries <Money>{fmtEUR(Math.abs(switchResult.unrealized_gain))}</Money> of unrealised losses. Selling now realises them, which offsets future gains (about <Money>{fmtEUR(Math.abs(switchResult.unrealized_gain) * 0.26375)}</Money> of tax).
+                    </li>
+                  )}
+                  {switchResult.unrealized_gain >= 0 && switchResult.tax_on_switch <= 1000 && switchResult.tax_on_switch > 0 && (
+                    <li>
+                      <span className="font-medium text-ink">Switch in one go.</span>{' '}
+                      A tax cost of <Money>{fmtEUR(switchResult.tax_on_switch)}</Money> is modest; a single switch may be simpler than a gradual one.
+                    </li>
+                  )}
+                </ol>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────────────────────── Page ───────────────────────────────── */
+
 export default function Portfolio() {
   const tc = useThemeColors();
+  const [confirm, confirmDialog] = useConfirm();
+  const [activeTab, setActiveTab] = useTabParam<PortfolioTab>(TAB_IDS, 'overview');
+
+  // Core data: holdings, performance, dividends
   const [holdings, setHoldings] = useState<HoldingRow[]>([]);
   const [performance, setPerformance] = useState<PerformanceData | null>(null);
   const [dividends, setDividends] = useState<DividendData | null>(null);
-  const [perfHistory, setPerfHistory] = useState<PerformanceHistoryPoint[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [dividendView, setDividendView] = useState<'monthly' | 'yearly' | 'cumulative'>('monthly');
   const [priceAsOf, setPriceAsOf] = useState<string | null>(null);
-  const [allocation, setAllocation] = useState<AllocationData | null>(null);
-  const [editingTargets, setEditingTargets] = useState(false);
-  const [targetDrafts, setTargetDrafts] = useState<Record<string, string>>({});
-  const [rebalanceTrades, setRebalanceTrades] = useState<RebalanceTrade[]>([]);
-  const [rebalanceMsg, setRebalanceMsg] = useState('');
-  const [depositAmount, setDepositAmount] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [filterAccount, setFilterAccount] = useState<string>('');
-  const [healthScore, setHealthScore] = useState<{ score: number; subscores: { name: string; score: number; weight: number; status: string; detail: string }[] } | null>(null);
-  const [securityDetail, setSecurityDetail] = useState<Awaited<ReturnType<typeof api.getSecurityDetail>> | null>(null);
-  const [tmDate, setTmDate] = useState('');
-  const [tmData, setTmData] = useState<{ date: string; holdings: { isin: string; name: string; quantity: number; value: number; weight_pct: number }[]; net_worth: number; current: { net_worth: number }; change: { net_worth_change: number; net_worth_pct: number; contributions: number; market_return: number; dividends: number; assets?: number; purchase_costs?: number; loan_interest?: number } } | null>(null);
-  const [tmLoading, setTmLoading] = useState(false);
-  const [savingsPlans, setSavingsPlans] = useState<Awaited<ReturnType<typeof api.getSavingsPlans>> | null>(null);
-  const [allocHistory, setAllocHistory] = useState<{ history: { date: string; weights: Record<string, number> }[]; holdings: string[] } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<PortfolioTab>('overview');
+
+  const [dividendView, setDividendView] = useState<'monthly' | 'yearly' | 'cumulative'>('monthly');
   const [growthPeriod, setGrowthPeriod] = useState<Period>('All');
   const [allocPeriod, setAllocPeriod] = useState<Period>('All');
-  const [switchAltISIN, setSwitchAltISIN] = useState('');
-  const [switchResult, setSwitchResult] = useState<{ current_name: string; total_invested: number; current_value: number; alternative_value: number; difference_eur: number; difference_pct: number; correlation: number; low_correlation_warning: boolean; unrealized_gain: number; teilfreistellung: number; taxable_gain: number; freibetrag_used: number; tax_on_switch: number; net_proceeds: number; break_even_years: number; is_equity: boolean } | null>(null);
-  const [switchLoading, setSwitchLoading] = useState(false);
 
-  // Goals & Alerts state
-  const [securities, setSecurities] = useState<Security[]>([]);
-  const [goals, setGoals] = useState<GoalProgress[]>([]);
+  // Allocation
+  const [editingTargets, setEditingTargets] = useState(false);
+  const [targetDrafts, setTargetDrafts] = useState<Record<string, number>>({});
+  const [targetError, setTargetError] = useState<string | null>(null);
+  const [rebalanceTrades, setRebalanceTrades] = useState<RebalanceTrade[]>([]);
+  const [rebalanceMsg, setRebalanceMsg] = useState('');
+  const [rebalanceError, setRebalanceError] = useState<string | null>(null);
+  const [rebalanceDone, setRebalanceDone] = useState(false);
+  const [depositAmount, setDepositAmount] = useState(0);
+
+  // Holdings: expanded security detail, time machine
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [securityDetail, setSecurityDetail] = useState<SecurityDetail | null>(null);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const detailRequest = useRef<string | null>(null);
+  const [tmDate, setTmDate] = useState('');
+  const [tmData, setTmData] = useState<TimeMachineData | null>(null);
+  const [tmLoading, setTmLoading] = useState(false);
+  const [tmError, setTmError] = useState<string | null>(null);
+
+  // Goals & alerts forms
   const [goalName, setGoalName] = useState('');
-  const [goalTarget, setGoalTarget] = useState('');
+  const [goalTarget, setGoalTarget] = useState(0);
   const [goalDate, setGoalDate] = useState('');
-  const [goalContrib, setGoalContrib] = useState('');
-  const [goalReturn, setGoalReturn] = useState('7');
-  const [alerts, setAlerts] = useState<PriceAlertEntry[]>([]);
-  const [notifications, setNotifications] = useState<NotificationEntry[]>([]);
+  const [goalContrib, setGoalContrib] = useState(0);
+  const [goalReturn, setGoalReturn] = useState(7);
+  const [goalError, setGoalError] = useState<string | null>(null);
   const [alertType, setAlertType] = useState('price_above');
   const [alertISIN, setAlertISIN] = useState('');
-  const [alertThreshold, setAlertThreshold] = useState('');
+  const [alertThreshold, setAlertThreshold] = useState(0);
+  const [alertError, setAlertError] = useState<string | null>(null);
 
   const loadPortfolio = useCallback(() => {
+    const acctId = filterAccount || undefined;
     Promise.all([
-      api.listHoldings(),
-      api.getPerformance(),
+      api.listHoldings(acctId),
+      api.getPerformance(acctId),
       api.getDividends(),
     ])
       .then(([holdRes, perfRes, divRes]) => {
@@ -74,1315 +461,999 @@ export default function Portfolio() {
         setPriceAsOf(holdRes.price_as_of || null);
         setPerformance(perfRes);
         setDividends(divRes);
+        setError(null);
       })
       .catch(e => setError(e.message || 'Failed to load portfolio data'))
       .finally(() => setLoading(false));
-    api.getPerformanceHistory().then(res => setPerfHistory(res.history || [])).catch(() => {});
-  }, []);
+  }, [filterAccount]);
+
+  useEffect(() => { loadPortfolio(); }, [loadPortfolio]);
 
   useEffect(() => {
-    loadPortfolio();
-    api.getAllocation().then(setAllocation).catch(() => {});
-    api.listAccounts().then(res => setAccounts((res.accounts || []).filter(a => a.type === 'brokerage'))).catch(() => {});
-    api.getAllocationHistory().then(setAllocHistory).catch(() => {});
-    api.getHealthScore().then(setHealthScore).catch(() => {});
-    api.getSavingsPlans().then(setSavingsPlans).catch(() => {});
-    api.listSecurities().then(res => setSecurities(res.securities || [])).catch(() => {});
-    api.listGoals().then(r => setGoals(r.goals || [])).catch(() => {});
-    api.listAlerts().then(r => setAlerts(r.alerts || [])).catch(() => {});
-    api.listNotifications().then(r => setNotifications(r.notifications || [])).catch(() => {});
-  }, [loadPortfolio]);
+    api.listAccounts().then(res => setAccounts((res.accounts || []).filter(a => ['brokerage', 'crypto', 'pension', 'precious_metals'].includes(a.type)))).catch(() => {});
+  }, []);
+
+  const perfHistory = useLoad<PerformanceHistoryPoint[]>(() => api.getPerformanceHistory().then(r => r.history || []));
+  const allocation = useLoad<AllocationData>(() => api.getAllocation());
+  const allocHistory = useLoad<AllocationHistory>(() => api.getAllocationHistory());
+  const healthScore = useLoad<HealthScore>(() => api.getHealthScore());
+  const savingsPlans = useLoad<SavingsPlans>(() => api.getSavingsPlans());
+  const securities = useLoad<Security[]>(() => api.listSecurities().then(r => r.securities || []));
+  const goals = useLoad<GoalProgress[]>(() => api.listGoals().then(r => r.goals || []));
+  const alerts = useLoad<PriceAlertEntry[]>(() => api.listAlerts().then(r => r.alerts || []));
+  const notifications = useLoad<NotificationEntry[]>(() => api.listNotifications().then(r => r.notifications || []));
 
   // Auto-refresh during market hours (every 60s)
   useMarketRefresh(loadPortfolio, 60_000);
 
-  // Reload holdings and performance when account filter changes
-  useEffect(() => {
-    api.listHoldings(filterAccount || undefined).then(res => {
-      setHoldings(res.holdings || []);
-      setPriceAsOf(res.price_as_of || null);
-    }).catch(() => {});
-    api.getPerformance(filterAccount || undefined).then(setPerformance).catch(() => {});
-  }, [filterAccount]);
+  const retryCore = () => { setError(null); setLoading(true); loadPortfolio(); };
 
-  if (loading) {
-    return <div className="flex items-center justify-center py-20 text-[16px] text-ink-muted">Loading...</div>;
-  }
-
-  if (error) {
-    return (
-      <div className="flex flex-col items-center justify-center py-20 gap-3">
-        <svg className="w-10 h-10 text-claret" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-        </svg>
-        <p className="text-[16px] text-claret">{error}</p>
-        <button onClick={() => { setError(null); loadPortfolio(); }} className="text-forest text-[15px] font-medium">Retry</button>
-      </div>
-    );
-  }
-
-  // hasMarketPrices = ANY holding has a live price. fullyPriced = ALL do.
-  // market_value and unrealized_pl are EUR-converted server-side
-  // (HandleHoldings); avg_cost_basis is still per-share in the security's
-  // native currency. To get an EUR-clean cost basis without doing FX on the
-  // client, derive it from market_value - unrealized_pl for priced holdings.
-  // Unpriced holdings fall back to qty × avg_cost_basis (native) — surfaced
-  // via the "Value (partial market)" label so the user knows the total is
-  // a hybrid.
-  const hasMarketPrices = holdings.some((h) => h.market_value != null);
-  const fullyPriced = holdings.length > 0 && holdings.every((h) => h.market_value != null);
-  const pricedCount = holdings.filter((h) => h.market_value != null).length;
-  const totalMarketValue = hasMarketPrices
-    ? holdings.reduce((sum, h) => sum + (h.market_value ?? h.quantity * h.avg_cost_basis), 0)
-    : holdings.reduce((sum, h) => sum + h.quantity * h.avg_cost_basis, 0);
-  const totalUnrealizedPL = holdings.reduce((sum, h) => sum + (h.unrealized_pl ?? 0), 0);
-  // costBasis = marketValue - PL for priced rows, falling back to qty × cost
-  // for unpriced ones (those rows contribute 0 to unrealized_pl and their
-  // market_value fallback equals their cost basis anyway, so the math
-  // remains coherent).
-  const totalCostBasis = totalMarketValue - totalUnrealizedPL;
-  const totalPL = totalUnrealizedPL;
-  const totalPLPct = totalCostBasis !== 0 ? (totalPL / totalCostBasis) * 100 : 0;
+  // ── Totals. `market_value`, `unrealized_pl` and `value_eur` are EUR (converted server-side);
+  // `avg_cost_basis` is per share in the trading currency and is never summed here. An unpriced
+  // holding counts at `value_eur`, which is its EUR cost. Cost basis = value − gain, so both sides
+  // of every percentage are EUR.
+  const hasMarketPrices = holdings.some(h => h.market_value != null);
+  const fullyPriced = holdings.length > 0 && holdings.every(h => h.market_value != null);
+  const pricedCount = holdings.filter(h => h.market_value != null).length;
+  const totalMarketValue = holdings.reduce((sum, h) => sum + (h.market_value ?? h.value_eur ?? 0), 0);
+  const totalPL = holdings.reduce((sum, h) => sum + (h.unrealized_pl ?? 0), 0);
+  const totalCostBasis = totalMarketValue - totalPL;
+  const totalPLPct = totalCostBasis > 0 ? (totalPL / totalCostBasis) * 100 : null;
+  // Dividends per holding come in that holding's own currency.
   const totalDividends = holdings.reduce((sum, h) => sum + h.total_dividends, 0);
-  const fmt = (n: number) =>
-    new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' }).format(n);
+  const dividendsMixed = holdings.some(h => h.total_dividends > 0 && (h.currency || 'EUR').toUpperCase() !== 'EUR');
 
-  const netCash = performance ? performance.total_invested - performance.total_withdrawn : 0;
+  const accountFilter = accounts.length > 1 ? (
+    <SelectField label="Account" value={filterAccount} onChange={e => setFilterAccount(e.target.value)} className="max-w-xs mt-6">
+      <option value="">All accounts</option>
+      {accounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+    </SelectField>
+  ) : null;
 
-  const hasMonthlyDividends = dividends && dividends.monthly && dividends.monthly.length > 0;
-  const hasYearlyDividends = dividends && dividends.yearly && dividends.yearly.length > 0;
-  const hasDividendData = dividendView === 'yearly' ? hasYearlyDividends : hasMonthlyDividends;
+  const kpiRow = (
+    <MetricGrid className="mt-6">
+      <MetricCard
+        label={fullyPriced ? 'Market value' : hasMarketPrices ? 'Value · partly at cost' : 'Value · at cost'}
+        value={fmtEUR(totalMarketValue)}
+        sublabel={`${holdings.length} ${holdings.length === 1 ? 'holding' : 'holdings'}, converted to EUR${!fullyPriced && hasMarketPrices ? ` · ${pricedCount} of ${holdings.length} priced` : ''}`}
+      />
+      <MetricCard label="Cost basis" value={fmtEUR(totalCostBasis)} sublabel="Purchase cost of current holdings, in EUR" />
+      {hasMarketPrices && (
+        <MetricCard
+          label="Unrealised gain"
+          value={fmtEUR(totalPL, { sign: true })}
+          tone={toneOf(totalPL)}
+          sublabel={totalPLPct != null ? `${fmtPct(totalPLPct, { sign: true })} on cost basis` : 'Value minus cost basis'}
+        />
+      )}
+      <MetricCard
+        label="Dividends received"
+        value={fmtEUR(totalDividends)}
+        sublabel={dividendsMixed ? 'Current holdings · sums payouts in their own currencies, unconverted' : 'On current holdings, since purchase'}
+      />
+    </MetricGrid>
+  );
 
-  const dividendChartData = dividendView === 'yearly'
-    ? { labels: dividends?.yearly?.map(d => d.year) ?? [], values: dividends?.yearly?.map(d => Math.round(d.amount * 100) / 100) ?? [] }
-    : { labels: dividends?.monthly?.map(d => d.month) ?? [], values: dividends?.monthly?.map(d => Math.round(d.amount * 100) / 100) ?? [] };
+  const coreGate = (render: () => ReactNode): ReactNode => {
+    if (loading) return <div className="mt-6"><LoadingState message="Loading portfolio" lines={6} /></div>;
+    if (error) return <div className="mt-6"><ErrorState message="Portfolio data couldn’t be loaded." details={error} onRetry={retryCore} /></div>;
+    return render();
+  };
 
-  const dividendChartOption = hasDividendData ? {
-    tooltip: {
-      trigger: 'axis' as const,
-      formatter: (params: unknown) => {
-        const p = params as { data: number; name: string }[];
-        if (Array.isArray(p) && p.length > 0) {
-          return `${p[0].name}<br/>Dividends: ${fmt(p[0].data)}`;
-        }
-        return '';
-      },
-    },
-    xAxis: {
-      type: 'category' as const,
-      data: dividendChartData.labels,
-      axisLabel: { rotate: dividendView === 'monthly' ? 45 : 0, fontSize: 11, color: tc.inkMuted },
-      axisLine: { show: false },
-      axisTick: { show: false },
-    },
-    yAxis: {
-      type: 'value' as const,
-      axisLabel: {
-        formatter: (v: number) => v >= 1000 ? `${(v / 1000).toFixed(0)}k` : `${v.toFixed(0)}`,
-        fontSize: 12,
-        color: tc.inkMuted,
-      },
-      splitLine: { lineStyle: { color: tc.divider } },
-    },
-    series: [{
-      type: 'bar' as const,
-      data: dividendChartData.values,
-      itemStyle: { borderRadius: [4, 4, 0, 0], color: tc.sage },
-      barMaxWidth: dividendView === 'yearly' ? 50 : 30,
-    }],
-    grid: { left: 50, right: 16, top: 16, bottom: dividendView === 'monthly' ? 60 : 30 },
-  } : null;
+  /* ───────────── Overview ───────────── */
+
+  const renderPerformance = () => {
+    if (!performance) return null;
+    const p = performance;
+    // The API's total gain is "current value − net capital invested", where net capital also
+    // counts in-kind transfers. Deriving it back keeps the two figures consistent with each other.
+    const netCapital = p.current_value - p.total_return;
+    const ok = (n: number) => Number.isFinite(n);
+    const capitalOk = ok(netCapital) && ok(p.current_value) && !(netCapital <= 0 && p.current_value > 0);
+    const twrOk = ok(p.twr) && p.twr > -100;
+    const irrOk = ok(p.irr) && p.irr > -100 && p.irr < 1000;
+    const gainsOk = capitalOk && ok(p.total_return);
+    const dash = (caption: string) => ({ value: '—' as ReactNode, tone: 'neutral' as Tone, sublabel: caption, money: false });
+    return (
+      <Section title="Performance" subtitle="All figures in EUR. “Since inception” covers every transaction on record for the selected account.">
+        <MetricGrid className="md:!grid-cols-3">
+          <MetricCard
+            label="Net capital invested"
+            {...(capitalOk
+              ? { value: fmtEUR(netCapital), sublabel: 'Deposits and in-kind transfers (such as RSU vests) minus withdrawals, since inception' }
+              : dash('Not enough history: recorded withdrawals exceed recorded deposits'))}
+          />
+          <MetricCard
+            label="Total gain · since inception"
+            {...(gainsOk
+              ? {
+                  value: fmtEUR(p.total_return, { sign: true }),
+                  tone: toneOf(p.total_return),
+                  sublabel: ok(p.total_return_pct) ? `${fmtPct(p.total_return_pct, { sign: true })} of net capital invested · current value minus net capital` : 'Current value minus net capital invested',
+                }
+              : dash('Not enough history: needs complete deposit records'))}
+          />
+          <MetricCard
+            label="Time-weighted return · 12 months"
+            {...(twrOk
+              ? { value: fmtPct(p.twr, { sign: true }), tone: toneOf(p.twr), sublabel: 'TWR over the trailing 12 months, whole portfolio; ignores the timing of deposits', money: false }
+              : dash('Not enough history for a 12-month return'))}
+          />
+          <MetricCard
+            label="Money-weighted return · p.a."
+            {...(irrOk
+              ? { value: fmtPct(p.irr, { sign: true }), tone: toneOf(p.irr), sublabel: 'IRR per year since inception; reflects when money went in and out', money: false }
+              : dash('Not enough history for an annual rate'))}
+          />
+          <MetricCard
+            label="Realised gain · since inception"
+            {...(ok(p.realized_pl)
+              ? { value: fmtEUR(p.realized_pl, { sign: true }), tone: toneOf(p.realized_pl), sublabel: 'On positions sold, average-cost method' }
+              : dash('Not available'))}
+          />
+          <MetricCard
+            label="Remaining gain · since inception"
+            {...(gainsOk && ok(p.unrealized_pl)
+              ? { value: fmtEUR(p.unrealized_pl, { sign: true }), tone: toneOf(p.unrealized_pl), sublabel: 'Total gain minus realised gain; besides price gains it contains dividends, interest and fees' }
+              : dash('Not enough history: needs complete deposit records'))}
+          />
+        </MetricGrid>
+      </Section>
+    );
+  };
+
+  const renderGrowth = () => {
+    if (perfHistory.loading && !perfHistory.data) return <Section title="Growth Over Time"><LoadingState lines={5} /></Section>;
+    if (perfHistory.error && !perfHistory.data) return <Section title="Growth Over Time"><ErrorState message="The growth history couldn’t be loaded." details={perfHistory.error} onRetry={perfHistory.reload} /></Section>;
+    const all = perfHistory.data || [];
+    const filtered = filterByPeriod(all, growthPeriod);
+    const selector = <PeriodSelector value={growthPeriod} onChange={setGrowthPeriod} />;
+    if (all.length < 2) {
+      return (
+        <Section title="Growth Over Time">
+          <p className="text-[14px] text-ink-body">Not enough history yet. The chart appears once the portfolio has been valued on at least two days.</p>
+        </Section>
+      );
+    }
+    if (filtered.length < 2) {
+      return (
+        <Section title="Growth Over Time" actions={selector}>
+          <p className="text-[14px] text-ink-body">No data in this period. Choose a longer one.</p>
+        </Section>
+      );
+    }
+    const dates = filtered.map(p => p.date);
+    const hasInKind = filtered.some(p => p.in_kind_invested > 0);
+    const hasBenchmark = filtered.some(p => p.benchmark_pct != null);
+    const line = (name: string, color: string, data: (number | null)[], extra: Record<string, unknown> = {}) => ({
+      name, type: 'line' as const, data, symbol: 'none', smooth: 0.3,
+      color, itemStyle: { color }, lineStyle: { color, width: 2 }, ...extra,
+    });
+    return (
+      <Section
+        title="Growth Over Time"
+        actions={selector}
+        subtitle={`Capital invested is cash deposits${hasInKind ? ' plus RSU vests at their fair-market value on the vest date' : ''}, net of withdrawals.`}
+      >
+        <SubHeading>Portfolio value and capital invested · EUR</SubHeading>
+        <EChartWrapper option={{
+          tooltip: axisTooltip(v => fmtEUR(v)),
+          legend: lineLegend([['Portfolio value', 'solid'], ['Capital invested', 'dashed'], ...(hasInKind ? [['Of which cash deposits', 'dotted'] as [string, 'dotted']] : [])]),
+          xAxis: timeAxis(dates, growthPeriod),
+          yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
+          series: [
+            line('Portfolio value', tc.forest, filtered.map(p => Math.round(p.portfolio_value)), { lineStyle: { color: tc.forest, width: 2.5 }, z: 3 }),
+            line('Capital invested', tc.inkMuted, filtered.map(p => Math.round(p.cash_invested + p.in_kind_invested)), {
+              lineStyle: { color: tc.inkMuted, width: 1.5, type: 'dashed' as const }, areaStyle: { color: tc.inkMuted, opacity: 0.08 },
+            }),
+            ...(hasInKind ? [line('Of which cash deposits', tc.walnut, filtered.map(p => Math.round(p.cash_invested)), {
+              lineStyle: { color: tc.walnut, width: 1.5, type: 'dotted' as const },
+            })] : []),
+          ],
+          grid: GRID,
+        }} height="300px" />
+
+        <SubHeading className="mt-6">Cumulative return{hasBenchmark ? ' against MSCI World' : ''} · %</SubHeading>
+        <EChartWrapper option={{
+          tooltip: axisTooltip(v => fmtPct(v, { sign: true })),
+          legend: lineLegend([['Portfolio return', 'solid'], ...(hasBenchmark ? [['MSCI World', 'dashed'] as [string, 'dashed']] : [])]),
+          xAxis: timeAxis(dates, growthPeriod),
+          yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtPct(v, { digits: 0 }) } },
+          series: [
+            line('Portfolio return', tc.forest, filtered.map(p => Math.round(p.return_pct * 10) / 10)),
+            ...(hasBenchmark ? [line('MSCI World', tc.walnut, filtered.map(p => (p.benchmark_pct != null ? Math.round(p.benchmark_pct * 10) / 10 : null)), {
+              lineStyle: { color: tc.walnut, width: 1.5, type: 'dashed' as const },
+            })] : []),
+          ],
+          grid: GRID,
+        }} height="220px" />
+      </Section>
+    );
+  };
+
+  const renderHealth = () => {
+    const hs = healthScore.data;
+    if (healthScore.error && !hs) return <Section title="Portfolio Health"><ErrorState message="The health score couldn’t be loaded." details={healthScore.error} onRetry={healthScore.reload} /></Section>;
+    if (!hs || hs.score <= 0) return null;
+    const verdict = hs.score >= 80 ? { tone: 'success' as const, text: 'Good' } : hs.score >= 60 ? { tone: 'warning' as const, text: 'Fair' } : { tone: 'danger' as const, text: 'Needs attention' };
+    const statusTone = (s: string) => (s === 'good' ? 'success' as const : s === 'fair' ? 'warning' as const : 'danger' as const);
+    return (
+      <Section title="Portfolio Health" subtitle="A 0–100 score built from the parts below; higher is better.">
+        <div className="flex flex-wrap items-center gap-3 mb-4">
+          <span className="font-serif text-[32px] leading-9 text-ink">{fmtNum(hs.score)}<span className="text-[18px] text-ink-muted"> / 100</span></span>
+          <Chip tone={verdict.tone}>{verdict.text}</Chip>
+        </div>
+        <Rows>
+          {hs.subscores.map(s => (
+            <li key={s.name} className="py-2.5 grid grid-cols-[1fr_auto] md:grid-cols-[minmax(0,1.2fr)_minmax(80px,1fr)_auto_auto] items-center gap-x-4 gap-y-1 text-[14px]">
+              <span className="min-w-0">
+                <span className="text-ink">{s.name}</span>
+                {s.detail && <span className="block text-[12px] text-ink-muted">{s.detail}</span>}
+              </span>
+              <ProgressBar value={s.score} label={`${s.name} score`} className="hidden md:block" />
+              <span className="text-ink text-right">{fmtNum(s.score)}<span className="text-ink-muted"> / 100</span></span>
+              <span className="col-span-2 md:col-span-1 md:text-right"><Chip tone={statusTone(s.status)}>{labelFor(s.status)}</Chip></span>
+            </li>
+          ))}
+        </Rows>
+      </Section>
+    );
+  };
+
+  const renderOverview = () => coreGate(() => {
+    if (holdings.length === 0 && !(performance && performance.current_value > 0)) {
+      return (
+        <div className="mt-6">
+          {accountFilter}
+          <div className="mt-6">
+            <EmptyState title="No holdings yet" message="Import your broker’s transactions to see value, gains and performance here." action={{ label: 'Import transactions', href: IMPORT_HREF }} />
+          </div>
+        </div>
+      );
+    }
+    return (
+      <>
+        {accountFilter}
+        <SectionBoundary>{kpiRow}</SectionBoundary>
+        <SectionBoundary>{renderHealth()}</SectionBoundary>
+        <SectionBoundary>{renderPerformance()}</SectionBoundary>
+        <SectionBoundary>{renderGrowth()}</SectionBoundary>
+      </>
+    );
+  });
+
+  /* ───────────── Dividends ───────────── */
+
+  const renderDividends = () => coreGate(() => {
+    if (!dividends || !(dividends.total > 0)) {
+      return (
+        <div className="mt-6">
+          <EmptyState
+            title="No dividends yet"
+            message="Dividends and distributions appear here once a holding pays out and the transaction has been imported."
+            action={{ label: 'Import transactions', href: IMPORT_HREF }}
+          />
+        </div>
+      );
+    }
+    const d = dividends;
+    const growthOk = Number.isFinite(d.dividend_growth) && Math.abs(d.dividend_growth) <= 500;
+    const monthly = d.monthly || [];
+    const yearly = d.yearly || [];
+    const cumulative = d.cumulative || [];
+    const views = [
+      { id: 'monthly' as const, label: 'By month' },
+      { id: 'yearly' as const, label: 'By year' },
+      { id: 'cumulative' as const, label: 'Cumulative' },
+    ];
+    const bars = dividendView === 'yearly'
+      ? { labels: yearly.map(x => x.year), values: yearly.map(x => Math.round(x.amount * 100) / 100) }
+      : { labels: monthly.map(x => x.month), values: monthly.map(x => Math.round(x.amount * 100) / 100) };
+    const head = (v: string) => monthLabel(v, true);
+    const bySecurityTotal = (d.by_security || []).reduce((s, x) => s + x.amount, 0);
+
+    // Group expected payouts by month
+    const byMonth: Record<string, { name: string; expected: number }[]> = {};
+    (d.calendar || []).forEach(c => { (byMonth[c.month] ??= []).push({ name: c.name, expected: c.expected }); });
+    const upcoming = Object.entries(byMonth).slice(0, 6);
+
+    let chart: ReactNode;
+    if (dividendView === 'cumulative') {
+      chart = cumulative.length > 1 ? (
+        <EChartWrapper option={{
+          tooltip: axisTooltip(v => fmtEUR(v, { cents: true }), head),
+          xAxis: { type: 'category' as const, data: cumulative.map(c => c.month), boundaryGap: false, axisLabel: { formatter: (v: string) => monthLabel(v), hideOverlap: true } },
+          yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
+          series: [{
+            name: 'Dividends received to date', type: 'line' as const, data: cumulative.map(c => c.cumulative), symbol: 'none',
+            color: tc.forest, itemStyle: { color: tc.forest }, lineStyle: { color: tc.forest, width: 2 }, areaStyle: { color: tc.forest, opacity: 0.08 },
+          }],
+          grid: { ...GRID, bottom: 4 },
+        }} height="260px" />
+      ) : <p className="text-[14px] text-ink-body">Not enough history for a cumulative view yet.</p>;
+    } else {
+      chart = bars.labels.length > 0 ? (
+        <EChartWrapper option={{
+          tooltip: axisTooltip(v => fmtEUR(v, { cents: true }), head),
+          xAxis: { type: 'category' as const, data: bars.labels, axisLabel: { formatter: (v: string) => monthLabel(v), hideOverlap: true } },
+          yAxis: { type: 'value' as const, min: 0, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
+          series: [{
+            name: dividendView === 'yearly' ? 'Dividends in the year' : 'Dividends in the month', type: 'bar' as const, data: bars.values,
+            color: tc.forest, itemStyle: { color: tc.forest, borderRadius: [2, 2, 0, 0] }, barMaxWidth: dividendView === 'yearly' ? 48 : 28,
+          }],
+          grid: { ...GRID, bottom: 4 },
+        }} height="260px" />
+      ) : <p className="text-[14px] text-ink-body">No dividends recorded for this view.</p>;
+    }
+
+    return (
+      <>
+        <SectionBoundary>
+          <Section title="Dividend Income" first subtitle="Dividends and distributions received across all accounts, in EUR.">
+            <MetricGrid>
+              <MetricCard label="Total received" value={fmtEUR(d.total)} sublabel="Since the first payout" />
+              <MetricCard label="Trailing 12 months" value={fmtEUR(d.trailing_12m)} sublabel="Received in the last 12 months" />
+              <MetricCard label="Yield on cost" value={fmtPct(d.yield_on_cost, { digits: 2 })} money={false} sublabel="Trailing 12 months ÷ cost basis" />
+              <MetricCard
+                label="Growth · year on year"
+                value={growthOk ? fmtPct(d.dividend_growth, { sign: true }) : '—'}
+                tone={growthOk ? toneOf(d.dividend_growth) : 'neutral'}
+                money={false}
+                sublabel={growthOk ? 'Trailing 12 months against the 12 before' : 'Not enough history'}
+              />
+            </MetricGrid>
+          </Section>
+        </SectionBoundary>
+
+        <SectionBoundary>
+          <Section title="Payout History" actions={<ViewToggle value={dividendView} options={views} onChange={setDividendView} label="Dividend view" />} subtitle="In EUR.">
+            {chart}
+          </Section>
+        </SectionBoundary>
+
+        {d.by_security && d.by_security.length > 0 && (
+          <SectionBoundary>
+            <Section title="By Security" subtitle="Total received per security, in EUR.">
+              <RankedBars items={d.by_security.map(s => ({
+                label: s.name,
+                value: s.amount,
+                display: fmtEUR(s.amount, { cents: true }),
+                share: bySecurityTotal > 0 ? fmtPct((s.amount / bySecurityTotal) * 100) : undefined,
+              }))} />
+            </Section>
+          </SectionBoundary>
+        )}
+
+        {upcoming.length > 0 && (
+          <SectionBoundary>
+            <Section title="Expected Upcoming Dividends" subtitle="Estimates based on past payouts of your current holdings; not announced amounts.">
+              <div className="flex flex-col gap-4">
+                {upcoming.map(([month, entries]) => (
+                  <div key={month}>
+                    <SubHeading className="mb-1">{monthLabel(month, true)}</SubHeading>
+                    <Rows>
+                      {entries.map((e, i) => (
+                        <li key={i} className="flex items-center justify-between gap-3 py-2 text-[14px]">
+                          <span className="text-ink-body min-w-0 truncate">{e.name}</span>
+                          <Money className="text-ink shrink-0">≈ {fmtEUR(e.expected, { cents: true })}</Money>
+                        </li>
+                      ))}
+                    </Rows>
+                  </div>
+                ))}
+              </div>
+            </Section>
+          </SectionBoundary>
+        )}
+      </>
+    );
+  });
+
+  /* ───────────── Allocation ───────────── */
+
+  const startEditingTargets = (a: AllocationData) => {
+    const drafts: Record<string, number> = {};
+    for (const x of a.allocations) drafts[x.isin] = x.target_pct;
+    setTargetDrafts(drafts);
+    setTargetError(null);
+    setEditingTargets(true);
+  };
+  const saveTargets = () => {
+    const allocs = Object.entries(targetDrafts).map(([isin, val]) => ({ isin, target_pct: Number.isFinite(val) ? val : 0 }));
+    setTargetError(null);
+    api.setAllocation(allocs)
+      .then(() => { setEditingTargets(false); allocation.reload(); })
+      .catch((e: Error) => setTargetError(e.message || 'Request failed'));
+  };
+  const computeRebalance = () => {
+    setRebalanceError(null);
+    api.getRebalance(depositAmount > 0 ? depositAmount : undefined)
+      .then(r => { setRebalanceTrades(r.trades || []); setRebalanceMsg(r.message || ''); setRebalanceDone(true); })
+      .catch((e: Error) => setRebalanceError(e.message || 'Request failed'));
+  };
+
+  const renderTargets = () => {
+    const a = allocation.data;
+    if (allocation.loading && !a) return <Section title="Target Allocation" first><LoadingState lines={5} /></Section>;
+    if (allocation.error && !a) return <Section title="Target Allocation" first><ErrorState message="The allocation couldn’t be loaded." details={allocation.error} onRetry={allocation.reload} /></Section>;
+    if (!a || a.allocations.length === 0) {
+      return (
+        <Section title="Target Allocation" first>
+          <EmptyState title="Nothing to allocate yet" message="Once you hold securities you can set a target weight for each and see how far the portfolio has drifted." action={{ label: 'Import transactions', href: IMPORT_HREF }} />
+        </Section>
+      );
+    }
+    const drift = Math.abs(a.max_drift);
+    const driftChip = drift > 5 ? { tone: 'danger' as const, text: 'Rebalancing due' } : drift > 2 ? { tone: 'warning' as const, text: 'Drifting' } : { tone: 'success' as const, text: 'On target' };
+    const statusTone = (s: string) => (s === 'on_target' ? 'success' as const : s === 'overweight' ? 'danger' as const : 'warning' as const);
+    const draftSum = Object.values(targetDrafts).reduce((s, v) => s + (Number.isFinite(v) ? v : 0), 0);
+    return (
+      <Section
+        title="Target Allocation"
+        first
+        subtitle={a.has_targets
+          ? <span className="inline-flex flex-wrap items-center gap-2">Largest drift from target: {fmtPct(a.max_drift, { sign: true })} <Chip tone={driftChip.tone}>{driftChip.text}</Chip></span>
+          : 'Actual weight of each holding. Set targets to see drift and rebalancing suggestions.'}
+        actions={editingTargets ? (
+          <>
+            <button type="button" className="apple-btn-secondary min-h-[44px] md:min-h-[40px]" onClick={() => setEditingTargets(false)}>Cancel</button>
+            <button type="button" className="apple-btn-primary min-h-[44px] md:min-h-[40px]" onClick={saveTargets}>Save targets</button>
+          </>
+        ) : (
+          <button type="button" className="apple-btn-secondary min-h-[44px] md:min-h-[40px]" onClick={() => startEditingTargets(a)}>Edit targets</button>
+        )}
+      >
+        {targetError && <div className="mb-4"><ErrorState message="The targets couldn’t be saved." details={targetError} /></div>}
+        {editingTargets ? (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {a.allocations.map(x => (
+                <NumberField
+                  key={x.isin}
+                  label={x.name}
+                  unit="%"
+                  value={targetDrafts[x.isin] ?? 0}
+                  onValueChange={v => setTargetDrafts(d => ({ ...d, [x.isin]: Math.max(0, Math.min(100, v)) }))}
+                  hint={`Currently ${fmtPct(x.actual_pct)}`}
+                />
+              ))}
+            </div>
+            <p className="mt-4 text-[13px] text-ink-body flex flex-wrap items-center gap-2">
+              Targets add up to {fmtPct(draftSum)}.
+              {Math.abs(draftSum - 100) > 0.05 && <Chip tone="warning">Should total 100 %</Chip>}
+            </p>
+          </>
+        ) : (
+          <ul className="flex flex-col gap-4">
+            {a.allocations.map(x => (
+              <li key={x.isin}>
+                <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 mb-1.5">
+                  <span className="text-[14px] font-medium text-ink min-w-0 truncate">{x.name}</span>
+                  <span className="flex items-center gap-2 text-[13px] text-ink-body shrink-0">
+                    {fmtPct(x.actual_pct)}{x.target_pct > 0 ? ` of ${fmtPct(x.target_pct)} target` : ''}
+                    {x.target_pct > 0 && <Chip tone={statusTone(x.status)}>{labelFor(x.status)} {fmtPct(x.drift_pct, { sign: true })}</Chip>}
+                  </span>
+                </div>
+                {/* Bar shows the actual weight; the ink tick marks the target. */}
+                <div
+                  className="relative h-2"
+                  role="img"
+                  aria-label={`${x.name}: ${fmtPct(x.actual_pct)} actual${x.target_pct > 0 ? `, ${fmtPct(x.target_pct)} target` : ''}`}
+                >
+                  <div className="h-2 rounded-[2px] bg-divider overflow-hidden">
+                    <div className="h-full bg-forest" style={{ width: `${Math.max(0, Math.min(x.actual_pct, 100))}%` }} />
+                  </div>
+                  {x.target_pct > 0 && x.target_pct <= 100 && (
+                    <span className="absolute -top-1 h-4 w-[2px] bg-ink outline outline-1 outline-parchment" style={{ left: `calc(${x.target_pct}% - 1px)` }} />
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Section>
+    );
+  };
+
+  const renderRebalancing = () => {
+    const a = allocation.data;
+    if (!a || a.allocations.length === 0) return null;
+    if (!a.has_targets) {
+      return (
+        <Section title="Rebalancing">
+          <p className="text-[14px] text-ink-body">Set target weights above to get buy and sell suggestions.</p>
+        </Section>
+      );
+    }
+    return (
+      <Section title="Rebalancing" subtitle="Suggested trades to bring the portfolio back to its targets, in EUR.">
+        <form className="flex flex-wrap items-end gap-3" onSubmit={e => { e.preventDefault(); computeRebalance(); }}>
+          <NumberField
+            label="New deposit to allocate"
+            unit="€"
+            value={depositAmount}
+            onValueChange={v => setDepositAmount(Math.max(0, v))}
+            className="flex-1 basis-56 max-w-xs"
+          />
+          <button type="submit" className="apple-btn-primary min-h-[44px]">
+            {depositAmount > 0 ? 'Allocate deposit' : 'Compute trades'}
+          </button>
+        </form>
+        <p className="mt-2 text-[12px] text-ink-muted">Leave the deposit at 0 to rebalance the existing holdings by buying and selling.</p>
+
+        {rebalanceError && <div className="mt-4"><ErrorState message="The trades couldn’t be computed." details={rebalanceError} onRetry={computeRebalance} /></div>}
+        {rebalanceMsg && <p className="text-[13px] text-ink-body mt-4">{rebalanceMsg}</p>}
+
+        {rebalanceTrades.length > 0 && (
+          <Rows className="mt-4">
+            {rebalanceTrades.map(t => (
+              <li key={t.isin} className="flex items-center justify-between gap-3 py-3">
+                <div className="min-w-0 flex-1">
+                  <p className="text-[14px] font-medium text-ink truncate">{t.name}</p>
+                  <p className="text-[12px] text-ink-muted">{fmtPct(t.current_pct)} now → {fmtPct(t.target_pct)} target</p>
+                </div>
+                <div className="text-right shrink-0">
+                  <p className="text-[14px] text-ink flex items-center justify-end gap-2">
+                    <Chip tone={t.action === 'buy' ? 'success' : 'danger'}>{t.action === 'buy' ? 'Buy' : 'Sell'}</Chip>
+                    <Money className="font-medium">{fmtEUR(t.amount)}</Money>
+                  </p>
+                  {t.shares != null && t.shares > 0 && <p className="text-[12px] text-ink-muted">about {fmtQty(t.shares)} units</p>}
+                </div>
+              </li>
+            ))}
+          </Rows>
+        )}
+        {rebalanceDone && rebalanceTrades.length === 0 && !rebalanceError && (
+          <p className="text-[14px] text-ink-body mt-4">No trades needed: every holding is within tolerance of its target.</p>
+        )}
+      </Section>
+    );
+  };
+
+  const renderAllocHistory = () => {
+    const title = 'Allocation History';
+    const ah = allocHistory.data;
+    if (allocHistory.loading && !ah) return <Section title={title}><LoadingState lines={5} /></Section>;
+    if (allocHistory.error && !ah) return <Section title={title}><ErrorState message="The allocation history couldn’t be loaded." details={allocHistory.error} onRetry={allocHistory.reload} /></Section>;
+    const history = ah?.history || [];
+    const names = ah?.holdings || [];
+    if (history.length <= 3 || names.length === 0) {
+      return (
+        <Section title={title}>
+          <p className="text-[14px] text-ink-body">Not enough history yet. The chart appears after a few days of portfolio snapshots.</p>
+        </Section>
+      );
+    }
+    if (names.length === 1) {
+      return (
+        <Section title={title}>
+          <p className="text-[14px] text-ink-body">
+            {names[0]} has been the only holding since {fmtDateLong(history[0].date)}, so it has made up 100 % of the portfolio throughout. A history appears once there is a second holding.
+          </p>
+        </Section>
+      );
+    }
+    const filtered = filterByPeriod(history, allocPeriod);
+    const selector = <PeriodSelector value={allocPeriod} onChange={setAllocPeriod} />;
+    if (filtered.length < 2) {
+      return <Section title={title} actions={selector}><p className="text-[14px] text-ink-body">No data in this period. Choose a longer one.</p></Section>;
+    }
+    const weightOf = (h: { weights: Record<string, number> }, name: string): number => {
+      if (h.weights[name] != null) return h.weights[name];
+      for (const [isin, w] of Object.entries(h.weights)) {
+        if (name === isin || holdings.some(hold => hold.security_isin === isin && hold.name === name)) return w;
+      }
+      return 0;
+    };
+    return (
+      <Section title={title} actions={selector} subtitle="Share of each holding in the portfolio over time, in % of market value.">
+        <EChartWrapper option={{
+          tooltip: axisTooltip(v => fmtPct(v)),
+          legend: { type: 'scroll' as const, bottom: 0, textStyle: { fontSize: 12 } },
+          xAxis: timeAxis(filtered.map(h => h.date), allocPeriod),
+          yAxis: { type: 'value' as const, min: 0, max: 100, axisLabel: { formatter: (v: number) => fmtPct(v, { digits: 0 }) } },
+          series: names.map(name => ({
+            name, type: 'line' as const, stack: 'total', areaStyle: { opacity: 0.7 }, lineStyle: { width: 1 },
+            emphasis: { focus: 'series' as const }, symbol: 'none',
+            data: filtered.map(h => weightOf(h, name)),
+          })),
+          grid: GRID,
+        }} height="340px" />
+      </Section>
+    );
+  };
+
+  const renderSavingsPlans = () => {
+    const sp = savingsPlans.data;
+    if (savingsPlans.error && !sp) return <Section title="Savings Plans"><ErrorState message="Savings plans couldn’t be loaded." details={savingsPlans.error} onRetry={savingsPlans.reload} /></Section>;
+    if (savingsPlans.loading && !sp) return <Section title="Savings Plans"><LoadingState lines={3} /></Section>;
+    if (!sp || sp.plans.length === 0) {
+      return (
+        <Section title="Savings Plans">
+          <p className="text-[14px] text-ink-body">No savings plans detected. Regular monthly purchases of the same security show up here.</p>
+        </Section>
+      );
+    }
+    return (
+      <Section
+        title="Savings Plans"
+        subtitle={<>{sp.plan_count} detected {sp.plan_count === 1 ? 'plan' : 'plans'} · <Money>{fmtEUR(sp.total_monthly)}</Money> per month in total</>}
+      >
+        <Rows>
+          {sp.plans.map(p => (
+            <li key={p.isin} className="py-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <p className="text-[14px] font-medium text-ink truncate">{p.name}</p>
+                  <p className="text-[12px] text-ink-muted">
+                    about <Money>{fmtEUR(p.monthly_amount)}</Money> per month · {fmtNum(p.executions)} purchases over {fmtNum(p.months_active)} months
+                  </p>
+                </div>
+                <div className="text-right shrink-0">
+                  <p className="text-[14px] font-medium text-ink"><Money>{fmtEUR(p.current_value)}</Money></p>
+                  <p className={`text-[12px] ${toneText(p.dca_return_pct)}`}>{fmtPct(p.dca_return_pct, { sign: true })} return</p>
+                </div>
+              </div>
+              {p.lump_sum_value > 0 && (
+                <p className="mt-1.5 text-[12px] text-ink-muted">
+                  Had the same total been invested at once at the start, it would be worth <Money>{fmtEUR(p.lump_sum_value)}</Money>:{' '}
+                  <span className="text-ink-body">
+                    investing monthly is {p.dca_advantage_eur >= 0 ? 'ahead' : 'behind'} by <Money>{fmtEUR(Math.abs(p.dca_advantage_eur))}</Money>.
+                  </span>
+                </p>
+              )}
+            </li>
+          ))}
+        </Rows>
+      </Section>
+    );
+  };
+
+  /* ───────────── Holdings ───────────── */
+
+  const loadDetail = (isin: string) => {
+    detailRequest.current = isin;
+    setSecurityDetail(null);
+    setDetailError(null);
+    api.getSecurityDetail(isin)
+      .then(d => { if (detailRequest.current === isin) setSecurityDetail(d); })
+      .catch((e: Error) => { if (detailRequest.current === isin) setDetailError(e.message || 'Request failed'); });
+  };
+  const toggleHolding = (h: HoldingRow) => {
+    const key = holdingKey(h);
+    if (expandedKey === key) { setExpandedKey(null); detailRequest.current = null; return; }
+    setExpandedKey(key);
+    loadDetail(h.security_isin);
+  };
+  const expandedHolding = holdings.find(h => holdingKey(h) === expandedKey);
+  const detailNode = expandedHolding ? (
+    <SectionBoundary key={expandedKey}>
+      {detailError
+        ? <ErrorState message="The details for this security couldn’t be loaded." details={detailError} onRetry={() => loadDetail(expandedHolding.security_isin)} />
+        : securityDetail && securityDetail.isin === expandedHolding.security_isin
+          ? <SecurityDetailPanel key={securityDetail.isin} detail={securityDetail} />
+          : <LoadingState message="Loading security details" lines={4} />}
+    </SectionBoundary>
+  ) : null;
+
+  const runTimeMachine = async () => {
+    if (!tmDate) return;
+    setTmLoading(true);
+    setTmError(null);
+    try {
+      const res = await fetch(`/api/portfolio/time-machine?date=${encodeURIComponent(tmDate)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setTmData(await res.json());
+    } catch (e) {
+      setTmError(e instanceof Error ? e.message : 'Request failed');
+    } finally {
+      setTmLoading(false);
+    }
+  };
+
+  const renderTimeMachine = () => {
+    const c = tmData?.change;
+    const attribution: { label: string; value: number; show: boolean }[] = c ? [
+      { label: 'Contributions', value: c.contributions, show: true },
+      { label: 'Market return', value: c.market_return, show: true },
+      { label: 'Dividends', value: c.dividends, show: true },
+      { label: 'Physical assets', value: c.assets ?? 0, show: Math.abs(c.assets ?? 0) >= 1 },
+      { label: 'Purchase costs', value: c.purchase_costs ?? 0, show: Math.abs(c.purchase_costs ?? 0) >= 1 },
+      { label: 'Loan interest', value: c.loan_interest ?? 0, show: Math.abs(c.loan_interest ?? 0) >= 1 },
+    ] : [];
+    return (
+      <Section title="Time Machine" subtitle="Reconstruct net worth and holdings on any past date, in EUR.">
+        <form className="flex flex-wrap items-end gap-3" onSubmit={e => { e.preventDefault(); runTimeMachine(); }}>
+          <Field label="Date" type="date" value={tmDate} max={new Date().toISOString().slice(0, 10)} onChange={e => setTmDate(e.target.value)} className="flex-1 basis-48 max-w-xs" />
+          <button type="submit" disabled={!tmDate || tmLoading} className="apple-btn-primary min-h-[44px]">
+            {tmLoading ? 'Loading…' : 'Show that day'}
+          </button>
+        </form>
+        {tmError && <div className="mt-4"><ErrorState message="That date couldn’t be reconstructed." details={tmError} onRetry={runTimeMachine} /></div>}
+
+        {tmData && c && (
+          <div className="mt-5 flex flex-col gap-5">
+            <MetricGrid>
+              <MetricCard label={`Net worth · ${fmtDate(tmData.date)}`} value={fmtEUR(tmData.net_worth)} />
+              <MetricCard label="Net worth · today" value={fmtEUR(tmData.current.net_worth)} />
+              <MetricCard
+                label="Change since"
+                value={fmtEUR(c.net_worth_change, { sign: true })}
+                tone={toneOf(c.net_worth_change)}
+                sublabel={fmtPct(c.net_worth_pct, { sign: true })}
+              />
+            </MetricGrid>
+
+            <div>
+              <SubHeading className="mb-2">Where the change came from</SubHeading>
+              <dl className="grid grid-cols-[1fr_auto] gap-x-6 gap-y-1.5 text-[14px] max-w-md">
+                {attribution.filter(r => r.show).map(r => (
+                  <div key={r.label} className="contents">
+                    <dt className="text-ink-body">{r.label}</dt>
+                    <dd className={`text-right ${toneText(r.value)}`}><Money>{fmtEUR(r.value, { sign: true })}</Money></dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+
+            {tmData.holdings.length > 0 && (
+              <div>
+                <SubHeading className="mb-3">Holdings on {fmtDateLong(tmData.date)}</SubHeading>
+                <RankedBars
+                  scale="total"
+                  items={tmData.holdings.map(h => ({ label: h.name, value: h.value, display: fmtEUR(h.value), share: fmtPct(h.weight_pct) }))}
+                />
+              </div>
+            )}
+          </div>
+        )}
+      </Section>
+    );
+  };
+
+  const renderHoldings = () => (
+    <>
+      {coreGate(() => (
+        <>
+          {accountFilter}
+          {holdings.length > 0 && <SectionBoundary>{kpiRow}</SectionBoundary>}
+          <SectionBoundary>
+            <Section
+              title="Holdings"
+              first={holdings.length === 0}
+              actions={holdings.length > 0 ? <span className="text-[13px] text-ink-muted">Prices in the trading currency. Value and gain in EUR.</span> : undefined}
+            >
+              <HoldingsTable holdings={holdings} expandedKey={expandedKey} onToggle={toggleHolding} detail={detailNode} />
+            </Section>
+          </SectionBoundary>
+        </>
+      ))}
+      <SectionBoundary><UnvestedPanel mode="detail" /></SectionBoundary>
+      <SectionBoundary>{renderTimeMachine()}</SectionBoundary>
+    </>
+  );
+
+  /* ───────────── Goals & Alerts ───────────── */
+
+  const addGoal = () => {
+    if (!goalName || !(goalTarget > 0) || !goalDate) return;
+    setGoalError(null);
+    api.createGoal({
+      name: goalName, target_amount: goalTarget, target_date: goalDate,
+      monthly_contribution: goalContrib || 0, assumed_return_pct: goalReturn || 7,
+    })
+      .then(() => { setGoalName(''); setGoalTarget(0); setGoalDate(''); setGoalContrib(0); goals.reload(); })
+      .catch((e: Error) => setGoalError(e.message || 'Request failed'));
+  };
+  const deleteGoal = async (g: GoalProgress) => {
+    if (!(await confirm({ title: `Delete the goal “${g.name}”?`, body: 'The goal and its progress tracking are removed. Your accounts and transactions are not affected.', confirmLabel: 'Delete goal' }))) return;
+    api.deleteGoal(g.id).then(() => goals.reload()).catch((e: Error) => setGoalError(e.message || 'Request failed'));
+  };
+  const addAlert = () => {
+    if (!(alertThreshold > 0)) return;
+    setAlertError(null);
+    api.createAlert({
+      alert_type: alertType,
+      security_isin: alertType !== 'portfolio_milestone' ? alertISIN : undefined,
+      threshold: alertThreshold,
+    })
+      .then(() => { setAlertThreshold(0); alerts.reload(); })
+      .catch((e: Error) => setAlertError(e.message || 'Request failed'));
+  };
+  const deleteAlert = async (a: PriceAlertEntry, name: string) => {
+    if (!(await confirm({ title: `Delete the alert for ${name}?`, body: 'You will no longer be notified when this level is reached.', confirmLabel: 'Delete alert' }))) return;
+    api.deleteAlert(a.id).then(() => alerts.reload()).catch((e: Error) => setAlertError(e.message || 'Request failed'));
+  };
+
+  const goalStatusTone = (s: GoalProgress['status']) => (s === 'behind' ? 'warning' as const : 'success' as const);
+  const alertName = (a: PriceAlertEntry) => (a.alert_type === 'portfolio_milestone' ? 'Net worth' : (a.security_name || a.security_isin || 'Unknown security'));
+  const alertCondition = (a: PriceAlertEntry): ReactNode => {
+    switch (a.alert_type) {
+      case 'price_above': return <>Price at or above <Money>{fmtEUR(a.threshold, { cents: true })}</Money></>;
+      case 'price_below': return <>Price at or below <Money>{fmtEUR(a.threshold, { cents: true })}</Money></>;
+      case 'portfolio_milestone': return <>Crosses <Money>{fmtEUR(a.threshold)}</Money></>;
+      case 'daily_change': return <>Moves by {fmtPct(a.threshold)} or more in a day</>;
+      default: return <>{labelFor(a.alert_type)} <Money>{fmtNum(a.threshold, 2)}</Money></>;
+    }
+  };
+
+  const renderGoals = () => {
+    const list = goals.data || [];
+    return (
+      <Section title="Financial Goals" first subtitle="A target amount and date; progress is measured against your current net worth.">
+        {goals.loading && !goals.data ? <LoadingState lines={3} />
+          : goals.error && !goals.data ? <ErrorState message="Goals couldn’t be loaded." details={goals.error} onRetry={goals.reload} />
+          : list.length === 0 ? <EmptyState title="No goals yet" message="Add a target amount and date below to track your progress towards it." />
+          : (
+            <Rows>
+              {list.map(g => (
+                <li key={g.id} className="py-3">
+                  <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+                    <div className="min-w-0 flex-1 basis-56">
+                      <p className="text-[15px] font-medium text-ink flex flex-wrap items-center gap-2">
+                        {g.name}
+                        <Chip tone={goalStatusTone(g.status)}>{labelFor(g.status)}</Chip>
+                      </p>
+                      <p className="text-[13px] text-ink-body mt-0.5">
+                        <Money>{fmtEUR(g.target_amount)}</Money> by {fmtDateLong(g.target_date)}
+                        {g.monthly_contribution > 0 && <> · <Money>{fmtEUR(g.monthly_contribution)}</Money> per month</>}
+                      </p>
+                    </div>
+                    <button type="button" className="apple-btn-danger apple-btn-sm min-h-[44px] md:min-h-[36px]" onClick={() => deleteGoal(g)} aria-label={`Delete goal ${g.name}…`}>Delete…</button>
+                  </div>
+                  <div className="mt-2 flex items-center gap-3" data-privacy="blur">
+                    <ProgressBar value={g.progress_pct} label={`Progress towards ${g.name}`} className="flex-1" />
+                    <span className="text-[13px] text-ink shrink-0">{fmtPct(g.progress_pct, { digits: 0 })} · {fmtEUR(g.current_value)}</span>
+                  </div>
+                </li>
+              ))}
+            </Rows>
+          )}
+
+        <form className="mt-6" onSubmit={e => { e.preventDefault(); addGoal(); }}>
+          <SubHeading className="mb-3">Add a goal</SubHeading>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <Field label="Goal name" value={goalName} onChange={e => setGoalName(e.target.value)} placeholder="e.g. Retirement" />
+            <NumberField label="Target amount" unit="€" value={goalTarget} onValueChange={v => setGoalTarget(Math.max(0, v))} />
+            <Field label="Target date" type="date" value={goalDate} onChange={e => setGoalDate(e.target.value)} />
+            <NumberField label="Monthly contribution" unit="€ / month" value={goalContrib} onValueChange={v => setGoalContrib(Math.max(0, v))} hint="Optional." />
+            <NumberField label="Assumed return" unit="% / year" value={goalReturn} onValueChange={setGoalReturn} hint="Used to project whether you are on track." />
+          </div>
+          {goalError && <div className="mt-4"><ErrorState message="That didn’t work. Nothing was changed." details={goalError} /></div>}
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <button type="submit" className="apple-btn-primary min-h-[44px]" disabled={!goalName || !(goalTarget > 0) || !goalDate}>Add goal</button>
+            {(!goalName || !(goalTarget > 0) || !goalDate) && <span className="text-[12px] text-ink-muted">Needs a name, a target amount and a date.</span>}
+          </div>
+        </form>
+      </Section>
+    );
+  };
+
+  const renderAlerts = () => {
+    const list = (alerts.data || []).filter(a => PRICE_ALERT_TYPES.has(a.alert_type));
+    const triggered = (notifications.data || []).filter(n => PRICE_ALERT_TYPES.has(n.alert_type)).slice(0, 10);
+    const needsSecurity = alertType !== 'portfolio_milestone';
+    const canAdd = alertThreshold > 0 && (!needsSecurity || !!alertISIN);
+    return (
+      <Section title="Price Alerts" subtitle="Be notified when a security reaches a price, or your net worth crosses a level. System digests and reminders are under the bell.">
+        {alerts.loading && !alerts.data ? <LoadingState lines={3} />
+          : alerts.error && !alerts.data ? <ErrorState message="Alerts couldn’t be loaded." details={alerts.error} onRetry={alerts.reload} />
+          : list.length === 0 ? <EmptyState title="No price alerts yet" message="Set a price level or a net-worth milestone below and you’ll be notified when it is reached." />
+          : (
+            <Rows>
+              {list.map(a => (
+                <li key={a.id} className="py-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                  <div className="min-w-0 flex-1 basis-56">
+                    <p className="text-[15px] font-medium text-ink flex flex-wrap items-center gap-2">
+                      {alertName(a)}
+                      <Chip tone={a.is_active ? 'success' : 'neutral'}>{a.is_active ? 'Active' : 'Paused'}</Chip>
+                    </p>
+                    <p className="text-[13px] text-ink-body mt-0.5">{alertCondition(a)}</p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      className="apple-btn-secondary apple-btn-sm min-h-[44px] md:min-h-[36px]"
+                      aria-label={`${a.is_active ? 'Pause' : 'Resume'} alert for ${alertName(a)}`}
+                      onClick={() => api.toggleAlert(a.id).then(() => alerts.reload()).catch((e: Error) => setAlertError(e.message || 'Request failed'))}
+                    >
+                      {a.is_active ? 'Pause' : 'Resume'}
+                    </button>
+                    <button type="button" className="apple-btn-danger apple-btn-sm min-h-[44px] md:min-h-[36px]" aria-label={`Delete alert for ${alertName(a)}…`} onClick={() => deleteAlert(a, alertName(a))}>Delete…</button>
+                  </div>
+                </li>
+              ))}
+            </Rows>
+          )}
+
+        <form className="mt-6" onSubmit={e => { e.preventDefault(); if (canAdd) addAlert(); }}>
+          <SubHeading className="mb-3">Add an alert</SubHeading>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <SelectField label="Alert when" value={alertType} onChange={e => setAlertType(e.target.value)}>
+              <option value="price_above">Price rises to or above</option>
+              <option value="price_below">Price falls to or below</option>
+              <option value="portfolio_milestone">Net worth crosses</option>
+            </SelectField>
+            {needsSecurity && (
+              <SelectField label="Security" value={alertISIN} onChange={e => setAlertISIN(e.target.value)} error={securities.error && !securities.data ? 'Securities couldn’t be loaded.' : undefined}>
+                <option value="">Select a security…</option>
+                {(securities.data || []).map(s => <option key={s.isin} value={s.isin}>{s.name}</option>)}
+              </SelectField>
+            )}
+            <NumberField label={needsSecurity ? 'Price level' : 'Net worth level'} unit="€" value={alertThreshold} onValueChange={v => setAlertThreshold(Math.max(0, v))} />
+          </div>
+          {alertError && <div className="mt-4"><ErrorState message="That didn’t work. Nothing was changed." details={alertError} /></div>}
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <button type="submit" className="apple-btn-primary min-h-[44px]" disabled={!canAdd}>Add alert</button>
+            {!canAdd && <span className="text-[12px] text-ink-muted">{needsSecurity ? 'Needs a security and a price level.' : 'Needs a net worth level.'}</span>}
+          </div>
+        </form>
+
+        {triggered.length > 0 && (
+          <div className="mt-6">
+            <SubHeading className="mb-2">Recently triggered</SubHeading>
+            <Rows>
+              {triggered.map(n => (
+                <li key={n.id} className="py-2.5 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                  <p className="text-[14px] text-ink min-w-0 flex-1 basis-56" data-privacy={n.alert_type === 'portfolio_milestone' ? 'blur' : undefined}>{n.message}</p>
+                  <p className="text-[12px] text-ink-muted shrink-0 flex items-center gap-2">
+                    {!n.is_read && <Chip tone="info">New</Chip>}
+                    {fmtDate(n.triggered_at)}
+                  </p>
+                </li>
+              ))}
+            </Rows>
+          </div>
+        )}
+      </Section>
+    );
+  };
+
+  /* ───────────── Shell ───────────── */
+
+  const staleDays = priceAsOf ? Math.floor((Date.now() - new Date(priceAsOf).getTime()) / 86_400_000) : 0;
+  const meta = priceAsOf ? (
+    <span className="inline-flex flex-wrap items-center gap-2">
+      Prices as of {fmtDateLong(priceAsOf)}
+      {staleDays > 3 && <Chip tone="warning">Stale · {staleDays} days old</Chip>}
+    </span>
+  ) : undefined;
+
+  let panel: ReactNode;
+  switch (activeTab) {
+    case 'dividends': panel = renderDividends(); break;
+    case 'allocation':
+      panel = (
+        <>
+          <SectionBoundary>{renderTargets()}</SectionBoundary>
+          <SectionBoundary>{renderRebalancing()}</SectionBoundary>
+          <SectionBoundary>{renderAllocHistory()}</SectionBoundary>
+          <SectionBoundary>{renderSavingsPlans()}</SectionBoundary>
+        </>
+      );
+      break;
+    case 'holdings': panel = renderHoldings(); break;
+    case 'goals':
+      panel = (
+        <>
+          <SectionBoundary>{renderGoals()}</SectionBoundary>
+          <SectionBoundary>{renderAlerts()}</SectionBoundary>
+        </>
+      );
+      break;
+    default: panel = renderOverview();
+  }
 
   return (
-    <div className="space-y-6">
-      <TabBar tabs={PORTFOLIO_TABS} activeTab={activeTab} onTabChange={setActiveTab} />
-
-      {activeTab === 'overview' && (<>
-      {/* Price freshness + account filter */}
-      <div className="flex items-center justify-between">
-        {priceAsOf ? (
-          <p className="text-[12px] text-ink-muted">
-            Prices as of {new Date(priceAsOf).toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' })}
-            {(() => {
-              const days = Math.floor((Date.now() - new Date(priceAsOf).getTime()) / (1000 * 60 * 60 * 24));
-              if (days > 3) return <span className="text-amber ml-1">(stale)</span>;
-              return null;
-            })()}
-          </p>
-        ) : <div />}
-        {accounts.length > 1 && (
-          <select
-            value={filterAccount}
-            onChange={e => setFilterAccount(e.target.value)}
-            className="rounded-[8px] border border-divider bg-parchment text-ink px-3 py-1.5 text-[15px]"
-          >
-            <option value="">All Accounts</option>
-            {accounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
-          </select>
-        )}
+    <div>
+      <PageHeader title="Portfolio" meta={meta} />
+      <div className="mt-2 md:mt-4">
+        <TabBar tabs={PORTFOLIO_TABS} activeTab={activeTab} onTabChange={setActiveTab} ariaLabel="Portfolio views" />
       </div>
-
-      {/* KPI row */}
-      <div className="grid grid-cols-2 gap-2 md:gap-3 md:grid-cols-4">
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <p className="text-[12px] md:text-[13px] text-ink-muted">
-            {fullyPriced ? 'Market Value' : hasMarketPrices ? 'Value (partial market)' : 'Value (Cost)'}
-          </p>
-          <p className="font-serif text-[20px] md:text-[22px] text-ink mt-1 tabular-nums">{fmt(totalMarketValue)}</p>
-          {hasMarketPrices && (
-            <p className="text-[11px] md:text-[12px] text-ink-muted mt-0.5 tabular-nums">
-              Cost: {fmt(totalCostBasis)}
-              {!fullyPriced && holdings.length > 0 && (
-                <span className="text-amber"> · {pricedCount}/{holdings.length} priced</span>
-              )}
-            </p>
-          )}
-        </div>
-        {hasMarketPrices && (
-          <div className="border-t border-divider pt-6 py-3 md:py-5">
-            <p className="text-[12px] md:text-[13px] text-ink-muted">P&L</p>
-            <p className={`font-serif text-[20px] md:text-[22px] mt-1 tabular-nums ${totalPL >= 0 ? 'text-sage' : 'text-claret'}`}>
-              {totalPL >= 0 ? '+' : ''}{fmt(totalPL)}
-            </p>
-            <p className={`text-[11px] md:text-[12px] mt-0.5 tabular-nums ${totalPL >= 0 ? 'text-sage' : 'text-claret'}`}>
-              {totalPLPct >= 0 ? '+' : ''}{totalPLPct.toFixed(2)}%
-            </p>
-          </div>
-        )}
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <p className="text-[12px] md:text-[13px] text-ink-muted">Positions</p>
-          <p className="font-serif text-[20px] md:text-[22px] text-ink mt-1">{holdings.length}</p>
-        </div>
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <p className="text-[12px] md:text-[13px] text-ink-muted">Dividends</p>
-          <p className="font-serif text-[20px] md:text-[22px] text-sage mt-1 tabular-nums">{fmt(totalDividends)}</p>
-        </div>
-      </div>
-
-      {/* Health Score */}
-      {healthScore && healthScore.score > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <div className="flex items-center gap-4 px-1 md:px-0">
-            <div className={`w-16 h-16 rounded-full flex items-center justify-center text-white dark:text-parchment-deep text-xl font-bold shrink-0 ${
-              healthScore.score >= 80 ? 'bg-sage' : healthScore.score >= 60 ? 'bg-amber' : 'bg-claret'
-            }`}>
-              {healthScore.score}
-            </div>
-            <div className="flex-1 min-w-0">
-              <h2 className="font-serif text-heading text-ink mb-1">Portfolio Health</h2>
-              <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1">
-                {healthScore.subscores.map(s => (
-                  <span key={s.name} className="text-[12px]">
-                    <span className={`font-medium ${s.status === 'good' ? 'text-sage' : s.status === 'fair' ? 'text-amber' : 'text-claret'}`}>
-                      {s.score}
-                    </span>
-                    <span className="text-ink-muted ml-0.5">{s.name}</span>
-                  </span>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Performance summary */}
-      {performance && performance.total_invested > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4">Performance</h2>
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-x-4 md:gap-x-8 gap-y-3">
-            <div>
-              <p className="text-[11px] md:text-[12px] text-ink-muted" title="Total deposits minus withdrawals across all accounts">Net Invested</p>
-              <p className="text-[13px] md:text-[15px] font-medium text-ink tabular-nums mt-0.5">{fmt(netCash)}</p>
-            </div>
-            <div>
-              <p className="text-[11px] md:text-[12px] text-ink-muted">Total Gains</p>
-              <p className={`text-[13px] md:text-[15px] font-medium tabular-nums mt-0.5 ${performance.total_return >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {performance.total_return >= 0 ? '+' : ''}{fmt(performance.total_return)}
-              </p>
-              <p className={`text-[11px] tabular-nums ${performance.total_return >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {performance.total_return_pct >= 0 ? '+' : ''}{performance.total_return_pct.toFixed(2)}%
-              </p>
-            </div>
-            <div>
-              <p className="text-[11px] md:text-[12px] text-ink-muted">TWR</p>
-              <p className={`text-[13px] md:text-[15px] font-semibold tabular-nums mt-0.5 ${performance.twr >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {performance.twr >= 0 ? '+' : ''}{performance.twr.toFixed(2)}%
-              </p>
-            </div>
-            <div>
-              <p className="text-[11px] md:text-[12px] text-ink-muted">IRR</p>
-              <p className={`text-[13px] md:text-[15px] font-semibold tabular-nums mt-0.5 ${performance.irr >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {performance.irr >= 0 ? '+' : ''}{performance.irr.toFixed(2)}%
-              </p>
-            </div>
-            <div>
-              <p className="text-[11px] md:text-[12px] text-ink-muted">Realized</p>
-              <p className={`text-[13px] md:text-[15px] font-medium tabular-nums mt-0.5 ${performance.realized_pl >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {performance.realized_pl >= 0 ? '+' : ''}{fmt(performance.realized_pl)}
-              </p>
-            </div>
-            <div>
-              <p className="text-[11px] md:text-[12px] text-ink-muted">Unrealized <span className="text-[11px] text-ink-muted">(avg)</span></p>
-              <p className={`text-[13px] md:text-[15px] font-medium tabular-nums mt-0.5 ${performance.unrealized_pl >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {performance.unrealized_pl >= 0 ? '+' : ''}{fmt(performance.unrealized_pl)}
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Performance History Chart */}
-      {perfHistory.length > 1 && (() => {
-        const filtered = filterByPeriod(perfHistory, growthPeriod);
-        return (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <div className="flex flex-col md:flex-row md:items-start md:justify-between mb-3 md:mb-4 px-1 md:px-0 gap-3">
-            <div>
-              <h2 className="font-serif text-heading text-ink">Growth Over Time</h2>
-              <p className="text-[11px] md:text-[12px] text-ink-muted mt-1">Capital invested stacks cash deposits and RSU vests, valued at fair-market value on the vest date.</p>
-            </div>
-            <PeriodSelector value={growthPeriod} onChange={setGrowthPeriod} />
-          </div>
-          <EChartWrapper option={{
-            tooltip: {
-              trigger: 'axis' as const,
-              formatter: (params: unknown) => {
-                const p = params as { seriesName: string; data: number; axisValueLabel: string; color: string }[];
-                if (!Array.isArray(p) || p.length === 0) return '';
-                let html = `<strong>${p[0].axisValueLabel}</strong>`;
-                for (const s of p) {
-                  const isPct = s.seriesName === 'Return' || s.seriesName === 'MSCI World';
-                  const color = isPct ? s.color
-                    : s.seriesName === 'Cash' ? tc.inkMuted
-                    : s.seriesName === 'In-kind' ? tc.slate
-                    : tc.forest;
-                  html += `<br/><span style="color:${color}">${s.seriesName}: ${
-                    isPct ? `${s.data >= 0 ? '+' : ''}${s.data.toFixed(1)}%`
-                    : new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(s.data)
-                  }</span>`;
-                }
-                return html;
-              },
-            },
-            legend: { data: ['Portfolio Value', 'Cash', 'In-kind', 'Return', ...(filtered.some(p => p.benchmark_pct != null) ? ['MSCI World'] : [])], bottom: 0, itemGap: 12, textStyle: { fontSize: 10, color: tc.inkMuted } },
-            xAxis: {
-              type: 'category' as const,
-              data: filtered.map(p => formatDateForPeriod(p.date, growthPeriod)),
-              axisLabel: { fontSize: 11, color: tc.inkMuted, rotate: 45 },
-              axisLine: { show: false },
-              axisTick: { show: false },
-            },
-            yAxis: [
-              {
-                type: 'value' as const,
-                axisLabel: { formatter: (v: number) => `${(v / 1000).toFixed(0)}k`, fontSize: 12, color: tc.inkMuted },
-                splitLine: { lineStyle: { color: tc.divider } },
-              },
-              {
-                type: 'value' as const,
-                axisLabel: { formatter: (v: number) => `${v.toFixed(0)}%`, fontSize: 12, color: tc.inkMuted },
-                splitLine: { show: false },
-              },
-            ],
-            series: [
-              {
-                name: 'Portfolio Value',
-                type: 'line' as const,
-                data: filtered.map(p => Math.round(p.portfolio_value)),
-                smooth: 0.3,
-                showSymbol: false,
-                lineStyle: { width: 2.5, color: tc.forest },
-                areaStyle: { opacity: 0.08, color: tc.forest },
-              },
-              {
-                name: 'Cash',
-                type: 'line' as const,
-                stack: 'invested',
-                data: filtered.map(p => Math.round(p.cash_invested)),
-                smooth: 0.3,
-                showSymbol: false,
-                lineStyle: { width: 1.5, color: tc.inkMuted, type: 'dashed' as const },
-                areaStyle: { opacity: 0.05, color: tc.inkMuted },
-              },
-              {
-                name: 'In-kind',
-                type: 'line' as const,
-                stack: 'invested',
-                data: filtered.map(p => Math.round(p.in_kind_invested)),
-                smooth: 0.3,
-                showSymbol: false,
-                lineStyle: { width: 1.5, color: tc.slate, type: 'dashed' as const },
-                areaStyle: { opacity: 0.1, color: tc.slate },
-              },
-              {
-                name: 'Return',
-                type: 'line' as const,
-                yAxisIndex: 1,
-                data: filtered.map(p => Math.round(p.return_pct * 10) / 10),
-                smooth: 0.3,
-                showSymbol: false,
-                lineStyle: { width: 2, color: tc.sage },
-              },
-              ...(filtered.some(p => p.benchmark_pct != null) ? [{
-                name: 'MSCI World',
-                type: 'line' as const,
-                yAxisIndex: 1,
-                data: filtered.map(p => p.benchmark_pct != null ? Math.round(p.benchmark_pct * 10) / 10 : null),
-                smooth: 0.3,
-                showSymbol: false,
-                lineStyle: { width: 1.5, color: tc.walnut, type: 'dotted' as const },
-              }] : []),
-            ],
-            grid: { left: 55, right: 45, top: 10, bottom: 55 },
-          }} height="300px" />
-        </div>
-        );
-      })()}
-
-      </>)}
-
-      {activeTab === 'dividends' && (<>
-      {/* Dividend Dashboard */}
-      {dividends && dividends.total > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Dividend Income</h2>
-
-          {/* Dividend KPIs */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-3 mb-4 px-1 md:px-0">
-            <div className="rounded-xl bg-parchment-deep p-3">
-              <p className="text-[12px] text-ink-muted mb-1">Total Received</p>
-              <p className="font-serif text-[20px] font-semibold tabular-nums text-sage">{fmt(dividends.total)}</p>
-            </div>
-            <div className="rounded-xl bg-parchment-deep p-3">
-              <p className="text-[12px] text-ink-muted mb-1">Trailing 12 Months</p>
-              <p className="font-serif text-[20px] font-semibold tabular-nums text-sage">{fmt(dividends.trailing_12m)}</p>
-            </div>
-            <div className="rounded-xl bg-parchment-deep p-3">
-              <p className="text-[12px] text-ink-muted mb-1">Yield on Cost</p>
-              <p className="font-serif text-[20px] font-semibold tabular-nums">{dividends.yield_on_cost.toFixed(2)}%</p>
-            </div>
-            <div className="rounded-xl bg-parchment-deep p-3">
-              <p className="text-[12px] text-ink-muted mb-1">Growth YoY</p>
-              <p className={`font-serif text-[20px] font-semibold tabular-nums ${dividends.dividend_growth >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {Math.abs(dividends.dividend_growth) > 500
-                  ? 'N/A'
-                  : `${dividends.dividend_growth >= 0 ? '+' : ''}${dividends.dividend_growth.toFixed(1)}%`}
-              </p>
-              {Math.abs(dividends.dividend_growth) > 500 && (
-                <p className="text-[11px] text-ink-muted mt-0.5">insufficient history</p>
-              )}
-            </div>
-          </div>
-
-          {/* View toggle */}
-          <div className="flex gap-1.5 mb-3 px-1 md:px-0" role="group" aria-label="Dividend view">
-            {(['monthly', 'yearly', 'cumulative'] as const).map((view) => (
-              <button
-                key={view}
-                onClick={() => setDividendView(view as 'monthly' | 'yearly')}
-                className={`rounded-[8px] px-3 py-2.5 text-[12px] font-medium transition-all duration-150 capitalize ${
-                  dividendView === view
-                    ? 'bg-forest text-white dark:text-parchment-deep'
-                    : 'bg-parchment-deep text-ink-body hover:bg-divider active:bg-divider'
-                }`}
-              >
-                {view}
-              </button>
-            ))}
-          </div>
-
-          {/* Charts */}
-          {dividendView === 'cumulative' && dividends.cumulative && dividends.cumulative.length > 0 ? (
-            <EChartWrapper option={{
-              tooltip: {
-                trigger: 'axis' as const,
-                formatter: (params: unknown) => {
-                  const ps = params as { seriesName: string; data: number; axisValue: string; marker: string }[];
-                  if (!Array.isArray(ps) || ps.length === 0) return '';
-                  return `${ps[0].axisValue}<br/>${ps.map(p => `${p.marker} ${p.seriesName}: ${fmt(p.data)}`).join('<br/>')}`;
-                },
-              },
-              legend: { data: ['Monthly', 'Cumulative'], bottom: 0, textStyle: { fontSize: 11, color: tc.inkMuted } },
-              xAxis: {
-                type: 'category' as const,
-                data: dividends.cumulative.map(c => c.month),
-                axisLabel: { fontSize: 11, color: tc.inkMuted, interval: Math.max(Math.floor(dividends.cumulative.length / 8) - 1, 0) },
-                axisLine: { show: false }, axisTick: { show: false },
-              },
-              yAxis: [
-                { type: 'value' as const, axisLabel: { formatter: (v: number) => `${v}`, fontSize: 11, color: tc.inkMuted }, splitLine: { lineStyle: { color: tc.divider } } },
-                { type: 'value' as const, axisLabel: { formatter: (v: number) => `${v}`, fontSize: 11, color: tc.inkMuted }, splitLine: { show: false } },
-              ],
-              series: [
-                { name: 'Monthly', type: 'bar' as const, data: dividends.cumulative.map(c => Math.round(c.amount * 100) / 100), itemStyle: { color: tc.sage, borderRadius: [3, 3, 0, 0] }, barMaxWidth: 20 },
-                { name: 'Cumulative', type: 'line' as const, yAxisIndex: 1, data: dividends.cumulative.map(c => c.cumulative), smooth: 0.3, showSymbol: false, lineStyle: { color: tc.forest, width: 2 } },
-              ],
-              grid: { left: 45, right: 45, top: 10, bottom: 40 },
-            }} height="250px" />
-          ) : dividendChartOption ? (
-            <EChartWrapper option={dividendChartOption} height="220px" />
-          ) : null}
-
-          {/* By Security breakdown */}
-          {dividends.by_security && dividends.by_security.length > 0 && (
-            <div className="mt-3 md:mt-4 pt-3 md:pt-4 border-t border-divider px-1 md:px-0">
-              <p className="text-[12px] text-ink-muted mb-2">By Security</p>
-              <div className="space-y-1.5">
-                {dividends.by_security.map((s) => (
-                  <div key={s.isin} className="flex items-center justify-between gap-2">
-                    <p className="text-[13px] md:text-[15px] text-ink truncate">{s.name}</p>
-                    <p className="text-[13px] md:text-[15px] text-sage tabular-nums font-medium shrink-0">{fmt(s.amount)}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Dividend Calendar */}
-          {dividends.calendar && dividends.calendar.length > 0 && (
-            <div className="mt-3 md:mt-4 pt-3 md:pt-4 border-t border-divider px-1 md:px-0">
-              <p className="text-[12px] text-ink-muted mb-2">Expected Upcoming Dividends</p>
-              <div className="space-y-1.5">
-                {(() => {
-                  // Group by month
-                  const byMonth: Record<string, { name: string; expected: number }[]> = {};
-                  dividends.calendar.forEach((c: { month: string; name: string; expected: number }) => {
-                    (byMonth[c.month] ??= []).push({ name: c.name, expected: c.expected });
-                  });
-                  return Object.entries(byMonth).slice(0, 6).map(([month, entries]) => (
-                    <div key={month} className="rounded-lg bg-inset border-l-[3px] border-sage px-3 py-2">
-                      <p className="text-[12px] font-medium text-ink mb-1">{month}</p>
-                      {entries.map((e, i) => (
-                        <div key={i} className="flex items-center justify-between">
-                          <span className="text-[12px] text-ink-muted truncate">{e.name}</span>
-                          <span className="text-[12px] text-sage font-medium tabular-nums shrink-0 ml-2">~{fmt(e.expected)}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ));
-                })()}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      </>)}
-
-      {activeTab === 'allocation' && (<>
-      {/* Target Allocation */}
-      {allocation && allocation.allocations.length > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <div className="flex items-center justify-between mb-3 md:mb-4 px-1 md:px-0">
-            <div>
-              <h2 className="font-serif text-heading text-ink">Target Allocation</h2>
-              {allocation.has_targets && (
-                <p className="text-[13px] text-ink-muted mt-0.5">
-                  Max drift: <span className={Math.abs(allocation.max_drift) > 5 ? 'text-claret font-medium' : Math.abs(allocation.max_drift) > 2 ? 'text-amber font-medium' : 'text-sage font-medium'}>
-                    {allocation.max_drift > 0 ? '+' : ''}{allocation.max_drift}%
-                  </span>
-                </p>
-              )}
-            </div>
-            <button
-              onClick={() => {
-                if (editingTargets) {
-                  // Save
-                  const allocs = Object.entries(targetDrafts)
-                    .map(([isin, val]) => ({ isin, target_pct: parseFloat(val) || 0 }));
-                  api.setAllocation(allocs).then(() => {
-                    setEditingTargets(false);
-                    api.getAllocation().then(setAllocation).catch(() => {});
-                  }).catch(console.error);
-                } else {
-                  // Start editing
-                  const drafts: Record<string, string> = {};
-                  for (const a of allocation.allocations) {
-                    drafts[a.isin] = String(a.target_pct);
-                  }
-                  setTargetDrafts(drafts);
-                  setEditingTargets(true);
-                }
-              }}
-              className={`rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors ${
-                editingTargets
-                  ? 'bg-sage text-white dark:text-parchment-deep'
-                  : 'bg-parchment-deep text-ink-body hover:bg-divider'
-              }`}
-            >
-              {editingTargets ? 'Save' : 'Edit Targets'}
-            </button>
-          </div>
-
-          {/* Target vs Actual bars */}
-          <div className="space-y-3">
-            {allocation.allocations.map(a => (
-              <div key={a.isin} className="px-1 md:px-0">
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[15px] font-medium text-ink truncate mr-2">{a.name}</span>
-                  <div className="flex items-center gap-2 shrink-0">
-                    {editingTargets ? (
-                      <div className="flex items-center gap-1">
-                        <span className="text-[12px] text-ink-muted">Target:</span>
-                        <input
-                          type="number"
-                          min="0"
-                          max="100"
-                          step="0.5"
-                          value={targetDrafts[a.isin] ?? '0'}
-                          onChange={e => setTargetDrafts(d => ({ ...d, [a.isin]: e.target.value }))}
-                          className="w-16 text-right text-[13px] font-medium tabular-nums rounded border border-divider px-1.5 py-0.5 bg-parchment text-ink"
-                        />
-                        <span className="text-[12px] text-ink-muted">%</span>
-                      </div>
-                    ) : (
-                      <>
-                        <span className="text-[13px] tabular-nums text-ink-body">
-                          {a.actual_pct}%{a.target_pct > 0 ? ` / ${a.target_pct}%` : ''}
-                        </span>
-                        {a.target_pct > 0 && (
-                          // Drift badge: bg-{color}/20 alpha modifiers don't
-                          // render against this codebase's var-backed Tailwind
-                          // colors, so the tint was invisible. Use a parchment
-                          // surface with a coloured outline + matching text
-                          // colour — clearly tinted in both modes.
-                          <span className={`text-[12px] font-semibold tabular-nums px-2 py-0.5 rounded bg-parchment-deep border ${
-                            a.status === 'on_target' ? 'border-sage text-sage' :
-                            a.status === 'overweight' ? 'border-claret text-claret' :
-                            'border-amber text-amber'
-                          }`}>
-                            {a.drift_pct > 0 ? '+' : ''}{a.drift_pct}%
-                          </span>
-                        )}
-                      </>
-                    )}
-                  </div>
-                </div>
-                {/* Single bar with target tick. The previous two-tone bar
-                    rendered an amber "gap" segment at opacity 0.3 that was
-                    nearly invisible against parchment (below WCAG AA at the
-                    14px bar height it was the only signal of under-allocation).
-                    Now: bar shows actual%, a 2px vertical claret tick marks
-                    target%. Bar colour reflects status — forest when within
-                    tolerance, claret when overweight, walnut-ish forest when
-                    underweight (just shorter than the tick). */}
-                <svg className="w-full mt-1.5" height="14" role="img" aria-label={`${a.name}: ${a.actual_pct}% actual${a.target_pct > 0 ? `, ${a.target_pct}% target` : ''}`}>
-                  <defs>
-                    <clipPath id={`bar-clip-${a.isin}`}>
-                      <rect x="0" y="0" width="100%" height="14" rx="7" />
-                    </clipPath>
-                  </defs>
-                  {/* Track */}
-                  <rect x="0" y="0" width="100%" height="14" rx="7" fill="var(--color-divider)" opacity="0.5" />
-                  <g clipPath={`url(#bar-clip-${a.isin})`}>
-                    <rect
-                      x="0" y="0"
-                      width={`${Math.min(a.actual_pct, 100)}%`}
-                      height="14"
-                      fill={a.status === 'overweight' ? 'var(--color-claret)' : 'var(--color-forest)'}
-                      opacity="0.75"
-                    />
-                  </g>
-                  {a.target_pct > 0 && a.target_pct <= 100 && (
-                    // Target tick: 2px vertical claret bar, ink ring around it so
-                    // it stays visible whether the underlying bar segment is forest,
-                    // claret, or empty parchment track.
-                    <>
-                      <rect x={`calc(${a.target_pct}% - 2px)`} y="-1" width="4" height="16" fill="var(--color-parchment)" />
-                      <rect x={`calc(${a.target_pct}% - 1px)`} y="-1" width="2" height="16" fill="var(--color-ink)" />
-                    </>
-                  )}
-                </svg>
-              </div>
-            ))}
-          </div>
-
-          {!allocation.has_targets && !editingTargets && (
-            <p className="text-[13px] text-ink-muted mt-3 px-1 md:px-0">
-              No target allocation set. Click "Edit Targets" to define your desired portfolio weights.
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Rebalancing Suggestions */}
-      {allocation && allocation.has_targets && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Rebalancing</h2>
-
-          <div className="flex flex-col sm:flex-row gap-2 mb-3 px-1 md:px-0">
-            <div className="flex gap-2 flex-1">
-              <input
-                type="number"
-                placeholder="Deposit amount (EUR)"
-                value={depositAmount}
-                onChange={e => setDepositAmount(e.target.value)}
-                className="flex-1 rounded-[8px] border border-divider bg-parchment text-ink px-3 py-2 text-[16px] tabular-nums"
-              />
-              <button
-                onClick={() => {
-                  const dep = parseFloat(depositAmount) || 0;
-                  api.getRebalance(dep > 0 ? dep : undefined).then(r => {
-                    setRebalanceTrades(r.trades || []);
-                    setRebalanceMsg(r.message);
-                  }).catch(console.error);
-                }}
-                className="rounded-[8px] bg-forest text-white dark:text-parchment-deep px-4 py-2 text-[16px] font-medium whitespace-nowrap"
-              >
-                {depositAmount ? 'Allocate Deposit' : 'Compute Trades'}
-              </button>
-            </div>
-          </div>
-
-          {rebalanceMsg && (
-            <p className="text-[13px] text-ink-muted mb-3 md:mb-4 px-1 md:px-0">{rebalanceMsg}</p>
-          )}
-
-          {rebalanceTrades.length > 0 && (
-            <div className="space-y-2 px-1 md:px-0">
-              {rebalanceTrades.map(t => (
-                <div key={t.isin} className={`flex items-center justify-between rounded-xl px-3 py-2.5 ${
-                  t.action === 'buy' ? 'bg-inset border-l-[3px] border-sage' : 'bg-inset border-l-[3px] border-claret'
-                }`}>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[15px] font-medium text-ink">{t.name}</p>
-                    <p className="text-[12px] text-ink-muted">
-                      {t.current_pct}% → {t.target_pct}%
-                    </p>
-                  </div>
-                  <div className="text-right shrink-0 ml-3">
-                    <p className={`text-[15px] font-semibold tabular-nums ${
-                      t.action === 'buy' ? 'text-sage' : 'text-claret'
-                    }`}>
-                      {t.action === 'buy' ? 'Buy' : 'Sell'} {fmt(t.amount)}
-                    </p>
-                    {t.shares != null && t.shares > 0 && (
-                      <p className="text-[12px] text-ink-muted tabular-nums">
-                        ~{t.shares} shares
-                      </p>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {rebalanceTrades.length === 0 && rebalanceMsg && (
-            <p className="text-[13px] text-ink-muted px-1 md:px-0">
-              No trades needed — portfolio is within target allocation.
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Allocation History */}
-      {allocHistory && allocHistory.history.length > 3 && (() => {
-        const filtered = filterByPeriod(allocHistory.history, allocPeriod);
-        return (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <div className="flex items-center justify-between mb-1 px-1 md:px-0">
-            <h2 className="font-serif text-heading text-ink">Allocation History</h2>
-            <PeriodSelector value={allocPeriod} onChange={setAllocPeriod} />
-          </div>
-          <p className="text-[13px] text-ink-muted mb-3 md:mb-4 px-1 md:px-0">How your portfolio composition evolved over time.</p>
-          <EChartWrapper option={{
-            tooltip: { trigger: 'axis' as const },
-            legend: { type: 'scroll' as const, bottom: 0, textStyle: { fontSize: 11, color: tc.inkMuted } },
-            xAxis: { type: 'category' as const, data: filtered.map(h => formatDateForPeriod(h.date, allocPeriod)), axisLabel: { fontSize: 11, color: tc.inkMuted, rotate: 45 }, boundaryGap: false },
-            yAxis: { type: 'value' as const, max: 100, axisLabel: { formatter: (v: number) => `${v}%`, fontSize: 11, color: tc.inkMuted }, splitLine: { lineStyle: { color: tc.divider } } },
-            series: allocHistory.holdings.map(name => ({
-              name, type: 'line' as const, stack: 'total', areaStyle: { opacity: 0.7 },
-              emphasis: { focus: 'series' as const }, symbol: 'none',
-              data: filtered.map(h => {
-                for (const [isin, w] of Object.entries(h.weights)) {
-                  if (name === isin || holdings.some(hold => hold.security_isin === isin && hold.name === name)) return w;
-                }
-                return 0;
-              }),
-            })),
-            grid: { left: 45, right: 10, top: 10, bottom: 60 },
-          }} height="320px" />
-        </div>
-        );
-      })()}
-
-      {/* Savings Plans */}
-      {savingsPlans && savingsPlans.plans.length > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <h2 className="font-serif text-heading text-ink mb-1 px-1 md:px-0">Savings Plans</h2>
-          <p className="text-[13px] text-ink-muted mb-3 md:mb-4 px-1 md:px-0">
-            {savingsPlans.plan_count} detected plans · {fmt(savingsPlans.total_monthly)}/month total
-          </p>
-          <div className="space-y-2 px-1 md:px-0">
-            {savingsPlans.plans.map(p => (
-              <div key={p.isin} className="rounded-xl bg-parchment-deep px-3 py-2.5">
-                <div className="flex items-center justify-between">
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[15px] font-medium text-ink truncate">{p.name}</p>
-                    <p className="text-[12px] text-ink-muted">
-                      ~{fmt(p.monthly_amount)}/mo · {p.executions} buys · {p.months_active} months
-                    </p>
-                  </div>
-                  <div className="text-right shrink-0 ml-3">
-                    <p className="text-[15px] font-semibold tabular-nums">{fmt(p.current_value)}</p>
-                    <p className={`text-[12px] font-medium tabular-nums ${p.dca_return_pct >= 0 ? 'text-sage' : 'text-claret'}`}>
-                      {p.dca_return_pct >= 0 ? '+' : ''}{p.dca_return_pct}%
-                    </p>
-                  </div>
-                </div>
-                {p.lump_sum_value > 0 && (
-                  <div className="flex items-center gap-3 mt-1.5 pt-1.5 border-t border-divider text-[11px]">
-                    <span className="text-ink-muted">DCA: {fmt(p.current_value)}</span>
-                    <span className="text-ink-muted">Lump-sum: {fmt(p.lump_sum_value)}</span>
-                    <span className={`font-medium ${p.dca_advantage_eur >= 0 ? 'text-sage' : 'text-claret'}`}>
-                      DCA {p.dca_advantage_eur >= 0 ? 'wins' : 'loses'} by {fmt(Math.abs(p.dca_advantage_eur))}
-                    </span>
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      </>)}
-
-      {activeTab === 'holdings' && (<>
-      {/* Holdings */}
-      <div className="border-t border-divider pt-6 py-3 md:py-5">
-        <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Holdings</h2>
-        <HoldingsTable holdings={holdings} onSecurityClick={(isin) => {
-          if (securityDetail?.isin === isin) { setSecurityDetail(null); return; }
-          api.getSecurityDetail(isin).then(setSecurityDetail).catch(console.error);
-        }} />
-      </div>
-
-      <UnvestedPanel mode="detail" />
-
-      {/* Security Detail Panel */}
-      {securityDetail && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <div className="flex items-start justify-between mb-3">
-            <div>
-              <h2 className="font-serif text-heading font-semibold text-ink">{securityDetail.name}</h2>
-              <p className="text-[12px] text-ink-muted">
-                {securityDetail.isin} {securityDetail.symbol && `· ${securityDetail.symbol}`} · {securityDetail.asset_class}
-                {securityDetail.ter > 0 && ` · TER ${securityDetail.ter.toFixed(2)}%`}
-              </p>
-            </div>
-            <button onClick={() => setSecurityDetail(null)} className="text-ink-muted hover:text-claret text-xl leading-none">×</button>
-          </div>
-
-          {/* KPI Cards */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-            <div className="rounded-xl bg-parchment-deep p-3 text-center">
-              <p className="text-[12px] text-ink-muted mb-1">Market Value</p>
-              <p className="text-[13px] md:text-[15px] font-semibold tabular-nums">{fmt(securityDetail.total_value)}</p>
-            </div>
-            <div className="rounded-xl bg-parchment-deep p-3 text-center">
-              <p className="text-[12px] text-ink-muted mb-1">P&L</p>
-              <p className={`text-[13px] md:text-[15px] font-semibold tabular-nums ${securityDetail.unrealized_pl >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {securityDetail.unrealized_pl >= 0 ? '+' : ''}{fmt(securityDetail.unrealized_pl)}
-              </p>
-            </div>
-            <div className="rounded-xl bg-parchment-deep p-3 text-center">
-              <p className="text-[12px] text-ink-muted mb-1">Weight</p>
-              <p className="text-[13px] md:text-[15px] font-semibold tabular-nums">{securityDetail.weight_pct}%</p>
-            </div>
-            <div className="rounded-xl bg-parchment-deep p-3 text-center">
-              <p className="text-[12px] text-ink-muted mb-1">Shares</p>
-              <p className="text-[13px] md:text-[15px] font-semibold tabular-nums">{securityDetail.total_quantity}</p>
-            </div>
-          </div>
-
-          {/* Price Sparkline */}
-          {securityDetail.sparkline.length > 2 && (() => {
-            // Build buy/sell marker data aligned to sparkline dates. The
-            // sparkline x-axis is category-based, so a marker only renders
-            // when its x-value matches an existing category. Transactions
-            // executed on weekends/holidays have no matching market_data row
-            // and used to be silently dropped — now we snap each one to the
-            // first sparkline date on or after the txn date so the marker
-            // appears at the next trading day instead of vanishing.
-            const sparkDates = securityDetail.sparkline.map(s => s.date);
-            const sparkSet = new Set(sparkDates);
-            const priceMap = new Map(securityDetail.sparkline.map(s => [s.date, s.price]));
-            const firstSparkDate = sparkDates[0];
-            const lastSparkDate = sparkDates[sparkDates.length - 1];
-            const snapToSparkline = (txnDate: string): string | null => {
-              if (sparkSet.has(txnDate)) return txnDate;
-              if (txnDate < firstSparkDate || txnDate > lastSparkDate) return null;
-              // sparkDates is chronologically sorted; pick the first date on
-              // or after the txn date (forward-fill to next trading day).
-              for (const d of sparkDates) {
-                if (d >= txnDate) return d;
-              }
-              return null;
-            };
-            const buyMarkers: [string, number][] = [];
-            const sellMarkers: [string, number][] = [];
-            const avgCost = securityDetail.total_quantity > 0 ? securityDetail.total_cost / securityDetail.total_quantity : 0;
-            securityDetail.transactions.forEach(t => {
-              const snapped = snapToSparkline(t.date);
-              if (!snapped) return;
-              const price = priceMap.get(snapped) || 0;
-              if (t.type === 'buy' || t.type === 'savings_plan') buyMarkers.push([snapped, price]);
-              else if (t.type === 'sell') sellMarkers.push([snapped, price]);
-            });
-            return (
-              <div className="mb-4">
-                <p className="text-[12px] text-ink-muted mb-1">
-                  Price (90 days)
-                  {avgCost > 0 && <span className="text-amber ml-2">— avg cost {fmt(avgCost)}</span>}
-                  {buyMarkers.length > 0 && <span className="text-sage ml-2">● buys</span>}
-                  {sellMarkers.length > 0 && <span className="text-claret ml-2">● sells</span>}
-                </p>
-                <EChartWrapper option={{
-                  grid: { left: 50, right: 16, top: 8, bottom: 24 },
-                  xAxis: { type: 'category' as const, data: securityDetail.sparkline.map(s => s.date), show: false },
-                  yAxis: { type: 'value' as const, axisLabel: { fontSize: 10, formatter: (v: number) => `${v.toFixed(0)}` }, splitLine: { lineStyle: { color: tc.divider } } },
-                  series: [
-                    { type: 'line', data: securityDetail.sparkline.map(s => s.price), smooth: 0.3, showSymbol: false, lineStyle: { color: tc.forest, width: 1.5 }, areaStyle: { color: `color-mix(in srgb, ${tc.forest} 6%, transparent)` },
-                      ...(avgCost > 0 ? { markLine: { silent: true, symbol: 'none', data: [{ yAxis: avgCost, lineStyle: { color: tc.gold, type: 'dashed', width: 1 }, label: { show: false } }] } } : {}),
-                    },
-                    ...(buyMarkers.length > 0 ? [{
-                      type: 'scatter' as const, name: 'Buy',
-                      data: buyMarkers.map(([date, price]) => [date, price]),
-                      symbol: 'circle', symbolSize: 8,
-                      itemStyle: { color: tc.sage },
-                    }] : []),
-                    ...(sellMarkers.length > 0 ? [{
-                      type: 'scatter' as const, name: 'Sell',
-                      data: sellMarkers.map(([date, price]) => [date, price]),
-                      symbol: 'diamond', symbolSize: 10,
-                      itemStyle: { color: tc.claret },
-                    }] : []),
-                  ],
-                  tooltip: { trigger: 'axis' as const },
-                }} height="180px" />
-              </div>
-            );
-          })()}
-
-          {/* Per-Account Positions */}
-          {securityDetail.positions.length > 1 && (
-            <div className="mb-4">
-              <p className="text-[12px] text-ink-muted mb-1">By Account</p>
-              <div className="space-y-1">
-                {securityDetail.positions.map((p, i) => (
-                  <div key={i} className="flex items-center justify-between rounded-lg bg-parchment-deep px-3 py-1.5">
-                    <span className="text-[13px] text-ink">{p.account}</span>
-                    <span className="text-[13px] tabular-nums">{p.quantity} shares · {fmt(p.value)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Transaction History (last 10) */}
-          {securityDetail.transactions.length > 0 && (
-            <div>
-              <p className="text-[12px] text-ink-muted mb-1">Recent Transactions ({securityDetail.transactions.length} total)</p>
-              <div className="overflow-x-auto">
-                <table className="w-full text-[12px] min-w-[400px]">
-                  <thead>
-                    <tr className="text-ink-muted text-left border-b border-divider">
-                      <th className="px-2 py-1 font-medium">Date</th>
-                      <th className="px-2 py-1 font-medium">Type</th>
-                      <th className="px-2 py-1 font-medium text-right">Qty</th>
-                      <th className="px-2 py-1 font-medium text-right">Amount</th>
-                      <th className="px-2 py-1 font-medium text-right">Holding</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {securityDetail.transactions.slice(-10).reverse().map((t, i) => (
-                      <tr key={i} className="border-b border-divider">
-                        <td className="px-2 py-1 tabular-nums">{t.date}</td>
-                        <td className={`px-2 py-1 font-medium ${t.type === 'buy' || t.type === 'savings_plan' ? 'text-sage' : t.type === 'sell' ? 'text-claret' : 'text-forest'}`}>{t.type}</td>
-                        <td className="px-2 py-1 text-right tabular-nums">{t.quantity > 0 ? t.quantity : '—'}</td>
-                        <td className="px-2 py-1 text-right tabular-nums">{fmt(t.amount)}</td>
-                        <td className="px-2 py-1 text-right tabular-nums">{t.running_qty}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          <p className="text-[11px] text-ink-muted mt-3">
-            First buy: {securityDetail.first_buy} · Cost basis: {fmt(securityDetail.total_cost)}
-          </p>
-
-          {/* Product Switch Comparison */}
-          <div className="mt-4 pt-3 border-t border-divider">
-            <p className="text-[12px] text-ink-muted mb-2">What if I had bought a different product?</p>
-            <div className="flex gap-2 mb-2">
-              <input
-                type="text"
-                value={switchAltISIN}
-                onChange={e => setSwitchAltISIN(e.target.value.toUpperCase())}
-                placeholder="Alternative ISIN (e.g. IE00B4L5Y983)"
-                className="flex-1 rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums"
-              />
-              <button
-                onClick={async () => {
-                  if (!switchAltISIN || !securityDetail) return;
-                  setSwitchLoading(true);
-                  setSwitchResult(null);
-                  try {
-                    const res = await fetch(`/api/portfolio/switch-compare?current=${securityDetail.isin}&alternative=${switchAltISIN}`);
-                    if (res.ok) setSwitchResult(await res.json());
-                  } catch {} finally { setSwitchLoading(false); }
-                }}
-                disabled={switchLoading || !switchAltISIN}
-                className="apple-btn-primary text-[12px] px-3 py-1"
-              >
-                {switchLoading ? 'Comparing...' : 'Compare'}
-              </button>
-            </div>
-
-            {switchResult && (
-              <div className="space-y-2">
-                <div className="grid grid-cols-3 gap-2">
-                  <div className="rounded-lg bg-parchment-deep p-2 text-center">
-                    <p className="text-[11px] text-ink-muted">Current Value</p>
-                    <p className="font-serif text-[15px] font-semibold tabular-nums">{fmt(switchResult.current_value)}</p>
-                  </div>
-                  <div className="rounded-lg bg-parchment-deep p-2 text-center">
-                    <p className="text-[11px] text-ink-muted">Alternative</p>
-                    <p className="font-serif text-[15px] font-semibold tabular-nums">{fmt(switchResult.alternative_value)}</p>
-                  </div>
-                  <div className="rounded-lg bg-parchment-deep p-2 text-center">
-                    <p className="text-[11px] text-ink-muted">Difference</p>
-                    <p className={`font-serif text-[15px] font-semibold tabular-nums ${switchResult.difference_eur >= 0 ? 'text-sage' : 'text-claret'}`}>
-                      {switchResult.difference_eur >= 0 ? '+' : ''}{fmt(switchResult.difference_eur)}
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center justify-between text-[11px] text-ink-muted">
-                  <span>Correlation: {switchResult.correlation.toFixed(2)}</span>
-                  <span>{switchResult.difference_pct >= 0 ? '+' : ''}{switchResult.difference_pct}%</span>
-                </div>
-                {switchResult.low_correlation_warning && (
-                  <p className="text-[11px] text-amber">Low correlation ({switchResult.correlation.toFixed(2)}) — these products track different markets. Comparison may not be meaningful.</p>
-                )}
-
-                {/* Tax cost of switching */}
-                {switchResult.unrealized_gain !== 0 && (
-                  <div className="mt-2 pt-2 border-t border-divider">
-                    <p className="font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em] mb-1.5">Tax Cost of Switching</p>
-                    <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px]">
-                      <span className="text-ink-muted">Unrealized Gain</span>
-                      <span className={`text-right tabular-nums ${switchResult.unrealized_gain >= 0 ? 'text-sage' : 'text-claret'}`}>{fmt(switchResult.unrealized_gain)}</span>
-                      {switchResult.is_equity && switchResult.teilfreistellung > 0 && (<>
-                        <span className="text-ink-muted">Teilfreistellung (30%)</span>
-                        <span className="text-right tabular-nums text-sage">-{fmt(switchResult.teilfreistellung)}</span>
-                      </>)}
-                      {switchResult.freibetrag_used > 0 && (<>
-                        <span className="text-ink-muted">Freibetrag</span>
-                        <span className="text-right tabular-nums text-sage">-{fmt(switchResult.freibetrag_used)}</span>
-                      </>)}
-                      <span className="text-ink-muted font-medium">Tax on Switch</span>
-                      <span className="text-right tabular-nums text-claret font-medium">{fmt(switchResult.tax_on_switch)}</span>
-                      <span className="text-ink-muted">Net Proceeds</span>
-                      <span className="text-right tabular-nums">{fmt(switchResult.net_proceeds)}</span>
-                    </div>
-                    {switchResult.break_even_years > 0 ? (
-                      <p className="text-[11px] text-ink-muted mt-1.5">Break-even: ~{switchResult.break_even_years} year{switchResult.break_even_years !== 1 ? 's' : ''} for the alternative to recover the tax cost.</p>
-                    ) : switchResult.difference_eur < 0 && switchResult.tax_on_switch > 0 ? (
-                      <p className="text-[11px] text-claret mt-1.5">No break-even — the alternative historically underperforms, so the tax cost would never be recovered.</p>
-                    ) : null}
-                  </div>
-                )}
-
-                {/* Gradual Switch Strategy */}
-                <div className="mt-2 pt-2 border-t border-divider">
-                  <p className="font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em] mb-1.5">Switch Strategy</p>
-                  {switchResult.difference_eur < 0 && switchResult.unrealized_gain >= 0 ? (
-                    <p className="text-[11px] text-ink-muted">No switch recommended — the alternative has historically underperformed by {fmt(Math.abs(switchResult.difference_eur))}.</p>
-                  ) : <div className="space-y-1.5">
-                    {/* Option 1: Redirect contributions */}
-                    <div className="flex items-start gap-2 text-[11px]">
-                      <span className="w-4 h-4 rounded-full bg-parchment-deep border border-sage text-sage flex items-center justify-center shrink-0 mt-0.5 text-[10px] font-semibold">1</span>
-                      <div>
-                        <p className="text-ink font-medium">Redirect future contributions</p>
-                        <p className="text-ink-muted">Stop buying the current product and invest new money in the alternative. No tax event. Gradual transition over time.</p>
-                      </div>
-                    </div>
-
-                    {/* Option 2: Tax-year splitting */}
-                    {switchResult.tax_on_switch > 1000 && (
-                      <div className="flex items-start gap-2 text-[11px]">
-                        <span className="w-4 h-4 rounded-full bg-parchment-deep border border-amber text-amber flex items-center justify-center shrink-0 mt-0.5 text-[10px] font-semibold">2</span>
-                        <div>
-                          <p className="text-ink font-medium">Split across tax years</p>
-                          <p className="text-ink-muted">Sell {fmt(switchResult.current_value / 2)}/year over 2 years to use the Sparerpauschbetrag twice (saves ~{fmt(Math.min(1000, switchResult.taxable_gain) * 0.26375)}).</p>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Option 3: Loss harvesting */}
-                    {switchResult.unrealized_gain < 0 && (
-                      <div className="flex items-start gap-2 text-[11px]">
-                        <span className="w-4 h-4 rounded-full bg-parchment-deep border border-forest text-forest flex items-center justify-center shrink-0 mt-0.5 text-[10px] font-semibold">3</span>
-                        <div>
-                          <p className="text-ink font-medium">Tax-loss harvesting opportunity</p>
-                          <p className="text-ink-muted">Current holding has {fmt(Math.abs(switchResult.unrealized_gain))} in unrealized losses. Selling now and switching realizes the loss, which offsets future gains (saves ~{fmt(Math.abs(switchResult.unrealized_gain) * 0.26375)} in tax).</p>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Option 3 alt: Full switch when tax is low */}
-                    {switchResult.unrealized_gain >= 0 && switchResult.tax_on_switch <= 1000 && switchResult.tax_on_switch > 0 && (
-                      <div className="flex items-start gap-2 text-[11px]">
-                        <span className="w-4 h-4 rounded-full bg-parchment-deep border border-forest text-forest flex items-center justify-center shrink-0 mt-0.5 text-[10px] font-semibold">2</span>
-                        <div>
-                          <p className="text-ink font-medium">Full switch (low tax cost)</p>
-                          <p className="text-ink-muted">Tax cost of {fmt(switchResult.tax_on_switch)} is modest. A one-time switch may be simpler than a gradual transition.</p>
-                        </div>
-                      </div>
-                    )}
-                  </div>}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Time Machine */}
-      <div className="border-t border-divider pt-6 py-3 md:py-5">
-        <h2 className="font-serif text-heading text-ink mb-2">Time Machine</h2>
-        <p className="text-[13px] text-ink-muted mb-3">Reconstruct your portfolio at any historical date.</p>
-        <div className="flex gap-2 mb-3">
-          <input type="date" value={tmDate} onChange={e => setTmDate(e.target.value)}
-            className="flex-1 rounded-[8px] border border-divider bg-parchment text-ink px-3 py-2 text-[15px]" />
-          <button onClick={async () => {
-            if (!tmDate) return;
-            setTmLoading(true);
-            try {
-              const res = await fetch(`/api/portfolio/time-machine?date=${tmDate}`);
-              setTmData(await res.json());
-            } catch { /* ignore */ } finally { setTmLoading(false); }
-          }} disabled={!tmDate || tmLoading} className="apple-btn-primary shrink-0">
-            {tmLoading ? '...' : 'Go'}
-          </button>
-        </div>
-
-        {tmData && (
-          <div className="space-y-3">
-            {/* Then vs Now comparison */}
-            <div className="grid grid-cols-2 gap-2">
-              <div className="rounded-lg bg-parchment-deep p-2.5 text-center">
-                <p className="text-[11px] text-ink-muted">{tmData.date}</p>
-                <p className="font-serif text-[20px] font-semibold tabular-nums">{fmt(tmData.net_worth)}</p>
-              </div>
-              <div className="rounded-lg bg-parchment-deep p-2.5 text-center">
-                <p className="text-[11px] text-ink-muted">Today</p>
-                <p className="font-serif text-[20px] font-semibold tabular-nums">{fmt(tmData.current.net_worth)}</p>
-              </div>
-            </div>
-
-            {/* Change attribution */}
-            <div className="rounded-xl bg-parchment-deep p-3">
-              <div className="flex items-baseline justify-between mb-2">
-                <span className="text-[15px] font-medium text-ink">Change Since</span>
-                <span className={`text-[15px] font-semibold tabular-nums ${tmData.change.net_worth_change >= 0 ? 'text-sage' : 'text-claret'}`}>
-                  {tmData.change.net_worth_change >= 0 ? '+' : ''}{fmt(tmData.change.net_worth_change)} ({tmData.change.net_worth_pct >= 0 ? '+' : ''}{tmData.change.net_worth_pct}%)
-                </span>
-              </div>
-              <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[12px]">
-                <span className="text-ink-muted">Contributions</span>
-                <span className="tabular-nums text-right">{fmt(tmData.change.contributions)}</span>
-                <span className="text-ink-muted">Market Return</span>
-                <span className={`tabular-nums text-right ${tmData.change.market_return >= 0 ? 'text-sage' : 'text-claret'}`}>{fmt(tmData.change.market_return)}</span>
-                <span className="text-ink-muted">Dividends</span>
-                <span className="tabular-nums text-right">{fmt(tmData.change.dividends)}</span>
-                {Math.abs(tmData.change.assets ?? 0) >= 1 && (<>
-                  <span className="text-ink-muted">Physical assets</span>
-                  <span className={`tabular-nums text-right ${(tmData.change.assets ?? 0) >= 0 ? 'text-sage' : 'text-claret'}`}>{fmt(tmData.change.assets ?? 0)}</span>
-                </>)}
-                {Math.abs(tmData.change.purchase_costs ?? 0) >= 1 && (<>
-                  <span className="text-ink-muted">Purchase costs</span>
-                  <span className="tabular-nums text-right text-claret">{fmt(tmData.change.purchase_costs ?? 0)}</span>
-                </>)}
-                {Math.abs(tmData.change.loan_interest ?? 0) >= 1 && (<>
-                  <span className="text-ink-muted">Loan interest</span>
-                  <span className="tabular-nums text-right text-claret">{fmt(tmData.change.loan_interest ?? 0)}</span>
-                </>)}
-              </div>
-            </div>
-
-            {/* Historical holdings */}
-            {tmData.holdings.length > 0 && (
-              <div className="space-y-1.5">
-                <p className="text-[12px] font-medium text-ink-muted">Holdings on {tmData.date}</p>
-                {tmData.holdings.map((hld, i) => (
-                  <div key={i} className="flex items-center justify-between text-[12px]">
-                    <div className="min-w-0 flex-1">
-                      <span className="font-medium text-ink">{hld.name}</span>
-                      <span className="text-ink-muted ml-1">{hld.weight_pct}%</span>
-                    </div>
-                    <span className="tabular-nums text-ink shrink-0 ml-2">{fmt(hld.value)}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-      </>)}
-
-      {activeTab === 'goals' && (<>
-      {/* Financial Goals */}
-      <div>
-        <h2 className="font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em] mb-3">Financial Goals</h2>
-
-        {goals.length > 0 && (
-          <div className="space-y-2 mb-4">
-            {goals.map(g => (
-              <div key={g.id} className="flex items-center justify-between rounded-xl bg-parchment-deep px-3 py-2.5">
-                <div className="min-w-0 flex-1">
-                  <p className="text-[15px] font-medium text-ink">{g.name}</p>
-                  <p className="text-[12px] text-ink-muted">
-                    {fmt(g.target_amount)}
-                    {' by '}{g.target_date}
-                    {g.monthly_contribution > 0 && ` · ${fmt(g.monthly_contribution)}/mo`}
-                  </p>
-                </div>
-                <button
-                  onClick={() => api.deleteGoal(g.id).then(() => setGoals(prev => prev.filter(x => x.id !== g.id))).catch(console.error)}
-                  className="text-claret text-[12px] font-medium shrink-0 ml-3 hover:underline"
-                >Delete</button>
-              </div>
-            ))}
-          </div>
-        )}
-
-        <div className="space-y-2">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            <input aria-label="Goal name" type="text" placeholder="Goal name (e.g., Retirement)" value={goalName} onChange={e => setGoalName(e.target.value)}
-              className="rounded-[8px] border border-divider bg-parchment text-ink px-3 py-2 text-[16px] placeholder-ink-muted" />
-            <input aria-label="Target amount" type="number" placeholder="Target amount (EUR)" value={goalTarget} onChange={e => setGoalTarget(e.target.value)}
-              className="rounded-[8px] border border-divider bg-parchment text-ink px-3 py-2 text-[16px] placeholder-ink-muted tabular-nums" />
-            <input aria-label="Target date" type="date" value={goalDate} onChange={e => setGoalDate(e.target.value)}
-              className="rounded-[8px] border border-divider bg-parchment text-ink px-3 py-2 text-[16px] text-ink" />
-            <input aria-label="Monthly contribution" type="number" placeholder="Monthly contribution (EUR)" value={goalContrib} onChange={e => setGoalContrib(e.target.value)}
-              className="rounded-[8px] border border-divider bg-parchment text-ink px-3 py-2 text-[16px] placeholder-ink-muted tabular-nums" />
-          </div>
-          <div className="flex items-center gap-2">
-            <label className="text-[12px] text-ink-muted shrink-0">Assumed return:</label>
-            <input type="number" aria-label="Assumed annual return" value={goalReturn} onChange={e => setGoalReturn(e.target.value)} step="0.5"
-              className="w-16 rounded-[8px] border border-divider bg-parchment text-ink px-2 py-2.5 text-[16px] tabular-nums text-right" />
-            <span className="text-[12px] text-ink-muted">%/year</span>
-            <div className="flex-1" />
-            <button
-              onClick={() => {
-                if (!goalName || !goalTarget || !goalDate) return;
-                api.createGoal({ name: goalName, target_amount: parseFloat(goalTarget), target_date: goalDate,
-                  monthly_contribution: parseFloat(goalContrib) || 0, assumed_return_pct: parseFloat(goalReturn) || 7,
-                }).then(() => { setGoalName(''); setGoalTarget(''); setGoalDate(''); setGoalContrib('');
-                  api.listGoals().then(r => setGoals(r.goals || [])).catch(() => {}); }).catch(console.error);
-              }}
-              disabled={!goalName || !goalTarget || !goalDate}
-              className="rounded-[8px] bg-forest text-white dark:text-parchment-deep px-4 py-2.5 text-[16px] font-medium disabled:opacity-40 hover:bg-forest-light transition-colors"
-            >Add Goal</button>
-          </div>
-        </div>
-      </div>
-
-      {/* Price Alerts */}
-      <div>
-        <h2 className="font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em] mb-3">Price Alerts</h2>
-
-        {alerts.length > 0 && (
-          <div className="space-y-2 mb-4">
-            {alerts.map(a => (
-              <div key={a.id} className={`flex items-center justify-between rounded-xl px-3 py-2.5 ${a.is_active ? 'bg-parchment-deep' : 'bg-parchment-deep opacity-60'}`}>
-                <div className="min-w-0 flex-1">
-                  <p className="text-[15px] font-medium text-ink">
-                    {a.alert_type === 'portfolio_milestone' ? 'Net Worth' : (a.security_name || a.security_isin || '—')}
-                    {' '}
-                    <span className="text-[12px] text-ink-muted">
-                      {a.alert_type === 'price_above' ? '≥' : a.alert_type === 'price_below' ? '≤' : a.alert_type === 'portfolio_milestone' ? 'crosses' : 'Δ'}
-                      {' '}{fmt(a.threshold)}
-                    </span>
-                  </p>
-                </div>
-                <div className="flex items-center gap-2 shrink-0 ml-2">
-                  <button onClick={() => api.toggleAlert(a.id).then(() => api.listAlerts().then(r => setAlerts(r.alerts || []))).catch(console.error)}
-                    className={`text-[12px] font-medium ${a.is_active ? 'text-amber' : 'text-sage'}`}>
-                    {a.is_active ? 'Pause' : 'Resume'}
-                  </button>
-                  <button onClick={() => api.deleteAlert(a.id).then(() => setAlerts(prev => prev.filter(x => x.id !== a.id))).catch(console.error)}
-                    className="text-claret text-[12px] font-medium">Delete</button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        <div className="space-y-2">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-            <select aria-label="Alert type" value={alertType} onChange={e => setAlertType(e.target.value)}
-              className="rounded-[8px] border border-divider bg-parchment text-ink px-3 py-2 text-[16px]">
-              <option value="price_above">Price above</option>
-              <option value="price_below">Price below</option>
-              <option value="portfolio_milestone">Net worth milestone</option>
-            </select>
-            {alertType !== 'portfolio_milestone' && (
-              <select aria-label="Security" value={alertISIN} onChange={e => setAlertISIN(e.target.value)}
-                className="rounded-[8px] border border-divider bg-parchment text-ink px-3 py-2 text-[16px]">
-                <option value="">Select security...</option>
-                {securities.map(s => <option key={s.isin} value={s.isin}>{s.name}</option>)}
-              </select>
-            )}
-            <div className="flex gap-2">
-              <input aria-label="Alert threshold" type="number" placeholder="Threshold (EUR)" value={alertThreshold} onChange={e => setAlertThreshold(e.target.value)}
-                className="flex-1 rounded-[8px] border border-divider bg-parchment text-ink px-3 py-2 text-[16px] tabular-nums" />
-              <button
-                onClick={() => {
-                  if (!alertThreshold) return;
-                  api.createAlert({
-                    alert_type: alertType,
-                    security_isin: alertType !== 'portfolio_milestone' ? alertISIN : undefined,
-                    threshold: parseFloat(alertThreshold),
-                  }).then(() => {
-                    setAlertThreshold('');
-                    api.listAlerts().then(r => setAlerts(r.alerts || [])).catch(() => {});
-                  }).catch(console.error);
-                }}
-                disabled={!alertThreshold || (alertType !== 'portfolio_milestone' && !alertISIN)}
-                className="rounded-[8px] bg-forest text-white dark:text-parchment-deep px-4 py-2.5 text-[16px] font-medium disabled:opacity-40 hover:bg-forest-light transition-colors"
-              >Add</button>
-            </div>
-          </div>
-        </div>
-
-        {/* Recent Notifications */}
-        {notifications.length > 0 && (
-          <div className="mt-4 pt-4 border-t border-divider">
-            <div className="flex items-center justify-between mb-2">
-              <p className="text-[15px] font-medium text-ink">Recent Notifications</p>
-              <button onClick={() => api.markNotificationsRead().then(() => setNotifications(prev => prev.map(n => ({ ...n, is_read: true })))).catch(console.error)}
-                className="text-[12px] text-forest font-medium">Mark all read</button>
-            </div>
-            <div className="space-y-1.5">
-              {notifications.slice(0, 10).map(n => (
-                <div key={n.id} className={`flex items-start gap-2 rounded-lg px-3 py-2 ${n.is_read ? 'bg-parchment' : 'bg-inset border-l-[3px] border-forest'}`}>
-                  <span className={`w-2 h-2 rounded-full shrink-0 mt-1.5 ${n.is_read ? 'bg-divider' : 'bg-forest'}`} />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[13px] text-ink">{n.message}</p>
-                    <p className="text-[11px] text-ink-muted">{new Date(n.triggered_at).toLocaleDateString('de-DE')}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-      </>)}
+      <TabPanel id={activeTab}>
+        <SectionBoundary key={activeTab}>{panel}</SectionBoundary>
+      </TabPanel>
+      {confirmDialog}
     </div>
   );
 }

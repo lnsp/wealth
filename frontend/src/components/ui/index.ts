@@ -1,6 +1,12 @@
-export { default as TabBar } from './TabBar';
-export { default as MetricCard } from './MetricCard';
+export { default as TabBar, TabPanel, useTabParam } from './TabBar';
+export { default as MetricCard, MetricGrid } from './MetricCard';
+export { default as Section, SubHeading, PageHeader } from './Section';
+export { Field, NumberField, SelectField } from './Field';
 export { default as PeriodSelector } from './PeriodSelector';
 export { periodCutoff, filterByPeriod, formatDateForPeriod } from './PeriodSelector';
 export type { Period } from './PeriodSelector';
-export { LoadingState, ErrorState, EmptyState } from './StateViews';
+export { LoadingState, ErrorState, EmptyState, SectionBoundary } from './StateViews';
+export { ConfirmDialog, useConfirm } from './ConfirmDialog';
+export type { ConfirmOptions } from './ConfirmDialog';
+export { Chip, AddChip, RankedBars, ProgressBar } from './Misc';
+export type { RankedBarItem } from './Misc';

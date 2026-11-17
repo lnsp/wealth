@@ -1,37 +1,45 @@
-import { useEffect, useMemo, useState } from 'react';
-import { api, type CashflowData } from '../api/client';
-import EChartWrapper from '../components/charts/EChartWrapper';
-import { useThemeColors } from '../hooks/useThemeColors';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { api, type CashflowData, type CashflowMonth } from '../api/client';
+import {
+  PageHeader, Section, MetricCard, MetricGrid, RankedBars,
+  LoadingState, ErrorState, EmptyState, SectionBoundary,
+  type RankedBarItem,
+} from '../components/ui';
+import { fmtEUR, fmtNum, fmtPct, fmtMonth, fmtMonthShort, fmtDateTime, labelFor } from '../utils/format';
 
-const CATEGORY_LABEL: Record<string, string> = {
-  salary: 'Salary',
-  interest: 'Interest',
-  refund: 'Refund',
-  housing: 'Housing',
-  utilities: 'Utilities',
-  insurance: 'Insurance',
-  subscriptions: 'Subscriptions',
-  groceries: 'Groceries',
-  dining: 'Dining',
-  transport: 'Transport',
-  health: 'Health',
-  entertainment: 'Entertainment',
-  shopping: 'Shopping',
-  tax: 'Tax',
-  investment: 'Investment',
-  internal: 'Internal Transfer',
-  asset_purchase: 'Asset Purchase',
-  loan_payment: 'Loan Payment',
-  loan_principal: 'Loan Principal',
-  other: 'Other',
-};
-
-const MONTH_LABEL = (ym: string) => {
+/** 'YYYY-MM' → local Date on the 1st, so month labels never shift across time zones. */
+const monthDate = (ym: string) => {
   const [y, m] = ym.split('-');
-  return new Date(Number(y), Number(m) - 1, 1).toLocaleDateString('en-GB', { month: 'short', year: '2-digit' });
+  return new Date(Number(y), Number(m) - 1, 1);
 };
 
-const fmt = (n: number) => new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n);
+const categoryLabel = (c: string) => (c === 'internal' ? 'Internal transfer' : labelFor(c));
+
+const hasActivity = (m: CashflowMonth) => m.income !== 0 || m.fixed !== 0 || m.variable !== 0;
+
+/** Whole-euro figure without the symbol (the table caption names the unit). */
+const plain = (n: number) => fmtNum(Math.round(n));
+const signed = (n: number) => {
+  const r = Math.round(n);
+  return `${r > 0 ? '+' : ''}${fmtNum(r)}`;
+};
+const netTone = (n: number) => (Math.round(n) > 0 ? 'text-sage' : Math.round(n) < 0 ? 'text-claret' : 'text-ink');
+
+// Month, Income, Spend, Net fit a phone; desktop adds a Trend column.
+const GRID = 'grid grid-cols-[86px_1fr_1fr_1fr] md:grid-cols-[130px_1fr_1fr_1fr_140px] items-center';
+
+type RowGroup =
+  | { kind: 'month'; month: CashflowMonth }
+  | { kind: 'gap'; newest: string; oldest: string };
+
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg className="w-3.5 h-3.5 shrink-0 text-ink-muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={open ? 'M6 9l6 6 6-6' : 'M9 6l6 6-6 6'} />
+    </svg>
+  );
+}
 
 export default function Cashflow() {
   const [data, setData] = useState<CashflowData | null>(null);
@@ -39,38 +47,67 @@ export default function Cashflow() {
   const [err, setErr] = useState<string | null>(null);
   const [selectedMonth, setSelectedMonth] = useState<string>('');
   const [appliedAt, setAppliedAt] = useState<number | null>(null);
-  const tc = useThemeColors();
 
-  useEffect(() => {
+  const load = useCallback(() => {
     let cancelled = false;
+    setLoading(true);
+    setErr(null);
     api.getCashflow(12)
       .then(d => {
         if (cancelled) return;
         setData(d);
-        // Default to most recent month *with activity* — empty months would
-        // render an empty donut on first paint.
-        const first = d.months.find(m => m.income + m.fixed + m.variable > 0) || d.months[0];
-        if (first) setSelectedMonth(first.month);
+        // Open the most recent month that has activity.
+        const first = (d.months || []).find(hasActivity);
+        setSelectedMonth(first ? first.month : '');
       })
       .catch(e => { if (!cancelled) setErr(e instanceof Error ? e.message : 'Failed to load cashflow'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, []);
 
-  const donutData = useMemo(() => {
-    if (!data || !selectedMonth) return [];
-    return data.buckets
-      .filter(b => b.month === selectedMonth && (b.bucket === 'fixed' || b.bucket === 'variable'))
-      .map(b => ({ name: CATEGORY_LABEL[b.category] || b.category, value: Math.round(b.amount), bucket: b.bucket }))
-      .sort((a, b) => b.value - a.value);
-  }, [data, selectedMonth]);
+  useEffect(() => load(), [load]);
 
-  const incomeBreakdown = useMemo(() => {
-    if (!data || !selectedMonth) return [];
-    return data.buckets
-      .filter(b => b.month === selectedMonth && b.bucket === 'income')
-      .map(b => ({ name: CATEGORY_LABEL[b.category] || b.category, value: Math.round(b.amount) }))
-      .sort((a, b) => b.value - a.value);
+  const months = useMemo(() => data?.months ?? [], [data]);
+
+  // Collapse runs of months without imported data into one line.
+  const rows = useMemo<RowGroup[]>(() => {
+    const out: RowGroup[] = [];
+    for (const m of months) { // newest first
+      if (hasActivity(m)) {
+        out.push({ kind: 'month', month: m });
+        continue;
+      }
+      const last = out[out.length - 1];
+      if (last && last.kind === 'gap') last.oldest = m.month;
+      else out.push({ kind: 'gap', newest: m.month, oldest: m.month });
+    }
+    return out;
+  }, [months]);
+
+  const breakdown = useMemo(() => {
+    const buckets = (data?.buckets ?? []).filter(b => b.month === selectedMonth);
+    const toItems = (list: typeof buckets): { items: RankedBarItem[]; total: number } => {
+      const merged = new Map<string, number>();
+      for (const b of list) {
+        const label = categoryLabel(b.category);
+        merged.set(label, (merged.get(label) ?? 0) + b.amount);
+      }
+      const positive = [...merged.entries()].filter(([, v]) => Math.round(v) > 0).sort((a, b) => b[1] - a[1]);
+      const total = positive.reduce((s, [, v]) => s + v, 0);
+      return {
+        total,
+        items: positive.map(([label, value]) => ({
+          label,
+          value,
+          display: fmtEUR(value),
+          share: fmtPct(total > 0 ? (value / total) * 100 : 0),
+        })),
+      };
+    };
+    return {
+      spend: toItems(buckets.filter(b => b.bucket === 'fixed' || b.bucket === 'variable')),
+      income: toItems(buckets.filter(b => b.bucket === 'income')),
+    };
   }, [data, selectedMonth]);
 
   const applyToPlanning = () => {
@@ -84,216 +121,185 @@ export default function Cashflow() {
 
   if (loading) {
     return (
-      <div className="px-1 md:px-0 py-6 md:py-8">
-        <h1 className="font-serif text-title text-ink mb-3">Cashflow</h1>
-        <div className="text-[13px] text-ink-muted">Loading…</div>
+      <div>
+        <PageHeader title="Cashflow" />
+        <LoadingState message="Loading cashflow" lines={6} />
       </div>
     );
   }
 
   if (err) {
     return (
-      <div className="px-1 md:px-0 py-6 md:py-8">
-        <h1 className="font-serif text-title text-ink mb-3">Cashflow</h1>
-        <div className="rounded-[8px] border border-claret bg-parchment-deep p-4 text-[13px] text-claret">
-          Failed to load: {err}
-        </div>
+      <div className="space-y-4">
+        <PageHeader title="Cashflow" />
+        <ErrorState message="Cashflow couldn’t be loaded." details={err} onRetry={load} />
       </div>
     );
   }
 
-  if (!data || data.months.every(m => m.income === 0 && m.fixed === 0 && m.variable === 0)) {
+  if (!data || !months.some(hasActivity)) {
     return (
-      <div className="px-1 md:px-0 py-6 md:py-8">
-        <h1 className="font-serif text-title text-ink mb-3">Cashflow</h1>
-        <div className="rounded-[8px] border border-divider bg-parchment-deep p-6 text-[13px] text-ink-muted">
-          <p className="mb-2 text-ink">No cashflow data yet.</p>
-          <p>Import checking/savings transactions on the Transactions page. The classifier needs ~3 months of activity for a useful 12-month roll-up.</p>
-        </div>
+      <div className="space-y-4">
+        <PageHeader title="Cashflow" />
+        <EmptyState
+          title="No cashflow data yet"
+          message="Import current-account or savings transactions. About three months of activity are needed for a useful 12-month summary."
+          action={{ label: 'Import transactions', href: '/transactions' }}
+        />
       </div>
     );
   }
 
-  // The 12-month series is newest-first; reverse for the trend sparkline so
-  // time flows left-to-right (oldest on the left).
-  const chronological = [...data.months].reverse();
-  const surplusSeries = chronological.map(m => Math.round(m.net));
-  const maxSurplus = Math.max(0, ...surplusSeries);
-  const minSurplus = Math.min(0, ...surplusSeries);
+  const med = data.medians;
+  // The server takes its medians over the months that have income.
+  const medianMonths = months.filter(m => m.income > 0).length;
+  const savingsRate = med.monthly_income > 0 ? (med.monthly_surplus / med.monthly_income) * 100 : null;
+  const surplus = Math.round(med.monthly_surplus);
+
+  // Trend bar (desktop only): each month's net within the range of the window.
+  const nets = months.filter(hasActivity).map(m => m.net);
+  const maxNet = Math.max(0, ...nets);
+  const minNet = Math.min(0, ...nets);
 
   return (
-    <div className="px-1 md:px-0 py-6 md:py-8 space-y-6">
-      <h1 className="font-serif text-title text-ink">Cashflow</h1>
+    <div>
+      <PageHeader title="Cashflow" />
 
-      {/* KPI ribbon */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-        <div className="rounded-xl bg-parchment-deep p-3">
-          <p className="text-[11px] text-ink-muted mb-1">Median monthly income</p>
-          <p className="font-serif text-[18px] font-semibold tabular-nums text-sage">{fmt(data.medians.monthly_income)}</p>
-        </div>
-        <div className="rounded-xl bg-parchment-deep p-3">
-          <p className="text-[11px] text-ink-muted mb-1">Median monthly spend</p>
-          <p className="font-serif text-[18px] font-semibold tabular-nums text-claret">{fmt(data.medians.monthly_spend)}</p>
-        </div>
-        <div className="rounded-xl bg-parchment-deep p-3">
-          <p className="text-[11px] text-ink-muted mb-1">Median surplus</p>
-          <p className={`font-serif text-[18px] font-semibold tabular-nums ${data.medians.monthly_surplus >= 0 ? 'text-forest' : 'text-claret'}`}>
-            {fmt(data.medians.monthly_surplus)}
-          </p>
-        </div>
-        <div className="rounded-xl bg-parchment-deep p-3">
-          <p className="text-[11px] text-ink-muted mb-1">Annual gross income</p>
-          <p className="font-serif text-[18px] font-semibold tabular-nums text-ink">{fmt(data.medians.annual_gross_income)}</p>
-        </div>
-      </div>
+      <MetricGrid className="mt-2 md:mt-6">
+        <MetricCard label="Typical income" value={fmtEUR(med.monthly_income)} />
+        <MetricCard label="Typical spend" value={fmtEUR(med.monthly_spend)} />
+        <MetricCard
+          label="Typical net"
+          value={fmtEUR(surplus, { sign: true })}
+          tone={surplus > 0 ? 'positive' : surplus < 0 ? 'negative' : 'neutral'}
+        />
+        <MetricCard
+          label="Savings rate"
+          value={savingsRate === null ? '—' : fmtPct(savingsRate)}
+          tone={savingsRate !== null && savingsRate < 0 ? 'negative' : 'neutral'}
+          money={false}
+        />
+      </MetricGrid>
+      <p className="mt-3 text-[13px] text-ink-muted max-w-2xl">
+        Monthly medians over the {medianMonths} {medianMonths === 1 ? 'month' : 'months'} with imported income in the
+        past {months.length}. Typical net is typical income minus typical spend, and the savings rate is typical net
+        as a share of typical income.
+      </p>
 
-      {/* Apply-to-Planning CTA — single biggest reason for this whole feature
-          to exist: calibrate Planning inputs from real data instead of typed
-          guesses. */}
-      <div className="rounded-xl bg-inset border-l-[3px] border-amber p-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-        <div className="text-[13px] text-ink">
-          <p className="font-medium text-ink mb-0.5">Calibrate Planning inputs</p>
-          <p className="text-ink-muted">
-            Apply these medians to <span className="text-ink">monthly invest budget</span>,{' '}
-            <span className="text-ink">FIRE expenses</span> (× 12), and{' '}
-            <span className="text-ink">gross annual income</span> on the Planning page.
-          </p>
-        </div>
-        <div className="flex items-center gap-3 shrink-0">
-          {appliedAt && (
-            <span className="text-[11px] text-sage">Applied {new Date(appliedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-          )}
-          <button
-            onClick={applyToPlanning}
-            className="rounded-[6px] bg-forest text-parchment px-4 py-2 text-[13px] font-medium hover:bg-forest-light transition-colors"
-          >
-            Apply to Planning
-          </button>
-        </div>
-      </div>
-
-      {/* Monthly table */}
-      <div className="border-t border-divider pt-6 py-3 md:py-5">
-        <h2 className="font-serif text-heading text-ink mb-1 px-1 md:px-0">Monthly Cashflow</h2>
-        <p className="text-[13px] text-ink-muted mb-3 md:mb-4 px-1 md:px-0">
-          Trailing 12 months. Click a row to break down its categories.
-        </p>
-        <div className="overflow-x-auto px-1 md:px-0">
-          <table className="w-full text-[12px] min-w-[560px]">
-            <thead>
-              <tr className="font-serif text-[11px] text-ink-muted uppercase tracking-[0.1em] border-b border-divider">
-                <th className="text-left py-2 font-medium">Month</th>
-                <th className="text-right py-2 font-medium">Income</th>
-                <th className="text-right py-2 font-medium">Fixed</th>
-                <th className="text-right py-2 font-medium">Variable</th>
-                <th className="text-right py-2 font-medium">Net</th>
-                <th className="text-right py-2 font-medium pl-3">Trend</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.months.map((m, i) => {
-                const isSelected = m.month === selectedMonth;
-                const ratio = (maxSurplus - minSurplus) > 0
-                  ? (m.net - minSurplus) / (maxSurplus - minSurplus)
-                  : 0.5;
+      <SectionBoundary>
+        <Section title="Monthly Cashflow" subtitle="Select a month to open its spending. Amounts in EUR.">
+          <div className="relative rounded-apple border border-divider overflow-hidden">
+            <div className={`${GRID} bg-inset border-b border-divider py-2 pl-1.5 pr-2.5 text-right`} aria-hidden="true">
+              <span className="label-caps text-left pl-[18px]">Month</span>
+              <span className="label-caps">Income</span>
+              <span className="label-caps">Spend</span>
+              <span className="label-caps">Net</span>
+              <span className="label-caps hidden md:block">Trend</span>
+            </div>
+            {rows.map((row, idx) => {
+              const lastRow = idx === rows.length - 1;
+              if (row.kind === 'gap') {
+                const range = row.newest === row.oldest
+                  ? fmtMonthShort(monthDate(row.newest))
+                  : `${fmtMonthShort(monthDate(row.oldest))} to ${fmtMonthShort(monthDate(row.newest))}`;
                 return (
-                  <tr
-                    key={m.month}
-                    onClick={() => setSelectedMonth(m.month)}
-                    className={`border-b border-divider cursor-pointer transition-colors ${isSelected ? 'bg-parchment-deep' : 'hover:bg-parchment-deep'}`}
+                  <div
+                    key={`gap-${row.newest}`}
+                    className={`flex items-center justify-between gap-3 min-h-[44px] pl-3 pr-1 text-[13px] text-ink-muted ${lastRow ? '' : 'border-b border-divider'}`}
                   >
-                    <td className="py-1.5 text-ink">{MONTH_LABEL(m.month)}{isSelected && <span className="text-forest text-[10px] ml-1">●</span>}</td>
-                    <td className="py-1.5 text-right tabular-nums text-sage">{m.income > 0 ? fmt(m.income) : '—'}</td>
-                    <td className="py-1.5 text-right tabular-nums">{m.fixed > 0 ? fmt(m.fixed) : '—'}</td>
-                    <td className="py-1.5 text-right tabular-nums">{m.variable > 0 ? fmt(m.variable) : '—'}</td>
-                    <td className={`py-1.5 text-right tabular-nums font-medium ${m.net > 0 ? 'text-forest' : m.net < 0 ? 'text-claret' : 'text-ink-muted'}`}>
-                      {m.income + m.fixed + m.variable > 0 ? fmt(m.net) : '—'}
-                    </td>
-                    <td className="py-1.5 pl-3">
-                      <div className="h-1.5 w-16 rounded-full bg-parchment-deep relative ml-auto">
-                        <div
-                          className="absolute inset-y-0 left-0 rounded-full bg-forest"
-                          style={{ width: `${Math.max(2, ratio * 100)}%`, opacity: m.income + m.fixed + m.variable > 0 ? 1 : 0.2 }}
-                          aria-hidden
-                        />
-                      </div>
-                      <span className="sr-only">{i + 1} months ago net: {m.net}</span>
-                    </td>
-                  </tr>
+                    <span>{range}: nothing imported</span>
+                    <Link to="/transactions" className="inline-flex items-center min-h-[44px] px-2 font-medium text-forest underline">
+                      Import
+                    </Link>
+                  </div>
                 );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Donut for selected month */}
-      <div className="border-t border-divider pt-6 py-3 md:py-5">
-        <div className="flex items-baseline justify-between mb-3 md:mb-4 px-1 md:px-0">
-          <h2 className="font-serif text-heading text-ink">Spend Breakdown</h2>
-          <span className="text-[12px] text-ink-muted">{MONTH_LABEL(selectedMonth)}</span>
-        </div>
-        {donutData.length === 0 ? (
-          <p className="text-[13px] text-ink-muted px-1 md:px-0">No spend in {MONTH_LABEL(selectedMonth)}.</p>
-        ) : (
-          <EChartWrapper
-            option={{
-              tooltip: {
-                trigger: 'item' as const,
-                formatter: (params: unknown) => {
-                  const p = params as { name: string; value: number; percent: number };
-                  return `${p.name}<br/>${fmt(p.value)} (${p.percent.toFixed(1)}%)`;
-                },
-              },
-              legend: { type: 'scroll' as const, bottom: 0, textStyle: { color: tc.inkBody, fontSize: 11 } },
-              series: [{
-                type: 'pie' as const,
-                radius: ['40%', '70%'],
-                avoidLabelOverlap: true,
-                minAngle: 2,
-                data: donutData.map(d => ({
-                  name: d.name,
-                  value: d.value,
-                  itemStyle: { color: d.bucket === 'fixed' ? tc.walnut : tc.amber },
-                })),
-                label: {
-                  fontSize: 11, color: tc.inkBody, formatter: (p: unknown) => {
-                    const e = p as { name: string; percent: number };
-                    return e.percent >= 5 ? `${e.name} ${e.percent.toFixed(0)}%` : '';
-                  },
-                },
-                labelLine: { length: 10, length2: 6 },
-                itemStyle: { borderColor: tc.parchmentDeep, borderWidth: 2 },
-              }],
-              graphic: [{
-                type: 'text', left: 'center', top: 'center',
-                style: {
-                  text: fmt(donutData.reduce((s, d) => s + d.value, 0)),
-                  fontSize: 16, fontWeight: 600, fill: tc.ink,
-                },
-              }],
-            }}
-            height="280px"
-          />
-        )}
-      </div>
-
-      {incomeBreakdown.length > 0 && (
-        <div className="border-t border-divider pt-6 py-3 md:py-5">
-          <div className="flex items-baseline justify-between mb-3 px-1 md:px-0">
-            <h2 className="font-serif text-heading text-ink">Income Sources</h2>
-            <span className="text-[12px] text-ink-muted">{MONTH_LABEL(selectedMonth)}</span>
+              }
+              const m = row.month;
+              const open = m.month === selectedMonth;
+              const spend = m.fixed + m.variable;
+              const panelId = `cashflow-${m.month}`;
+              const ratio = maxNet - minNet > 0 ? (m.net - minNet) / (maxNet - minNet) : 0.5;
+              return (
+                <Fragment key={m.month}>
+                  <button
+                    type="button"
+                    aria-expanded={open}
+                    aria-controls={panelId}
+                    onClick={() => setSelectedMonth(open ? '' : m.month)}
+                    className={`${GRID} relative w-full min-h-[44px] pl-1.5 pr-2.5 text-right text-[14px] transition-colors hover:bg-inset ${
+                      open ? 'bg-inset text-ink font-semibold' : 'text-ink-body'
+                    } ${lastRow && !open ? '' : 'border-b border-divider'}`}
+                  >
+                    <span className="inline-flex items-center gap-1 text-left whitespace-nowrap">
+                      <Chevron open={open} />
+                      <span>
+                        {fmtMonthShort(monthDate(m.month))}
+                        <span className="sr-only">, income</span>
+                      </span>
+                    </span>
+                    <span data-privacy="blur">{plain(m.income)}<span className="sr-only"> €, spend</span></span>
+                    <span data-privacy="blur">{plain(spend)}<span className="sr-only"> €, net</span></span>
+                    <span data-privacy="blur" className={netTone(m.net)}>{signed(m.net)}<span className="sr-only"> €</span></span>
+                    <span className="hidden md:block pl-6" aria-hidden="true">
+                      <span className="block h-2 rounded-[2px] bg-divider overflow-hidden">
+                        <span className="block h-full bg-forest" style={{ width: `${Math.max(2, Math.min(100, ratio * 100))}%` }} />
+                      </span>
+                    </span>
+                  </button>
+                  {open && (
+                    <div
+                      id={panelId}
+                      role="region"
+                      aria-label={`Breakdown for ${fmtMonth(monthDate(m.month))}`}
+                      className={`bg-inset px-3 pt-3.5 pb-4 grid gap-x-10 gap-y-5 md:grid-cols-2 ${lastRow ? '' : 'border-b border-divider'}`}
+                    >
+                      <div className="flex flex-col gap-3 min-w-0">
+                        <h3 className="label-caps">
+                          Spending in {fmtMonth(monthDate(m.month))} · <span data-privacy="blur">{fmtEUR(breakdown.spend.total)}</span>
+                        </h3>
+                        {breakdown.spend.items.length > 0
+                          ? <RankedBars items={breakdown.spend.items} />
+                          : <p className="text-[13px] text-ink-body">No spending recorded in this month.</p>}
+                      </div>
+                      <div className="flex flex-col gap-3 min-w-0">
+                        <h3 className="label-caps">
+                          Income in {fmtMonth(monthDate(m.month))} · <span data-privacy="blur">{fmtEUR(breakdown.income.total)}</span>
+                        </h3>
+                        {breakdown.income.items.length > 0
+                          ? <RankedBars items={breakdown.income.items} />
+                          : <p className="text-[13px] text-ink-body">No income recorded in this month.</p>}
+                      </div>
+                    </div>
+                  )}
+                </Fragment>
+              );
+            })}
           </div>
-          <div className="space-y-1 px-1 md:px-0">
-            {incomeBreakdown.map((src, i) => (
-              <div key={i} className="flex items-center justify-between rounded-lg bg-parchment-deep px-3 py-2">
-                <span className="text-[13px] text-ink">{src.name}</span>
-                <span className="text-[13px] tabular-nums font-medium text-sage">{fmt(src.value)}</span>
-              </div>
-            ))}
+        </Section>
+      </SectionBoundary>
+
+      <SectionBoundary>
+        <Section
+          title="Calibrate Planning"
+          subtitle="Use these figures as the starting inputs on the Planning page instead of typed estimates."
+        >
+          <div className="rounded-apple border border-divider px-4 py-4 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <ul className="text-[14px] text-ink-body space-y-1">
+              <li>Monthly invest budget: <span className="text-ink" data-privacy="blur">{fmtEUR(Math.max(0, med.monthly_surplus))}</span> (typical net)</li>
+              <li>FIRE expenses: <span className="text-ink" data-privacy="blur">{fmtEUR(med.monthly_spend * 12)}</span> per year (typical spend × 12)</li>
+              <li>Annual income: <span className="text-ink" data-privacy="blur">{fmtEUR(med.annual_gross_income)}</span> (income received in the past {months.length} months)</li>
+            </ul>
+            <div className="flex flex-wrap items-center gap-3 shrink-0">
+              <span role="status" className="text-[13px] text-ink-muted">
+                {appliedAt ? `Applied ${fmtDateTime(appliedAt)}` : ''}
+              </span>
+              <button type="button" onClick={applyToPlanning} className="apple-btn-secondary min-h-[44px]">
+                Apply to Planning
+              </button>
+            </div>
           </div>
-        </div>
-      )}
+        </Section>
+      </SectionBoundary>
     </div>
   );
 }

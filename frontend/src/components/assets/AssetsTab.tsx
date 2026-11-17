@@ -5,12 +5,17 @@ import AssetsOverview from './AssetsOverview';
 import AssetDetail from './AssetDetail';
 import AssetForm from './AssetForm';
 import LoanDetail from './LoanDetail';
+import { LoadingState, ErrorState } from '../ui';
 
 // Query parameters that select a view inside the Assets tab, so the browser's
 // back button and reloads work: ?asset=<id>, ?loan=<id>, ?add=1, ?edit=<id>.
 export const ASSET_VIEW_PARAMS = ['asset', 'loan', 'add', 'edit'] as const;
 
-export default function AssetsTab({ onNetWorthChanged }: { onNetWorthChanged?: () => void }) {
+export default function AssetsTab({ onNetWorthChanged, snapshotNetWorth }: {
+  onNetWorthChanged?: () => void;
+  /** Net worth shown in the page hero (latest snapshot). */
+  snapshotNetWorth?: number;
+}) {
   const [params, setParams] = useSearchParams();
   const [data, setData] = useState<Overview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -37,14 +42,9 @@ export default function AssetsTab({ onNetWorthChanged }: { onNetWorthChanged?: (
   };
 
   if (error && !data) {
-    return (
-      <div role="alert" className="flex items-center justify-between gap-3 border-t border-divider pt-6">
-        <p className="text-[13px] text-claret">{error}</p>
-        <button type="button" onClick={load} className="text-forest text-[13px] font-medium">Retry</button>
-      </div>
-    );
+    return <div className="mt-6"><ErrorState message="Your assets couldn’t be loaded." details={error} onRetry={load} /></div>;
   }
-  if (!data) return <p role="status" className="text-[13px] text-ink-muted py-6">Loading assets…</p>;
+  if (!data) return <LoadingState message="Loading assets" />;
 
   const assetId = params.get('asset');
   const loanId = params.get('loan');
@@ -91,6 +91,7 @@ export default function AssetsTab({ onNetWorthChanged }: { onNetWorthChanged?: (
   return (
     <AssetsOverview
       data={data}
+      snapshotNetWorth={snapshotNetWorth}
       onOpenAsset={id => go({ asset: id })}
       onOpenLoan={id => go({ loan: id })}
       onAdd={() => go({ add: '1' })}

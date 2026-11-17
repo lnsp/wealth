@@ -1,69 +1,109 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 
 test.describe('Settings page', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/');
     await page.getByRole('link', { name: 'Settings', exact: true }).click();
     await page.waitForURL('**/settings');
-    // Wait for settings page to load — shows Accounts heading
-    await page.waitForSelector('text=Accounts');
+    // Wait for settings page to load — the section tabs are always rendered
+    await expect(page.getByRole('tablist', { name: 'Settings sections' })).toBeVisible();
   });
 
+  /** Settings is split into tabs; each keeps its state in the URL (?tab=…). */
+  async function openTab(page: Page, name: 'Data' | 'Accounts' | 'Security' | 'Notifications') {
+    const tab = page.getByRole('tab', { name, exact: true });
+    await tab.click();
+    await expect(tab).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tabpanel', { name })).toBeVisible();
+  }
+
   test('loads the settings page', async ({ page }) => {
-    await expect(page.getByRole('heading', { name: 'Accounts' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Settings', level: 1 })).toBeVisible();
+    // Four tabs, Data first and selected by default
+    await expect(page.getByRole('tab')).toHaveText(['Data', 'Accounts', 'Security', 'Notifications']);
+    await expect(page.getByRole('tab', { name: 'Data' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('heading', { name: 'Scheduled Jobs' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Data Export' })).toBeVisible();
+
+    // Accounts and Securities live on the Accounts tab
+    await openTab(page, 'Accounts');
+    await expect(page.getByRole('heading', { name: 'Accounts', exact: true })).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Securities' })).toBeVisible();
   });
 
-  test('scheduler status shows all 8 jobs', async ({ request }) => {
+  test('tab choice is kept in the URL and survives a reload', async ({ page }) => {
+    await openTab(page, 'Accounts');
+    await expect(page).toHaveURL(/\/settings\?tab=accounts$/);
+    await page.reload();
+    await expect(page.getByRole('tab', { name: 'Accounts' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('heading', { name: 'Securities' })).toBeVisible();
+    // Deep links open the right tab directly
+    await page.goto('/settings?tab=notifications');
+    await expect(page.getByRole('tab', { name: 'Notifications' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  test('scheduler status shows all 9 jobs', async ({ page, request }) => {
     const resp = await request.get('/api/settings/scheduler-status');
     expect(resp.ok()).toBeTruthy();
     const body = await resp.json();
-    expect(body.jobs.length).toBe(8);
+    // 9 since the House Price Index job was added with property valuation
+    const expected = [
+      'Price Update', 'Live Prices', 'FX Rates', 'ETF Metadata', 'Net Worth Snapshot',
+      'Database Backup', 'Price Alerts', 'Wealth Reports', 'House Price Index',
+    ];
+    expect(body.jobs.length).toBe(expected.length);
     const names = body.jobs.map((j: { name: string }) => j.name);
-    expect(names).toContain('Price Update');
-    expect(names).toContain('Live Prices');
-    expect(names).toContain('FX Rates');
-    expect(names).toContain('ETF Metadata');
-    expect(names).toContain('Net Worth Snapshot');
-    expect(names).toContain('Database Backup');
-    expect(names).toContain('Price Alerts');
-    expect(names).toContain('Wealth Reports');
+    for (const name of expected) expect(names).toContain(name);
+
+    // The Data tab lists every job
+    const jobs = page.getByRole('tabpanel', { name: 'Data' }).getByRole('list').first();
+    for (const name of expected) {
+      await expect(jobs.getByText(name, { exact: true })).toBeVisible();
+    }
   });
 
   test('displays account with active status toggle button', async ({ page }) => {
-    // Find any account toggle button (Active or Inactive) — data-independent
-    const activeBtns = page.getByRole('button', { name: /Activate|Deactivate/ });
-    const count = await activeBtns.count();
-    if (count === 0) return; // no accounts in DB, skip
-    const firstBtn = activeBtns.first();
-    await expect(firstBtn).toBeVisible();
-    const text = await firstBtn.textContent();
-    expect(text === 'Active' || text === 'Inactive').toBeTruthy();
+    await openTab(page, 'Accounts');
+    // Every account row has an Activate/Deactivate button named after the account
+    const toggleBtns = page.getByRole('button', { name: /^(Activate|Deactivate) / });
+    await expect(toggleBtns.first()).toBeVisible();
+    const firstBtn = toggleBtns.first();
+    const label = (await firstBtn.textContent())?.trim();
+    expect(label === 'Deactivate' || label === 'Activate').toBeTruthy();
+    // The row's status chip agrees with the action on offer
+    const accountName = (await firstBtn.getAttribute('aria-label') ?? '').replace(/^(Activate|Deactivate)\s+/, '');
+    const row = page.getByRole('listitem').filter({
+      has: page.getByRole('button', { name: `Edit ${accountName}`, exact: true }),
+    });
+    await expect(row.getByText(label === 'Deactivate' ? 'Active' : 'Inactive', { exact: true })).toBeVisible();
   });
 
   test('can deactivate and reactivate an account', async ({ page }) => {
-    // Find any active account's Deactivate button — data-independent
+    await openTab(page, 'Accounts');
     const deactivateBtns = page.getByRole('button', { name: /^Deactivate / });
-    const count = await deactivateBtns.count();
-    if (count === 0) return; // no active accounts, skip
+    await expect(deactivateBtns.first()).toBeVisible();
 
     const activeBtn = deactivateBtns.first();
-    const ariaLabel = await activeBtn.getAttribute('aria-label') ?? await activeBtn.textContent() ?? '';
-    // Extract account name from the aria-label/text (e.g. "Deactivate Foo" -> "Foo")
+    const ariaLabel = await activeBtn.getAttribute('aria-label') ?? '';
+    // Extract account name from the aria-label (e.g. "Deactivate Foo" -> "Foo")
     const accountName = ariaLabel.replace(/^Deactivate\s+/, '');
-    await expect(activeBtn).toBeVisible();
-    await expect(activeBtn).toHaveText('Active');
+    expect(accountName).not.toBe('');
+    const row = page.getByRole('listitem').filter({
+      has: page.getByRole('button', { name: `Edit ${accountName}`, exact: true }),
+    });
+    await expect(row.getByText('Active', { exact: true })).toBeVisible();
 
     // Deactivate
     await activeBtn.click();
-    const inactiveBtn = page.getByRole('button', { name: `Activate ${accountName}` });
+    const inactiveBtn = page.getByRole('button', { name: `Activate ${accountName}`, exact: true });
     await expect(inactiveBtn).toBeVisible();
-    await expect(inactiveBtn).toHaveText('Inactive');
+    await expect(inactiveBtn).toHaveText('Activate');
+    await expect(row.getByText('Inactive', { exact: true })).toBeVisible();
 
     // Reactivate
     await inactiveBtn.click();
-    await expect(page.getByRole('button', { name: `Deactivate ${accountName}` })).toBeVisible();
-    await expect(page.getByRole('button', { name: `Deactivate ${accountName}` })).toHaveText('Active');
+    await expect(page.getByRole('button', { name: `Deactivate ${accountName}`, exact: true })).toBeVisible();
+    await expect(row.getByText('Active', { exact: true })).toBeVisible();
   });
 
   test('settings accounts API returns all accounts including inactive', async ({ request }) => {
@@ -84,18 +124,10 @@ test.describe('Settings page', () => {
   });
 
   test('displays TER for ETFs in securities list', async ({ page }) => {
-    // Securities section is inside a collapsed details — expand it
-    const secSection = page.getByText('Bank Accounts & Securities');
-    if (await secSection.count() > 0) {
-      await secSection.scrollIntoViewIfNeeded();
-      await secSection.click();
-    }
-    // At least one ETF should show a TER percentage if metadata has been fetched
-    const terTexts = page.getByText(/TER \d+\.\d+%/);
-    const count = await terTexts.count();
-    if (count > 0) {
-      await expect(terTexts.first()).toBeVisible();
-    }
+    await openTab(page, 'Accounts');
+    await expect(page.getByRole('heading', { name: 'Securities' })).toBeVisible();
+    // At least one ETF shows its TER (the securities API test below requires one to exist)
+    await expect(page.getByText(/TER \d+[.,]\d+\s*%/).first()).toBeVisible();
   });
 
   test('securities API returns wkn and ter fields', async ({ request }) => {
@@ -194,9 +226,15 @@ test.describe('Settings page', () => {
   test('financial goals moved to Portfolio > Goals & Alerts tab', async ({ page }) => {
     await page.goto('/portfolio');
     await page.getByRole('tab', { name: 'Goals & Alerts' }).click();
+    await expect(page).toHaveURL(/\/portfolio\?tab=goals/);
     await expect(page.getByRole('heading', { name: 'Financial Goals' })).toBeVisible();
-    await expect(page.getByPlaceholder('Goal name')).toBeVisible();
-    await expect(page.getByText('Add Goal')).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Goal name' })).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Target amount' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Add goal' })).toBeVisible();
+    // Goals are no longer on the Settings page
+    await page.goto('/settings');
+    await expect(page.getByRole('tablist', { name: 'Settings sections' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Financial Goals' })).toHaveCount(0);
   });
 
   test('alerts API CRUD works', async ({ request }) => {
@@ -243,10 +281,13 @@ test.describe('Settings page', () => {
   });
 
   test('price alerts moved to Portfolio > Goals & Alerts tab', async ({ page }) => {
-    await page.goto('/portfolio');
-    await page.getByRole('tab', { name: 'Goals & Alerts' }).click();
+    await page.goto('/portfolio?tab=goals');
+    await expect(page.getByRole('tab', { name: 'Goals & Alerts' })).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByRole('heading', { name: 'Price Alerts' })).toBeVisible();
-    await expect(page.getByPlaceholder('Threshold')).toBeVisible();
+    await expect(page.getByRole('combobox', { name: 'Alert when' })).toBeVisible();
+    // The threshold field is labelled "Price level" for price alerts
+    await expect(page.getByRole('textbox', { name: 'Price level' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Add alert' })).toBeVisible();
   });
 
   test('holdings template endpoint returns CSV', async ({ request }) => {
@@ -283,12 +324,15 @@ test.describe('Settings page', () => {
   });
 
   test('displays users section', async ({ page }) => {
-    // Expand the "Users & Security" collapsible section
-    const summary = page.getByText('Users & Security');
-    await summary.scrollIntoViewIfNeeded();
-    await summary.click();
+    await openTab(page, 'Security');
+    await expect(page).toHaveURL(/\/settings\?tab=security/);
     await expect(page.getByRole('heading', { name: 'Users', exact: true })).toBeVisible();
-    await expect(page.getByPlaceholder('Username')).toBeVisible();
+    // The add-user form opens from the "Add user" button
+    await page.getByRole('button', { name: 'Add user' }).first().click();
+    await expect(page.getByRole('heading', { name: 'Add User' })).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Username' })).toBeVisible();
+    await expect(page.getByLabel('Password')).toBeVisible();
+    await expect(page.getByRole('combobox', { name: 'Role' })).toBeVisible();
   });
 
   test('can create and delete extended account types', async ({ request }) => {
@@ -359,35 +403,58 @@ test.describe('Settings page', () => {
   });
 
   test('displays wealth reports section', async ({ page }) => {
-    // Expand the "Reports & Notifications" collapsible section
-    const summary = page.getByText('Reports & Notifications');
-    await summary.scrollIntoViewIfNeeded();
-    await summary.click();
+    // Wealth Reports live on the Notifications tab
+    await openTab(page, 'Notifications');
+    await expect(page).toHaveURL(/\/settings\?tab=notifications/);
     await expect(page.getByRole('heading', { name: 'Wealth Reports' })).toBeVisible();
     await expect(page.getByRole('button', { name: /Generate/ })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Notification Channels' })).toBeVisible();
   });
 
   test('displays two-factor authentication section', async ({ page }) => {
-    // Expand the "Users & Security" collapsible section
-    const summary = page.getByText('Users & Security');
-    await summary.scrollIntoViewIfNeeded();
-    await summary.click();
-    await expect(page.getByRole('heading', { name: 'Two-Factor Authentication' })).toBeVisible();
-    await expect(page.getByText('2FA Off')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Enable 2FA' })).toBeVisible();
+    const status = await (await page.request.get('/api/auth/status')).json();
+    await openTab(page, 'Security');
+    if (status.required) {
+      // Sign-in is on: 2FA is managed per user
+      await expect(page.getByRole('heading', { name: 'Two-Factor Authentication' })).toBeVisible();
+      const anyUser = page.getByRole('button', { name: /^(Enable|Disable) two-factor authentication for / });
+      const noUsers = page.getByText('Two-factor authentication becomes available once a user account exists.');
+      await expect(anyUser.first().or(noUsers)).toBeVisible();
+    } else {
+      // Sign-in is off (the usual E2E setup): the redesign replaces the "2FA Off / Enable 2FA"
+      // controls with an explanation, because 2FA cannot apply without a password sign-in.
+      await expect(page.getByRole('heading', { name: 'Sign-in', exact: true })).toBeVisible();
+      await expect(page.getByText('Sign-in is switched off')).toBeVisible();
+      await expect(page.getByText(/passkeys and two-factor authentication don’t apply/)).toBeVisible();
+      await expect(page.getByRole('heading', { name: 'Two-Factor Authentication' })).toHaveCount(0);
+    }
   });
 
   test('TOTP setup API returns secret and URL', async ({ request }) => {
-    // Get admin user ID
+    // Use the first existing user (the admin when sign-in is on). An instance without
+    // sign-in has no users, so create a throwaway one for the duration of the test.
     const usersResp = await request.get('/api/settings/users');
-    const users = await usersResp.json();
-    const adminId = users.users[0].id;
+    expect(usersResp.ok()).toBeTruthy();
+    const { users } = await usersResp.json();
+    let userId: string | undefined = users?.[0]?.id;
+    let tempId: string | undefined;
+    if (!userId) {
+      const createResp = await request.post('/api/settings/users', {
+        data: { username: 'totpuser_e2e', password: 'testpassword123', role: 'member' },
+      });
+      expect(createResp.ok()).toBeTruthy();
+      tempId = userId = (await createResp.json()).id;
+    }
 
-    const resp = await request.post(`/api/settings/users/${adminId}/totp/setup`);
-    expect(resp.ok()).toBeTruthy();
-    const data = await resp.json();
-    expect(data).toHaveProperty('secret');
-    expect(data).toHaveProperty('url');
-    expect(data.url).toContain('otpauth://');
+    try {
+      const resp = await request.post(`/api/settings/users/${userId}/totp/setup`);
+      expect(resp.ok()).toBeTruthy();
+      const data = await resp.json();
+      expect(data).toHaveProperty('secret');
+      expect(data).toHaveProperty('url');
+      expect(data.url).toContain('otpauth://');
+    } finally {
+      if (tempId) await request.delete(`/api/settings/users/${tempId}`);
+    }
   });
 });

@@ -89,6 +89,7 @@ export interface HoldingRow {
   symbol: string | null;
   asset_class: string;
   currency: string;
+  price_currency?: string;
   current_price: number | null;
   market_value: number | null;
   value_eur: number;
@@ -720,9 +721,10 @@ export const api = {
   },
 
   // Transactions
-  listTransactions: (limit = 50, offset = 0, type = '', search = '', from = '', to = '') => {
+  listTransactions: (limit = 50, offset = 0, type = '', search = '', from = '', to = '', accountId = '') => {
     const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     if (type) params.set('type', type);
+    if (accountId) params.set('account_id', accountId);
     if (search) params.set('search', search);
     if (from) params.set('from', from);
     if (to) params.set('to', to);
@@ -816,7 +818,11 @@ export const api = {
   listUsers: () => request<{ users: { id: string; username: string; role: string; is_active: boolean; created_at: string; totp_enabled: boolean }[] }>('/settings/users'),
   setupTOTP: (userId: string) => request<{ secret: string; url: string }>(`/settings/users/${userId}/totp/setup`, { method: 'POST' }),
   verifyTOTP: (userId: string, code: string) => request<{ status: string }>(`/settings/users/${userId}/totp/verify`, { method: 'POST', body: JSON.stringify({ code }) }),
-  disableTOTP: (userId: string) => request<{ status: string }>(`/settings/users/${userId}/totp`, { method: 'DELETE' }),
+  disableTOTP: (userId: string, opts?: { code?: string; password?: string }) =>
+    request<{ status: string }>(`/settings/users/${userId}/totp`, {
+      method: 'DELETE',
+      body: opts ? JSON.stringify(opts) : undefined,
+    }),
   createUser: (data: { username: string; password: string; role?: string }) =>
     request<{ id: string; username: string; role: string }>('/settings/users', { method: 'POST', body: JSON.stringify(data) }),
   deleteUser: (id: string) => request<{ status: string }>(`/settings/users/${id}`, { method: 'DELETE' }),
@@ -835,7 +841,7 @@ export const api = {
     transactions: { date: string; type: string; quantity: number; amount: number; running_qty: number }[];
   }>(`/portfolio/security/${isin}`),
   getHealthScore: () => request<{ score: number; subscores: { name: string; score: number; weight: number; status: string; detail: string }[] }>('/analysis/health-score'),
-  getBenchmarkComparison: (isin?: string) => request<{ benchmark_name: string; actual_value: number; benchmark_value: number; difference: number; comparison: { date: string; actual: number; benchmark: number }[] }>(`/analysis/benchmark-comparison${isin ? `?isin=${isin}` : ''}`),
+  getBenchmarkComparison: (isin?: string) => request<{ benchmark_name: string; benchmark_isin?: string; actual_value: number; benchmark_value: number; difference: number; comparison: { date: string; actual: number; benchmark: number }[]; /** false when the benchmark has too few price rows; `have` of `need` rows are loaded. */ available?: boolean; reason?: string; have?: number; need?: number }>(`/analysis/benchmark-comparison${isin ? `?isin=${isin}` : ''}`),
   getInflation: () => request<{ history: { date: string; nominal: number; real: number }[]; nominal_return?: number; real_return?: number; purchasing_power_lost?: number }>('/analysis/inflation'),
   getCashFlow: () => request<{ history: { month: string; income: number; expenses: number; net: number }[]; projection: { month: string; income: number; expenses: number; net: number }[]; avg_income: number; avg_expenses: number; avg_net: number }>('/analysis/cash-flow'),
 

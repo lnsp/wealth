@@ -175,17 +175,17 @@ test.describe('Revolut CSV import', () => {
       }
     }
 
-    await page.goto('/settings');
-    // The "Add Account" form lives inside a collapsed details section — expand it first.
-    const section = page.getByText('Bank Accounts & Securities');
-    await section.scrollIntoViewIfNeeded();
-    await section.click();
+    // The "Add Account" form opens from the "Add account" button on the Accounts tab.
+    await page.goto('/settings?tab=accounts');
+    await expect(page.getByRole('tab', { name: 'Accounts' })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('button', { name: 'Add account' }).click();
     await expect(page.getByRole('heading', { name: 'Add Account' })).toBeVisible();
 
-    const institutionSelect = page.locator('select').filter({
-      has: page.locator('option[value="revolut"]'),
-    });
-    await expect(institutionSelect).toHaveCount(1);
+    const institutionSelect = page.getByRole('combobox', { name: 'Institution' });
+    await expect(institutionSelect).toBeVisible();
     await expect(institutionSelect.locator('option[value="revolut"]')).toHaveText('Revolut');
+    // The option is selectable, not just present
+    await institutionSelect.selectOption('revolut');
+    await expect(institutionSelect).toHaveValue('revolut');
   });
 });

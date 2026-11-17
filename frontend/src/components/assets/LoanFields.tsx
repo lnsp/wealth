@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { api, type Account, type Loan, type LoanInput } from '../../api/client';
-import { fmtCents, fieldCls, labelCls } from './format';
+import { Field, SelectField } from '../ui';
+import { fmtEUR } from '../../utils/format';
+import { formGrid } from './format';
 
 export interface LoanFormState {
   name: string;
@@ -20,6 +22,11 @@ export interface LoanFormState {
 const num = (s: string) => parseFloat(s.replace(',', '.'));
 
 export function loanFormFrom(l: Loan | null, defaults?: Partial<LoanFormState>): LoanFormState {
+  const derivedAnnuity = l
+    ? Math.round((l.principal * (l.nominal_rate + l.initial_repayment)) / 12 * 100) / 100
+    : null;
+  const hasExplicitMonthlyOverride =
+    l != null && derivedAnnuity != null && Math.abs(l.monthly_payment - derivedAnnuity) >= 0.02;
   return {
     name: l?.name ?? 'Mortgage',
     lender: l?.lender ?? '',
@@ -28,7 +35,7 @@ export function loanFormFrom(l: Loan | null, defaults?: Partial<LoanFormState>):
     first_payment_date: l?.first_payment_date ?? '',
     rate_pct: l ? String(+(l.nominal_rate * 100).toFixed(4)) : '',
     repayment_pct: l ? String(+(l.initial_repayment * 100).toFixed(2)) : '2',
-    monthly_payment: l ? String(l.monthly_payment) : '',
+    monthly_payment: hasExplicitMonthlyOverride && l ? String(l.monthly_payment) : '',
     fixed_until: l?.fixed_until ?? '',
     followup_rate_pct: l?.followup_rate != null ? String(+(l.followup_rate * 100).toFixed(4)) : '',
     extra_allowance_pct: l ? String(+(l.extra_allowance_pct * 100).toFixed(2)) : '5',
@@ -70,56 +77,41 @@ export default function LoanFields({ value, onChange, idPrefix }: {
   useEffect(() => {
     api.listAccounts().then(r => setAccounts((r.accounts || []).filter(a => a.type === 'checking' || a.type === 'savings'))).catch(() => {});
   }, []);
-  const set = (k: keyof LoanFormState) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
-    onChange({ ...value, [k]: e.target.value });
   const computed = annuity(value);
+  const set = (k: keyof LoanFormState) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    const nextVal = e.target.value;
+    const nextState: LoanFormState = { ...value, [k]: nextVal };
+    if (k === 'repayment_pct') {
+      nextState.monthly_payment = '';
+    } else if ((k === 'principal' || k === 'rate_pct') && value.monthly_payment && computed != null && Math.abs(num(value.monthly_payment) - computed) < 0.02) {
+      nextState.monthly_payment = '';
+    }
+    onChange(nextState);
+  };
   const id = (k: string) => `${idPrefix}-${k}`;
 
   return (
-    <div className="grid gap-x-5 gap-y-3.5" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 190px), 1fr))' }}>
-      <label className={labelCls} htmlFor={id('lender')}>Lender
-        <input id={id('lender')} className={fieldCls} value={value.lender} onChange={set('lender')} placeholder="e.g. Sparkasse" />
-      </label>
-      <label className={labelCls} htmlFor={id('name')}>Name
-        <input id={id('name')} className={fieldCls} value={value.name} onChange={set('name')} />
-      </label>
-      <label className={labelCls} htmlFor={id('principal')}>Loan amount (€)
-        <input id={id('principal')} className={fieldCls} type="number" min="1" step="0.01" required value={value.principal} onChange={set('principal')} />
-      </label>
-      <label className={labelCls} htmlFor={id('payout')}>Paid out on
-        <input id={id('payout')} className={fieldCls} type="date" required value={value.payout_date} onChange={set('payout_date')} />
-      </label>
-      <label className={labelCls} htmlFor={id('first')}>First payment (optional)
-        <input id={id('first')} className={fieldCls} type="date" value={value.first_payment_date} onChange={set('first_payment_date')} />
-      </label>
-      <label className={labelCls} htmlFor={id('rate')}>Nominal rate (%)
-        <input id={id('rate')} className={fieldCls} type="number" min="0" max="20" step="0.01" required value={value.rate_pct} onChange={set('rate_pct')} />
-      </label>
-      <label className={labelCls} htmlFor={id('repay')}>Initial repayment (%/yr)
-        <input id={id('repay')} className={fieldCls} type="number" min="0" max="20" step="0.01" value={value.repayment_pct} onChange={set('repayment_pct')} />
-      </label>
-      <label className={labelCls} htmlFor={id('payment')}>Monthly payment (€)
-        <input id={id('payment')} className={fieldCls} type="number" min="0" step="0.01" value={value.monthly_payment} onChange={set('monthly_payment')}
-          placeholder={computed != null ? String(computed) : 'from repayment rate'} />
-      </label>
-      <label className={labelCls} htmlFor={id('fixed')}>Fixed rate until
-        <input id={id('fixed')} className={fieldCls} type="date" value={value.fixed_until} onChange={set('fixed_until')} />
-      </label>
-      <label className={labelCls} htmlFor={id('followup')}>Rate after that (%, optional)
-        <input id={id('followup')} className={fieldCls} type="number" min="0" max="20" step="0.01" value={value.followup_rate_pct} onChange={set('followup_rate_pct')} placeholder="same as now" />
-      </label>
-      <label className={labelCls} htmlFor={id('extra')}>Extra repayment allowed (%/yr)
-        <input id={id('extra')} className={fieldCls} type="number" min="0" max="100" step="0.5" value={value.extra_allowance_pct} onChange={set('extra_allowance_pct')} />
-      </label>
-      <label className={labelCls} htmlFor={id('acct')}>Paid from
-        <select id={id('acct')} className={fieldCls} value={value.payment_account_id} onChange={set('payment_account_id')}>
-          <option value="">Any account</option>
-          {accounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
-        </select>
-      </label>
+    <div className="grid gap-x-5 gap-y-4" style={formGrid(190)}>
+      <Field id={id('lender')} label="Lender" value={value.lender} onChange={set('lender')} hint="For example your bank" />
+      <Field id={id('name')} label="Name" value={value.name} onChange={set('name')} />
+      <Field id={id('principal')} label="Loan amount" unit="€" type="number" inputMode="decimal" min="1" step="0.01" required value={value.principal} onChange={set('principal')} />
+      <Field id={id('payout')} label="Paid out on" type="date" required value={value.payout_date} onChange={set('payout_date')} />
+      <Field id={id('first')} label="First payment (optional)" type="date" value={value.first_payment_date} onChange={set('first_payment_date')} />
+      <Field id={id('rate')} label="Nominal rate" unit="% / year" type="number" inputMode="decimal" min="0" max="20" step="0.01" required value={value.rate_pct} onChange={set('rate_pct')} />
+      <Field id={id('repay')} label="Initial repayment" unit="% / year" type="number" inputMode="decimal" min="0" max="20" step="0.01" value={value.repayment_pct} onChange={set('repayment_pct')} />
+      <Field id={id('payment')} label="Monthly payment (optional)" unit="€" type="number" inputMode="decimal" min="0" step="0.01" value={value.monthly_payment} onChange={set('monthly_payment')}
+        hint={computed != null ? `Leave empty to use ${fmtEUR(computed, { cents: true })} from the repayment rate` : 'Leave empty to derive it from the repayment rate'} />
+      <Field id={id('fixed')} label="Fixed rate until" type="date" value={value.fixed_until} onChange={set('fixed_until')} />
+      <Field id={id('followup')} label="Rate after that (optional)" unit="% / year" type="number" inputMode="decimal" min="0" max="20" step="0.01" value={value.followup_rate_pct} onChange={set('followup_rate_pct')} hint="Leave empty to assume the same rate" />
+      <Field id={id('extra')} label="Extra repayment allowed" unit="% / year" type="number" inputMode="decimal" min="0" max="100" step="0.5" value={value.extra_allowance_pct} onChange={set('extra_allowance_pct')} />
+      <SelectField id={id('acct')} label="Paid from" value={value.payment_account_id} onChange={set('payment_account_id')}>
+        <option value="">Any account</option>
+        {accounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+      </SelectField>
       <p className="text-[13px] text-ink-body" style={{ gridColumn: '1 / -1' }}>
-        Monthly payment <strong className="tabular-nums">{value.monthly_payment ? fmtCents(num(value.monthly_payment)) : computed != null ? fmtCents(computed) : '—'}</strong>
-        {!value.monthly_payment && computed != null && ' (from the repayment rate)'} · payments from the chosen account are matched automatically.
+        Monthly payment{' '}
+        <strong data-privacy="blur">{value.monthly_payment ? fmtEUR(num(value.monthly_payment), { cents: true }) : computed != null ? fmtEUR(computed, { cents: true }) : '—'}</strong>
+        {!value.monthly_payment && computed != null && ' (from the repayment rate)'}. Payments from the chosen account are matched automatically.
       </p>
     </div>
   );

@@ -70,8 +70,11 @@ Body sets `font-variant-numeric: tabular-nums lining-nums` by default so columns
 | --------------- | ----- | ------ | --------- | --------- | ------------------------------------ |
 | `text-display`  | 44/52 | 400    | -0.025em  | EB Garamond (auto) | Hero numbers, page-defining KPIs |
 | `text-title`    | 26/32 | 400    | -0.015em  | EB Garamond (auto) | Page titles                          |
-| `text-heading`  | 20/28 | 500    | -0.005em  | sans      | Section headings                     |
-| `text-label`    | 11/16 | 500    | 0.1em     | sans      | All-caps eyebrows, table column heads |
+| Section heading | 20/28 | 500    | —         | EB Garamond | `<Section>` titles (h2)            |
+| Sub-heading     | 13/20 | 600    | —         | sans      | `<SubHeading>`: a chart or block inside a section (h3) |
+| `label-caps`    | 13/16 | 600    | 0.1em     | EB Garamond, capitals | Eyebrows, KPI labels, table column heads |
+
+Labels are Garamond **capitals**, not small caps: small caps at this size render at x-height (≈6px) and were the least legible text in the product. `text-label` carries the same metrics as `label-caps` but not the family or case — prefer the `label-caps` class.
 
 `text-display` and `text-title` bind serif via Tailwind's `fontSize` config — `font-serif` is no longer needed alongside them (it's harmless if left from prior usage).
 
@@ -141,10 +144,40 @@ These live in `frontend/src/index.css` under `@layer components`. Treat them as 
 | `apple-select`     | Same as input + custom dropdown chevron                          |
 | `apple-btn-primary`| 4px radius, forest fill, parchment text                          |
 | `apple-btn-secondary`| 4px radius, transparent + forest border, forest text           |
+| `apple-btn-danger` | 4px radius, claret outline. Destructive triggers; label ends in "…" and the action runs only after a confirm dialog |
+| `apple-btn-danger-solid` | Solid claret. Only as the confirm button inside a dialog   |
+| `apple-btn-sm`     | 36px-high modifier for buttons in dense desktop rows             |
+| `apple-chip`       | Outlined pill for status and type labels; tone via `border-{c} text-{c}` |
+| `apple-table`      | Table with `label-caps` head on `inset`, hairline rows; `.num` right-aligns |
+| `label-caps`       | Garamond capitals, 13px semibold, 0.1em tracking, `ink-muted`    |
+| `scroll-fade-x`    | Horizontal scroll with a right-edge fade on phones               |
 | `apple-badge`      | Pill, 12px text, no default colors — caller specifies bg/text    |
 | `safe-area-bottom` | Adds `env(safe-area-inset-bottom)` padding                       |
 | `safe-area-header-offset` | Adds top safe-area padding (mobile only)                  |
 | `scrollbar-hide`   | Hides scrollbar while keeping scroll                              |
+
+Disabled buttons are `inset` with a dashed `field` border and muted text, so they cannot be mistaken for an unselected pill. Control boundaries (inputs, selects, period pills) use the `field` colour, which clears 3:1 against every surface.
+
+### React components (`frontend/src/components/ui`)
+
+Pages are assembled from these; do not hand-roll equivalents.
+
+| Component | Use |
+| --- | --- |
+| `PageHeader` | Page title (h1 on desktop; on phones the app header shows the title) plus meta/actions |
+| `Section` / `SubHeading` | Hairline-topped section with serif h2, subtitle, right-aligned actions; h3 for charts inside |
+| `MetricCard` / `MetricGrid` | The one KPI tile: hairline above, `label-caps` label, serif figure, caption. `tone` colours the value; zero stays ink |
+| `Field` / `NumberField` / `SelectField` | Labelled 44px controls with 16px text and an in-field unit suffix. `NumberField` can be cleared and retyped |
+| `TabBar` / `TabPanel` / `useTabParam` | Underlined tabs with arrow-key navigation; tab state lives in `?tab=` |
+| `PeriodSelector` | Plain `aria-pressed` buttons; the active one is solid forest |
+| `LoadingState` / `ErrorState` / `EmptyState` | Skeleton lines; error band with retry and technical details; headline + sentence + one primary action |
+| `SectionBoundary` | Error boundary per section or tab panel — one failure never blanks the page |
+| `useConfirm` / `ConfirmDialog` | Promise-based confirmation for every destructive action |
+| `Chip`, `AddChip`, `RankedBars`, `ProgressBar` | Outlined status chip, dashed add button, ranked single-colour bars, labelled progress |
+
+### Formatting (`frontend/src/utils/format.ts`)
+
+One locale: German numbers, English words. `fmtEUR`, `fmtMoney` (symbol for EUR, ISO code otherwise; cents only on single transactions and prices), `fmtPct` (decimal comma, sign on changes), `fmtQty` (≤4 decimals, with a unit word), `fmtDate` (`16.11.2026`, tables), `fmtDateLong` (`16 Nov 2026`, prose), `fmtMonth` / `fmtMonthShort` (`Nov ’26`, axes), `fmtAxis` (`340k`, `1,2M`), `labelFor` (enum → label). No `toFixed` or ad-hoc `toLocaleString` in components.
 
 Note: the `apple-*` prefix is legacy — these are heritage primitives now. Don't rename without sweeping all callers.
 
@@ -166,9 +199,17 @@ Hard-won rules from production bugs (see TASKS.md for incident context):
 
 6. **Privacy mode CSS depends on `font-serif` selectors.** See the `.privacy` rules in `index.css`. If you display monetary values, use `font-serif` so they get blurred in privacy mode.
 
+7. **Destructive actions confirm.** Trigger with `apple-btn-danger` and a trailing "…", run through `useConfirm`.
+
+8. **A section never renders blank and never disappears.** Use `LoadingState`, `ErrorState`, `EmptyState`, and wrap independently loaded sections in `SectionBoundary`.
+
+9. **Bars start at zero; categories are labelled, not colour-coded.** The six chart tokens contain two browns (light) and two greens (dark) that cannot be told apart at swatch size. For allocation-style breakdowns use `RankedBars`; where two lines share a chart, differ by dash as well as hue.
+
+10. **Touch targets are 44px on phones**, and anything clickable is a `button` or `a`.
+
 ## Charts
 
-All visualizations go through `<ReactECharts>` with a shared theme object. The chart palette is `chart.1–6`, intentionally heritage-toned. See `ARCHITECTURE.md:754-767` for the mapping of chart types to ECharts series types.
+All visualizations go through `EChartWrapper`, which merges themed axis, gridline and legend defaults into every option (chart text never below 11px, category labels hide on overlap). The chart palette is `chart.1–6`, intentionally heritage-toned. See `ARCHITECTURE.md:754-767` for the mapping of chart types to ECharts series types.
 
 Quick reference:
 
@@ -184,8 +225,8 @@ Single breakpoint that matters: Tailwind `md` (768px).
 
 | Form factor          | Layout                                                                                  |
 | -------------------- | --------------------------------------------------------------------------------------- |
-| Desktop ≥1024px      | Top nav, multi-column dashboards                                                         |
-| Mobile <768px        | Fixed bottom 5-tab iOS-style bar with safe-area padding for notched phones              |
+| Desktop ≥768px       | Fixed left sidebar (224px), content column max 1024px                                    |
+| Mobile <768px        | Header with the page title; fixed bottom 5-tab bar (Net Worth, Portfolio, Cashflow, Transactions, More) with safe-area padding. Analysis, Planning, Tax and Settings live under More, with a back arrow in the header |
 
 Stacked allocation bars appear above holdings on both form factors; mobile collapses tables into cards while preserving the weight bar inline.
 

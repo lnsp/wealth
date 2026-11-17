@@ -1,9 +1,23 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/** Pick a transaction type in the filter and wait for the filtered list to arrive. */
+async function filterByType(page: Page, type: string) {
+  await Promise.all([
+    page.waitForResponse(r => r.url().includes('/api/transactions') && r.url().includes(`type=${type}`) && r.ok()),
+    page.getByLabel('Filter by transaction type').selectOption(type),
+  ]);
+  await expect(page.locator('[aria-busy="true"]')).toHaveCount(0);
+}
+
+/** Transaction rows of the desktop table (month group headers have no cells). */
+function dataRows(page: Page) {
+  return page.getByRole('table').getByRole('row').filter({ has: page.getByRole('cell') });
+}
 
 test.describe('Transactions page', () => {
   test.beforeEach(async ({ page }) => {
@@ -18,64 +32,67 @@ test.describe('Transactions page', () => {
     await expect(page.getByText('total')).toBeVisible();
   });
 
-  test('transaction table has Security, Qty, and Price columns', async ({ page }) => {
-    await expect(page.getByRole('columnheader', { name: 'Security' })).toBeVisible();
-    await expect(page.getByRole('columnheader', { name: 'Qty' })).toBeVisible();
-    await expect(page.getByRole('columnheader', { name: 'Price' })).toBeVisible();
-    await expect(page.getByRole('columnheader', { name: 'Amount' })).toBeVisible();
+  test('transaction table has Date, Description, Type, Account, Category and Amount columns', async ({ page }) => {
+    // The Security / Qty / Price columns were folded into Description in the redesign
+    const table = page.getByRole('table');
+    for (const name of ['Date', 'Description', 'Type', 'Account', 'Category', 'Amount']) {
+      await expect(table.getByRole('columnheader', { name, exact: true })).toBeVisible();
+    }
+    await expect(table.getByRole('columnheader', { name: 'Qty' })).toHaveCount(0);
   });
 
   test('buy transactions show security name, ISIN, quantity, and price', async ({ page }) => {
-    // Filter to buy transactions
-    await page.locator('select').selectOption('buy');
-    await page.waitForTimeout(500);
+    await filterByType(page, 'buy');
 
-    // Should show security with ISIN
-    const firstRow = page.locator('table tbody tr').first();
-    await expect(firstRow).toBeVisible();
+    const rows = dataRows(page);
+    await expect(rows.first()).toBeVisible();
+    await expect(rows.first().getByRole('cell').nth(2)).toHaveText('Buy');
 
-    // Should contain an ISIN (format: 2 letters + 10 alphanumeric)
-    const securityCell = firstRow.locator('td').nth(2);
-    const text = await securityCell.textContent();
-    expect(text).toMatch(/[A-Z]{2}[A-Z0-9]{10}/); // ISIN pattern
-
-    // Qty should not be "—"
-    const qtyCell = firstRow.locator('td').nth(3);
-    const qtyText = await qtyCell.textContent();
-    expect(qtyText).not.toBe('—');
-
-    // Price should not be "—"
-    const priceCell = firstRow.locator('td').nth(4);
-    const priceText = await priceCell.textContent();
-    expect(priceText).not.toBe('—');
+    // Description cell: security name, then "ISIN · N shares at PRICE"
+    const description = rows.first().getByRole('cell').nth(1);
+    await expect(description).toContainText(/[A-Z]{2}[A-Z0-9]{10}/); // ISIN pattern
+    await expect(description).toContainText(/\d\s+shares?\s+at\s+[\d.,]+\s*€/); // quantity and price
+    await expect(description).not.toContainText('0 shares at');
   });
 
-  test('deposit transactions show dashes for Qty and Price', async ({ page }) => {
-    await page.locator('select').selectOption('deposit');
-    await page.waitForTimeout(500);
+  test('deposit transactions show no quantity or price, and offer a category', async ({ page }) => {
+    await filterByType(page, 'deposit');
 
-    const firstRow = page.locator('table tbody tr').first();
-    await expect(firstRow).toBeVisible();
+    const rows = dataRows(page);
+    await expect(rows.first()).toBeVisible();
+    await expect(rows.first().getByRole('cell').nth(2)).toHaveText('Deposit');
 
-    // Qty should be "—"
-    const qtyCell = firstRow.locator('td').nth(3);
-    await expect(qtyCell).toHaveText('—');
-
-    // Price should be "—"
-    const priceCell = firstRow.locator('td').nth(4);
-    await expect(priceCell).toHaveText('—');
+    // No share count / price for a cash movement
+    const description = rows.first().getByRole('cell').nth(1);
+    await expect(description).not.toContainText(/shares?/);
+    await expect(description).not.toContainText(/\d\s*€/);
+    // Cash rows carry the category override instead
+    await expect(rows.first().getByRole('combobox', { name: /^Category for / })).toBeVisible();
   });
 
   test('type filter works', async ({ page }) => {
-    await page.locator('select').selectOption('sell');
-    await page.waitForTimeout(500);
-    // All visible rows should have "sell" badge
-    const badges = page.locator('table tbody tr td:nth-child(2) span');
-    const count = await badges.count();
+    await filterByType(page, 'sell');
+    await expect(page.getByLabel('Filter by transaction type')).toHaveValue('sell');
+    // All visible rows should carry the "Sale" type chip
+    const rows = dataRows(page);
+    const count = await rows.count();
     expect(count).toBeGreaterThan(0);
     for (let i = 0; i < count; i++) {
-      await expect(badges.nth(i)).toHaveText('sell');
+      await expect(rows.nth(i).getByRole('cell').nth(2)).toHaveText('Sale');
     }
+    // The count line reflects the filter, and clearing it restores the full list
+    await expect(page.getByText(/matching transactions?/)).toBeVisible();
+    await page.getByRole('button', { name: 'Clear filters' }).click();
+    await expect(page.getByLabel('Filter by transaction type')).toHaveValue('');
+    await expect(page.getByText(/transactions? in total/)).toBeVisible();
+  });
+
+  test('account, type and month filters are separately labelled', async ({ page }) => {
+    const filters = page.getByRole('group', { name: 'Filter transactions' });
+    await expect(filters.getByRole('combobox')).toHaveCount(3);
+    await expect(filters.getByLabel('Filter by account')).toBeVisible();
+    await expect(filters.getByLabel('Filter by transaction type')).toBeVisible();
+    await expect(filters.getByLabel('Filter by month')).toBeVisible();
   });
 
   test('import API returns parsing warnings for skipped rows', async ({ request }) => {
@@ -137,6 +154,7 @@ test.describe('Transactions page', () => {
     await importBtn.click();
 
     // Account selector should appear
+    await expect(importBtn).toHaveAttribute('aria-expanded', 'true');
     const accountSelect = page.locator('select', { has: page.locator('option', { hasText: 'Select account...' }) });
     await expect(accountSelect).toBeVisible();
 

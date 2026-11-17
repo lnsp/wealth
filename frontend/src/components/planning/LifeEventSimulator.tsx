@@ -2,22 +2,55 @@ import { useState } from 'react';
 import { usePlanning } from './PlanningContext';
 import { useThemeColors } from '../../hooks/useThemeColors';
 import EChartWrapper from '../charts/EChartWrapper';
+import {
+  Section, SubHeading, MetricCard, MetricGrid, Field, NumberField, AddChip,
+  EmptyState, ErrorState, useConfirm,
+} from '../ui';
+import { escapeHtml, fmtEUR, fmtPct, fmtNum, fmtAxis } from '../../utils/format';
+import { ItemCard, RemoveButton, monthLabel } from './shared';
 
-type LifeEvent = { type: string; date: string; cash_impact: number; contrib_change: number; recurring_cost: number; duration_months: number; tax_impact: number; label: string };
+type LifeEvent = {
+  type: string; date: string; cash_impact: number; contrib_change: number; recurring_cost: number;
+  duration_months: number; tax_impact: number; label: string;
+  /** Early retirement: contributions stop at the event date (sent as minus the current contribution). */
+  stops_contributions: boolean;
+};
 
-type LifeEventResult = { baseline: { date: string; value: number }[]; with_events: { date: string; value: number }[]; net_impact: number; fire_shift_months: number; templates: { type: string; label: string; description: string; default_cash_impact: number; default_contrib_change: number; default_recurring_cost: number; default_duration_months: number; icon: string }[]; execution_plans?: { type: string; event_label: string; cash_needed?: number; sell_order?: { isin: string; name: string; buy_date?: string; sell_amount: number; tax_due: number; net_proceeds: number; effective_rate_pct: number }[]; total_tax?: number; total_proceeds?: number; windfall_amount?: number; lump_sum_10y?: number; dca_10y?: number; lump_sum_edge_pct?: number }[] };
+type ExecutionPlan = {
+  type: string; event_label: string; cash_needed?: number;
+  sell_order?: { isin: string; name: string; buy_date?: string; sell_amount: number; tax_due: number; net_proceeds: number; effective_rate_pct: number }[];
+  total_tax?: number; total_proceeds?: number; windfall_amount?: number;
+  lump_sum_10y?: number; dca_10y?: number; lump_sum_edge_pct?: number;
+};
 
-const DEFAULT_TEMPLATES: LifeEventResult['templates'] = [
-  { type: 'home_purchase', label: 'Home Purchase', icon: 'H', default_cash_impact: -80000, default_contrib_change: 0, default_recurring_cost: 1500, default_duration_months: 300, description: '' },
-  { type: 'sabbatical', label: 'Sabbatical', icon: 'S', default_cash_impact: 0, default_contrib_change: -2000, default_recurring_cost: 500, default_duration_months: 12, description: '' },
-  { type: 'child', label: 'Child', icon: 'C', default_cash_impact: -5000, default_contrib_change: -250, default_recurring_cost: 600, default_duration_months: 216, description: '' },
-  { type: 'job_change', label: 'Job Change', icon: 'J', default_cash_impact: 0, default_contrib_change: 500, default_recurring_cost: 0, default_duration_months: 0, description: '' },
-  { type: 'inheritance', label: 'Inheritance', icon: 'I', default_cash_impact: 100000, default_contrib_change: 0, default_recurring_cost: 0, default_duration_months: 0, description: '' },
-  { type: 'marriage', label: 'Marriage', icon: 'M', default_cash_impact: -15000, default_contrib_change: 0, default_recurring_cost: 0, default_duration_months: 0, description: '' },
-  { type: 'early_retirement', label: 'Early Retirement', icon: 'R', default_cash_impact: 0, default_contrib_change: -999999, default_recurring_cost: 3000, default_duration_months: 0, description: '' },
+type LifeEventResult = {
+  baseline: { date: string; value: number }[];
+  with_events: { date: string; value: number }[];
+  net_impact: number;
+  fire_shift_months: number;
+  execution_plans?: ExecutionPlan[];
+};
+
+type Template = { type: string; label: string; cash: number; contrib: number; recurring: number; months: number; stopsContributions?: boolean };
+
+// Defaults mirror the backend templates. Early retirement is modelled explicitly: saving stops
+// and living costs are drawn from the portfolio — no sentinel value in a visible field.
+const TEMPLATES: Template[] = [
+  { type: 'home_purchase', label: 'Home purchase', cash: -80000, contrib: 0, recurring: 1500, months: 300 },
+  { type: 'sabbatical', label: 'Sabbatical', cash: 0, contrib: -2000, recurring: 500, months: 12 },
+  { type: 'child', label: 'Child', cash: -5000, contrib: -250, recurring: 600, months: 216 },
+  { type: 'job_change', label: 'Job change', cash: 0, contrib: 500, recurring: 0, months: 0 },
+  { type: 'inheritance', label: 'Inheritance', cash: 100000, contrib: 0, recurring: 0, months: 0 },
+  { type: 'marriage', label: 'Marriage', cash: -15000, contrib: 0, recurring: 0, months: 0 },
+  { type: 'early_retirement', label: 'Early retirement', cash: 0, contrib: 0, recurring: 3000, months: 0, stopsContributions: true },
 ];
 
-const ICONS: Record<string, string> = { home_purchase: 'H', sabbatical: 'S', marriage: 'M', child: 'C', job_change: 'J', inheritance: 'I', early_retirement: 'R' };
+function isLifeEventResult(body: unknown): body is LifeEventResult {
+  if (!body || typeof body !== 'object') return false;
+  const b = body as Record<string, unknown>;
+  return Array.isArray(b.baseline) && Array.isArray(b.with_events)
+    && (b.execution_plans === undefined || b.execution_plans === null || Array.isArray(b.execution_plans));
+}
 
 // "What-if" event simulator. Each event is (lump_sum, monthly_contrib_change,
 // monthly_recurring_cost, duration_months) and the backend at
@@ -26,219 +59,281 @@ const ICONS: Record<string, string> = { home_purchase: 'H', sabbatical: 'S', mar
 // an execution_plan with the FIFO sell order and tax estimate; for windfalls
 // (inheritance) it suggests lump-sum vs DCA.
 export default function LifeEventSimulator() {
-  const { projData, projContrib, projReturn, fmt } = usePlanning();
+  const { projData, projContrib, projReturn } = usePlanning();
   const tc = useThemeColors();
-  const [lifeEvents, setLifeEvents] = useState<LifeEvent[]>([]);
-  const [lifeEventResult, setLifeEventResult] = useState<LifeEventResult | null>(null);
-  const [lifeEventLoading, setLifeEventLoading] = useState(false);
+  const [confirm, confirmDialog] = useConfirm();
+  const [events, setEvents] = useState<LifeEvent[]>([]);
+  const [result, setResult] = useState<LifeEventResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const templates = lifeEventResult?.templates || DEFAULT_TEMPLATES;
+  const contrib = projData ? (parseFloat(projContrib) || projData.contribution) : 0;
+  const ret = projData ? (parseFloat(projReturn) || projData.return_pct) : 7;
+
+  const addEvent = (t: Template) => {
+    const now = new Date();
+    const defaultDate = `${now.getFullYear() + 2}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    setEvents(prev => [...prev, {
+      type: t.type, label: t.label, date: defaultDate,
+      cash_impact: t.cash, contrib_change: t.contrib,
+      recurring_cost: t.recurring, duration_months: t.months, tax_impact: 0,
+      stops_contributions: !!t.stopsContributions,
+    }]);
+  };
+  const update = (i: number, patch: Partial<LifeEvent>) => {
+    setEvents(prev => prev.map((ev, j) => (j === i ? { ...ev, ...patch } : ev)));
+  };
+  const remove = async (i: number) => {
+    const ev = events[i];
+    if (!(await confirm({ title: `Remove “${ev.label}”?`, body: 'The values you entered for this event will be lost.', confirmLabel: 'Remove event' }))) return;
+    setEvents(prev => prev.filter((_, j) => j !== i));
+  };
+
+  const simulate = async () => {
+    if (!projData && events.some(ev => ev.stops_contributions)) {
+      setError('Your current contribution could not be loaded, so stopping it cannot be simulated. Reload the page and try again.');
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const payload = events.map(({ stops_contributions, ...ev }) => ({
+        ...ev,
+        contrib_change: stops_contributions ? -contrib : ev.contrib_change,
+      }));
+      const res = await fetch('/api/portfolio/life-events', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ events: payload, contribution: contrib, return_pct: ret }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body: unknown = await res.json();
+      if (!isLifeEventResult(body)) throw new Error('Unexpected response from the server');
+      setResult(body);
+    } catch (e) {
+      setResult(null);
+      setError(e instanceof Error ? e.message : 'Request failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const hasResult = !!result && result.baseline.length > 0 && events.length > 0;
+  const netImpact = result?.net_impact ?? 0;
+  const shift = result?.fire_shift_months ?? 0;
+  const sorted = [...events].sort((a, b) => a.date.localeCompare(b.date));
 
   return (
-    <div className="border-t border-divider pt-6 py-3 md:py-5">
-      <h2 className="font-serif text-heading text-ink mb-3 md:mb-4 px-1 md:px-0">Life Event Simulator</h2>
-      <p className="text-[13px] text-ink-muted mb-3">
-        Model how major life events affect your net worth trajectory.
-      </p>
-
-      <div className="flex flex-wrap gap-2 mb-3">
-        {templates.map(t => (
-          <button key={t.type} onClick={() => {
-            const now = new Date();
-            const defaultDate = `${now.getFullYear() + 2}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-            setLifeEvents(prev => [...prev, {
-              type: t.type, label: t.label, date: defaultDate,
-              cash_impact: t.default_cash_impact, contrib_change: t.default_contrib_change,
-              recurring_cost: t.default_recurring_cost, duration_months: t.default_duration_months, tax_impact: 0,
-            }]);
-          }} className="rounded-[8px] bg-parchment-deep px-3 py-1.5 text-[13px] font-medium text-ink-body hover:bg-divider">
-            {t.icon} {t.label}
-          </button>
+    <Section
+      id="life-events"
+      title="Life Event Simulator"
+      subtitle="See how a major life event would change your net worth over the next 30 years."
+    >
+      <div className="flex flex-wrap gap-2">
+        {TEMPLATES.map(t => (
+          <AddChip key={t.type} onClick={() => addEvent(t)}>{t.label}</AddChip>
         ))}
       </div>
 
-      {lifeEvents.length > 0 && (
-        <div className="space-y-2 mb-3">
-          {lifeEvents.map((ev, i) => (
-            <div key={i} className="rounded-xl bg-parchment-deep px-3 py-2.5">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-[15px] font-medium text-ink">{ev.label}</span>
-                <button onClick={() => setLifeEvents(prev => prev.filter((_, j) => j !== i))} className="text-claret text-[12px]">Remove</button>
+      {events.length === 0 && (
+        <div className="mt-4">
+          <EmptyState
+            title="No events yet"
+            message="Add an event above, adjust its amounts, then simulate the effect on your net worth."
+            action={{ label: 'Add a home purchase', onClick: () => addEvent(TEMPLATES[0]) }}
+          />
+        </div>
+      )}
+
+      {events.length > 0 && (
+        <div className="mt-4 flex flex-col gap-3">
+          {events.map((ev, i) => (
+            <ItemCard key={i}>
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <span className="min-w-0 text-[15px] font-medium text-ink">{ev.label}</span>
+                <RemoveButton name={ev.label} onClick={() => remove(i)} />
               </div>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="text-[11px] text-ink-muted">When</label>
-                  <input aria-label="Event date" type="month" value={ev.date} onChange={e => {
-                    const updated = [...lifeEvents]; updated[i] = { ...ev, date: e.target.value }; setLifeEvents(updated);
-                  }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-                </div>
-                <div>
-                  <label className="text-[11px] text-ink-muted">Lump sum</label>
-                  <input aria-label="Cash impact" type="number" value={ev.cash_impact} onChange={e => {
-                    const updated = [...lifeEvents]; updated[i] = { ...ev, cash_impact: parseFloat(e.target.value) || 0 }; setLifeEvents(updated);
-                  }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-                </div>
-                <div>
-                  <label className="text-[11px] text-ink-muted">Monthly savings Δ</label>
-                  <input aria-label="Contribution change" type="number" value={ev.contrib_change} onChange={e => {
-                    const updated = [...lifeEvents]; updated[i] = { ...ev, contrib_change: parseFloat(e.target.value) || 0 }; setLifeEvents(updated);
-                  }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-                </div>
-                <div>
-                  <label className="text-[11px] text-ink-muted">Monthly cost</label>
-                  <input aria-label="Recurring cost" type="number" value={ev.recurring_cost} onChange={e => {
-                    const updated = [...lifeEvents]; updated[i] = { ...ev, recurring_cost: parseFloat(e.target.value) || 0 }; setLifeEvents(updated);
-                  }} className="w-full rounded-[6px] border border-divider bg-parchment text-ink px-2 py-1 text-[12px] tabular-nums" />
-                </div>
+              <div className="grid grid-cols-1 gap-x-3 gap-y-4 sm:grid-cols-2">
+                <Field label="When" type="month" value={ev.date} onChange={e => update(i, { date: e.target.value })} />
+                <NumberField
+                  label="One-off amount"
+                  unit="€"
+                  value={ev.cash_impact}
+                  onValueChange={v => update(i, { cash_impact: v })}
+                  hint="Negative for a cost, positive for money received."
+                />
+                {ev.stops_contributions ? (
+                  <div className="flex flex-col gap-1.5">
+                    <span className="text-[13px] font-medium text-ink">Monthly savings</span>
+                    <p className="flex min-h-[44px] items-center text-[14px] text-ink-body">
+                      <span>Stop completely from this date (today: <span data-privacy="blur">{fmtEUR(contrib)}</span> a month).</span>
+                    </p>
+                  </div>
+                ) : (
+                  <NumberField
+                    label="Change in monthly savings"
+                    unit="€ / month"
+                    value={ev.contrib_change}
+                    onValueChange={v => update(i, { contrib_change: v })}
+                    hint="Negative if you will save less."
+                  />
+                )}
+                <NumberField
+                  label={ev.stops_contributions ? 'Monthly living costs from the portfolio' : 'Monthly cost'}
+                  unit="€ / month"
+                  value={ev.recurring_cost}
+                  onValueChange={v => update(i, { recurring_cost: v })}
+                />
+                <NumberField
+                  label="Monthly cost lasts"
+                  unit="months"
+                  integer
+                  value={ev.duration_months}
+                  onValueChange={v => update(i, { duration_months: Math.max(0, v) })}
+                  hint="0 means it never ends."
+                />
               </div>
-            </div>
+            </ItemCard>
           ))}
 
-          <button onClick={async () => {
-            setLifeEventLoading(true);
-            try {
-              const contrib = projData ? (parseFloat(projContrib) || projData.contribution) : 0;
-              const ret = projData ? (parseFloat(projReturn) || projData.return_pct) : 7;
-              const res = await fetch('/api/portfolio/life-events', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ events: lifeEvents, contribution: contrib, return_pct: ret }),
-              });
-              const data = await res.json();
-              setLifeEventResult(prev => ({ ...prev, ...data }));
-            } catch { /* ignore */ } finally { setLifeEventLoading(false); }
-          }} className="w-full apple-btn-primary" disabled={lifeEventLoading}>
-            {lifeEventLoading ? 'Simulating...' : 'Simulate Impact'}
+          <button type="button" onClick={simulate} className="apple-btn-primary min-h-[44px] w-full md:w-auto md:self-start" disabled={loading}>
+            {loading ? 'Simulating…' : 'Simulate impact'}
           </button>
         </div>
       )}
 
-      {lifeEventResult?.baseline && lifeEventResult.baseline.length > 0 && lifeEvents.length > 0 && (
-        <div className="space-y-3">
-          <div className="grid grid-cols-2 gap-2">
-            <div className="rounded-lg bg-parchment-deep p-2.5">
-              <p className="text-[11px] text-ink-muted">30-Year Impact</p>
-              <p className={`text-[13px] font-semibold tabular-nums ${(lifeEventResult.net_impact ?? 0) >= 0 ? 'text-sage' : 'text-claret'}`}>
-                {(lifeEventResult.net_impact ?? 0) >= 0 ? '+' : ''}{fmt(lifeEventResult.net_impact ?? 0)}
-              </p>
-            </div>
-            <div className="rounded-lg bg-parchment-deep p-2.5">
-              <p className="text-[11px] text-ink-muted">FIRE Date Shift</p>
-              <p className={`text-[13px] font-semibold tabular-nums ${(lifeEventResult.fire_shift_months ?? 0) <= 0 ? 'text-sage' : 'text-claret'}`}>
-                {(lifeEventResult.fire_shift_months ?? 0) === 0 ? 'No change' :
-                  `${Math.abs(lifeEventResult.fire_shift_months ?? 0)} mo ${(lifeEventResult.fire_shift_months ?? 0) > 0 ? 'later' : 'earlier'}`}
-              </p>
-            </div>
-          </div>
+      {error && (
+        <div className="mt-4">
+          <ErrorState message="The simulation couldn’t be run." details={error} onRetry={simulate} />
+        </div>
+      )}
 
-          {lifeEvents.length > 1 && (() => {
-            const sorted = [...lifeEvents].sort((a, b) => a.date.localeCompare(b.date));
-            return (
-              <div className="rounded-xl bg-parchment-deep px-3 py-2">
-                <p className="text-[11px] text-ink-muted mb-1.5">Event Timeline</p>
-                <div className="relative h-8">
-                  <div className="absolute left-0 right-0 top-1/2 h-px bg-divider" />
-                  {sorted.map((ev, i) => {
-                    const allDates = sorted.map(e => new Date(e.date + '-01').getTime());
-                    const minDate = Math.min(...allDates);
-                    const maxDate = Math.max(...allDates);
-                    const range = maxDate - minDate || 1;
-                    const pos = ((new Date(ev.date + '-01').getTime() - minDate) / range) * 100;
-                    const left = Math.max(5, Math.min(95, sorted.length === 1 ? 50 : pos));
-                    return (
-                      <div key={i} className="absolute -translate-x-1/2 flex flex-col items-center" style={{ left: `${left}%`, top: 0 }}>
-                        <span className="text-sm leading-none">{ICONS[ev.type] || '·'}</span>
-                        <span className="text-[9px] text-ink-muted mt-0.5 whitespace-nowrap">{ev.date}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            );
-          })()}
+      {hasResult && result && (
+        <div className="mt-6">
+          <MetricGrid>
+            <MetricCard
+              label="Effect after 30 years"
+              tone={netImpact > 0 ? 'positive' : netImpact < 0 ? 'negative' : 'neutral'}
+              value={fmtEUR(netImpact, { sign: true })}
+              sublabel="Net worth with events minus without"
+            />
+            <MetricCard
+              label="Financial independence"
+              money={false}
+              tone={shift < 0 ? 'positive' : shift > 0 ? 'negative' : 'neutral'}
+              value={shift === 0 ? 'No change' : `${fmtNum(Math.abs(shift))} months ${shift > 0 ? 'later' : 'earlier'}`}
+              sublabel="Measured against a fixed target of 36.000 € a year at a 3,5 % withdrawal rate"
+            />
+          </MetricGrid>
 
+          <SubHeading className="mt-6">Net worth with and without the events</SubHeading>
           {(() => {
-            const eventDates = lifeEvents.map(ev => ev.date);
-            const markLines = lifeEvents.map(ev => ({
-              xAxis: ev.date, label: { formatter: ICONS[ev.type] || ev.label, fontSize: 12, position: 'start' as const },
-              lineStyle: { type: 'dashed' as const, color: tc.divider, width: 1 },
-            }));
+            const dates = result.baseline.map(p => p.date);
+            // Events sit between quarterly points: mark the first point on or after the event.
+            const markLines = sorted.map((ev, n) => {
+              const idx = dates.findIndex(d => d >= ev.date);
+              return idx < 0 ? null : {
+                xAxis: idx,
+                label: { formatter: String(n + 1), fontSize: 12, color: tc.inkBody, position: 'end' as const },
+                lineStyle: { type: 'dashed' as const, color: tc.inkMuted, width: 1 },
+              };
+            }).filter((m): m is NonNullable<typeof m> => m !== null);
             return (
-              <EChartWrapper option={{
-                tooltip: { trigger: 'axis' as const, formatter: (params: unknown) => {
-                  const ps = params as { seriesName: string; value: number; axisValue: string }[];
-                  const evtIdx = eventDates.indexOf(ps[0].axisValue);
-                  const evtLabel = evtIdx >= 0 ? `<b>${lifeEvents[evtIdx].label}</b><br/>` : '';
-                  return `${evtLabel}${ps[0].axisValue}<br/>${ps.map(p => `${p.seriesName}: ${fmt(p.value)}`).join('<br/>')}`;
-                }},
-                legend: { data: ['Baseline', 'With Events'], bottom: 0, textStyle: { fontSize: 11 } },
-                grid: { top: 20, right: 10, bottom: 30, left: 50 },
-                xAxis: { type: 'category' as const, data: lifeEventResult.baseline.map(p => p.date), axisLabel: { fontSize: 10, interval: Math.max(Math.floor(lifeEventResult.baseline.length / 6) - 1, 1) } },
-                yAxis: { type: 'value' as const, axisLabel: { fontSize: 10, formatter: (v: number) => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1000 ? `${Math.round(v/1000)}K` : String(v) } },
-                series: [
-                  { name: 'Baseline', type: 'line' as const, data: lifeEventResult.baseline.map(p => p.value), smooth: true, lineStyle: { width: 2 }, itemStyle: { color: tc.inkMuted }, showSymbol: false },
-                  { name: 'With Events', type: 'line' as const, data: lifeEventResult.with_events.map(p => p.value), smooth: true, lineStyle: { width: 2 }, itemStyle: { color: tc.forest }, showSymbol: false,
-                    markLine: markLines.length > 0 ? { data: markLines, symbol: 'none' as const, silent: true } : undefined,
-                  },
-                ],
-              }} height="220px" />
+              <>
+                <EChartWrapper
+                  option={{
+                    tooltip: {
+                      trigger: 'axis' as const,
+                      formatter: (params: unknown) => {
+                        const ps = params as { seriesName: string; value: number; axisValue: string }[];
+                        if (!Array.isArray(ps) || ps.length === 0) return '';
+                        return `${escapeHtml(ps[0].axisValue)}<br/>${ps.map(p => `${escapeHtml(p.seriesName)}: ${fmtEUR(p.value)}`).join('<br/>')}`;
+                      },
+                    },
+                    legend: {
+                      bottom: 0,
+                      itemWidth: 16,
+                      data: [
+                        { name: 'Without events', icon: 'path://M0 4h5v2h-5zM7 4h5v2h-5zM14 4h5v2h-5z' },
+                        { name: 'With events', icon: 'path://M0 4h19v2h-19z' },
+                      ],
+                    },
+                    grid: { top: 28, right: 16, bottom: 44, left: 52 },
+                    xAxis: {
+                      type: 'category' as const,
+                      data: dates.map(d => monthLabel(d, true)),
+                      axisLabel: { fontSize: 11, interval: Math.max(Math.floor(dates.length / 6) - 1, 1) },
+                    },
+                    yAxis: { type: 'value' as const, name: '€', axisLabel: { fontSize: 11, formatter: (v: number) => fmtAxis(v) } },
+                    series: [
+                      {
+                        name: 'Without events', type: 'line' as const, data: result.baseline.map(p => p.value), smooth: true, showSymbol: false,
+                        color: tc.inkMuted, itemStyle: { color: tc.inkMuted }, lineStyle: { color: tc.inkMuted, width: 2, type: 'dashed' as const },
+                      },
+                      {
+                        name: 'With events', type: 'line' as const, data: result.with_events.map(p => p.value), smooth: true, showSymbol: false,
+                        color: tc.forest, itemStyle: { color: tc.forest }, lineStyle: { color: tc.forest, width: 2 },
+                        markLine: markLines.length > 0 ? { data: markLines, symbol: 'none' as const, silent: true } : undefined,
+                      },
+                    ],
+                  }}
+                  height="260px"
+                />
+                <ol className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[13px] text-ink-body">
+                  {sorted.map((ev, n) => (
+                    <li key={n}><span className="font-semibold text-ink">{n + 1}</span> {ev.label}, {monthLabel(ev.date)}</li>
+                  ))}
+                </ol>
+              </>
             );
           })()}
+          <p className="mt-2 text-[13px] text-ink-muted">
+            Assumes contributions of <span data-privacy="blur">{fmtEUR(contrib)}</span> a month and {fmtPct(ret)} growth a year — the values from the FIRE Calculator.
+          </p>
 
-          {(lifeEventResult.execution_plans ?? []).map((plan, pi) => (
-            <div key={pi} className="rounded-xl bg-parchment-deep p-3">
-              <p className="text-[15px] font-medium text-ink mb-2">
-                {plan.type === 'liquidation' ? 'Sell Order' : 'Invest Strategy'}: {plan.event_label}
-              </p>
-              {plan.type === 'liquidation' && plan.sell_order && (
+          {(result.execution_plans ?? []).map((plan, pi) => (
+            <div key={pi} className="mt-6">
+              <SubHeading>{plan.type === 'liquidation' ? 'What to sell for' : 'How to invest'}: {plan.event_label}</SubHeading>
+              {plan.type === 'liquidation' && Array.isArray(plan.sell_order) && (
                 <>
-                  <div className="space-y-1.5 mb-2">
+                  <ul className="mt-2 border-t border-divider">
                     {plan.sell_order.map((step, si) => (
-                      <div key={si} className="flex items-center justify-between text-[12px]">
-                        <div className="min-w-0 flex-1">
-                          <span className="font-medium text-ink">{step.name}</span>
-                          {step.buy_date && <span className="text-ink-muted ml-1 text-[11px]">({step.buy_date.slice(0, 4)})</span>}
-                          <span className="text-ink-muted ml-1">{step.effective_rate_pct}% tax</span>
+                      <li key={si} className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-0.5 border-b border-divider py-2.5 text-[14px]">
+                        <div className="min-w-0 flex-1 basis-48">
+                          <span className="font-medium text-ink break-words">{step.name}</span>
+                          <span className="block text-[13px] text-ink-muted">
+                            {step.buy_date ? `Bought ${step.buy_date.slice(0, 4)} · ` : ''}{fmtPct(step.effective_rate_pct)} effective tax
+                          </span>
                         </div>
-                        <div className="text-right shrink-0 ml-2 tabular-nums">
-                          <span className="text-ink">{fmt(step.sell_amount)}</span>
-                          <span className="text-claret ml-1">−{fmt(step.tax_due)}</span>
+                        <div className="text-right">
+                          <span className="text-ink" data-privacy="blur">Sell {fmtEUR(step.sell_amount)}</span>
+                          <span className="block text-[13px] text-ink-muted" data-privacy="blur">tax {fmtEUR(step.tax_due)}</span>
                         </div>
-                      </div>
+                      </li>
                     ))}
-                  </div>
-                  <div className="flex justify-between text-[13px] font-medium border-t border-divider pt-1.5">
-                    <span className="text-ink-muted">Total tax: <span className="text-claret">{fmt(plan.total_tax ?? 0)}</span></span>
-                    <span className="text-ink">Net: {fmt(plan.total_proceeds ?? 0)}</span>
-                  </div>
+                  </ul>
+                  <MetricGrid className="mt-3">
+                    <MetricCard label="Tax on the sales" value={fmtEUR(plan.total_tax ?? 0)} />
+                    <MetricCard label="Received after tax" value={fmtEUR(plan.total_proceeds ?? 0)} />
+                  </MetricGrid>
                 </>
               )}
               {plan.type === 'invest' && (
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="rounded-lg bg-parchment p-2">
-                    <p className="text-[11px] text-ink-muted">Lump Sum (10Y)</p>
-                    <p className="text-[13px] font-semibold tabular-nums text-ink">{fmt(plan.lump_sum_10y ?? 0)}</p>
-                  </div>
-                  <div className="rounded-lg bg-parchment p-2">
-                    <p className="text-[11px] text-ink-muted">12-Mo DCA (10Y)</p>
-                    <p className="text-[13px] font-semibold tabular-nums text-ink">{fmt(plan.dca_10y ?? 0)}</p>
-                  </div>
-                  <div className="col-span-2 text-[12px] text-ink-muted">
-                    Lump sum has a <span className={`font-medium ${(plan.lump_sum_edge_pct ?? 0) >= 0 ? 'text-sage' : 'text-claret'}`}>
-                      {(plan.lump_sum_edge_pct ?? 0) >= 0 ? '+' : ''}{plan.lump_sum_edge_pct ?? 0}%
-                    </span> edge over DCA after 10 years. Historically, lump sum beats DCA ~67% of the time.
-                  </div>
-                </div>
+                <>
+                  <MetricGrid className="mt-3">
+                    <MetricCard label="All at once" value={fmtEUR(plan.lump_sum_10y ?? 0)} sublabel="Value after 10 years" />
+                    <MetricCard label="Spread over 12 months" value={fmtEUR(plan.dca_10y ?? 0)} sublabel="Value after 10 years" />
+                  </MetricGrid>
+                  <p className="mt-3 text-[13px] text-ink-body">
+                    Investing all at once ends {fmtPct(Math.abs(plan.lump_sum_edge_pct ?? 0))} {(plan.lump_sum_edge_pct ?? 0) >= 0 ? 'ahead of' : 'behind'} spreading it out after 10 years.
+                    Historically, investing at once has come out ahead about two times in three.
+                  </p>
+                </>
               )}
             </div>
           ))}
         </div>
       )}
-
-      {lifeEvents.length === 0 && (
-        <p className="text-[13px] text-ink-muted">
-          Add a life event above to see how it impacts your wealth trajectory.
-        </p>
-      )}
-    </div>
+      {confirmDialog}
+    </Section>
   );
 }

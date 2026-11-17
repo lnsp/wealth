@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -15,7 +16,14 @@ func parseGermanDecimal(s string) (float64, error) {
 	}
 	s = strings.ReplaceAll(s, ".", "")  // remove thousands separator
 	s = strings.Replace(s, ",", ".", 1) // swap decimal separator
-	return strconv.ParseFloat(s, 64)
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("non-finite decimal %q", s)
+	}
+	return v, nil
 }
 
 // parseStandardDecimal converts standard-format numbers (1,234.56 or 1234.56) to float64.
@@ -25,7 +33,14 @@ func parseStandardDecimal(s string) (float64, error) {
 		return 0, nil
 	}
 	s = strings.ReplaceAll(s, ",", "") // remove thousands separator
-	return strconv.ParseFloat(s, 64)
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("non-finite decimal %q", s)
+	}
+	return v, nil
 }
 
 // parseGermanDate parses DD.MM.YYYY format.
@@ -75,8 +90,8 @@ func getField(record []string, idx int) string {
 	return strings.TrimSpace(record[idx])
 }
 
-// defaultDate returns today's date.
+// defaultDate returns today's date in UTC.
 func defaultDate() time.Time {
-	now := time.Now()
+	now := time.Now().UTC()
 	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 }

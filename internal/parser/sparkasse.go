@@ -44,7 +44,7 @@ func (p *SparkasseParser) Parse(records [][]string, accountID uuid.UUID) ([]Tran
 	}
 
 	// Optional columns
-	currencyCol := idx["währung"]
+	currencyCol := findColumn(idx, "währung", "waehrung", "currency")
 	counterpartyCol := findColumn(idx, "begünstigter/zahlungspflichtiger", "beguenstigter/zahlungspflichtiger", "begünstigter", "beguenstigter")
 	referenceCol := findColumn(idx, "verwendungszweck")
 	typeCol := findColumn(idx, "buchungstext")
@@ -81,24 +81,26 @@ func (p *SparkasseParser) Parse(records [][]string, accountID uuid.UUID) ([]Tran
 		buchungstext := getField(record, typeCol)
 
 		txnType := classifySparkasseTransaction(amount, buchungstext)
+		switch {
+		case txnType == "transfer" && amount >= 0:
+			txnType = "cash_transfer_in"
+		case txnType == "transfer" && amount < 0:
+			txnType = "cash_transfer_out"
+		case txnType == "interest" && amount < 0:
+			txnType = "fee"
+		case txnType == "fee" && amount > 0:
+			txnType = "deposit"
+		}
 
 		txn := Transaction{
 			AccountID:    accountID,
 			Date:         date,
 			Type:         txnType,
-			Amount:       amount,
+			Amount:       abs(amount),
 			Currency:     currency,
 			Counterparty: counterparty,
 			Reference:    reference,
 			Category:     categorizeByBuchungstext(buchungstext),
-		}
-
-		// Normalize: amount should be positive for deposits, negative for withdrawals
-		// But we store absolute amounts with type indicating direction
-		if amount < 0 && txnType == "withdrawal" {
-			txn.Amount = -amount
-		} else if amount > 0 && txnType == "deposit" {
-			txn.Amount = amount
 		}
 
 		txns = append(txns, txn)

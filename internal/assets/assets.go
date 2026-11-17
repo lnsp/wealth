@@ -6,6 +6,7 @@ package assets
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -80,12 +81,15 @@ type Asset struct {
 	Property     *analytics.PropertyValuation // set for everything else
 }
 
-// Numeric converts a nullable numeric to float64 (0 when NULL).
+// Numeric converts a nullable numeric to float64 (0 when NULL or non-finite).
 func Numeric(n pgtype.Numeric) float64 {
 	if !n.Valid {
 		return 0
 	}
 	f, _ := n.Float64Value()
+	if math.IsNaN(f.Float64) || math.IsInf(f.Float64, 0) {
+		return 0
+	}
 	return f.Float64
 }
 

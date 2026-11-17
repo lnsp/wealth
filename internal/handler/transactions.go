@@ -8,8 +8,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lnsp/wealth/internal/cashflow"
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
+
+func resolveTxnCategoryBucket(override, txType, cp, ref string) string {
+	return string(cashflow.BucketOf(cashflow.ResolveCategory(override, txType, cp, ref)))
+}
 
 type TransactionsHandler struct {
 	queries *db.Queries
@@ -55,9 +60,21 @@ func (h *TransactionsHandler) HandleList(w http.ResponseWriter, r *http.Request)
 
 	// Filter parameters
 	typeFilter := r.URL.Query().Get("type")
+	accountFilter := r.URL.Query().Get("account_id")
+	categoryFilter := r.URL.Query().Get("category")
+	categoryGroup := r.URL.Query().Get("category_group")
 	searchFilter := strings.ToLower(r.URL.Query().Get("search"))
 	dateFrom := r.URL.Query().Get("from") // YYYY-MM-DD
 	dateTo := r.URL.Query().Get("to")     // YYYY-MM-DD
+
+	var accountUUID uuid.UUID
+	hasAccountFilter := false
+	if accountFilter != "" {
+		if parsed, err := uuid.Parse(accountFilter); err == nil {
+			accountUUID = parsed
+			hasAccountFilter = true
+		}
+	}
 
 	var fromDate, toDate time.Time
 	if dateFrom != "" {
@@ -71,19 +88,45 @@ func (h *TransactionsHandler) HandleList(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// If filters are active, fetch all and filter in memory
-	if typeFilter != "" || searchFilter != "" || !fromDate.IsZero() || !toDate.IsZero() {
-		allTxns, err := h.queries.ListTransactions(r.Context(), db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	// If filters are active, fetch all (untruncated!) and filter consistently before pagination
+	if typeFilter != "" || hasAccountFilter || categoryFilter != "" || categoryGroup != "" || searchFilter != "" || !fromDate.IsZero() || !toDate.IsZero() {
+		exportRows, err := h.queries.ListAllTransactionsForExport(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 			return
+		}
+		allTxns := make([]db.ListTransactionsRow, len(exportRows))
+		for i, er := range exportRows {
+			allTxns[i] = db.ListTransactionsRow(er)
 		}
 		allTxns = h.filterTxnsByUser(r.Context(), allTxns)
 
 		var filtered []db.ListTransactionsRow
 		for _, t := range allTxns {
+			if hasAccountFilter && t.AccountID != accountUUID {
+				continue
+			}
 			if typeFilter != "" && t.Type != typeFilter {
 				continue
+			}
+			if categoryFilter != "" && (!t.Category.Valid || t.Category.String != categoryFilter) {
+				continue
+			}
+			if categoryGroup != "" {
+				cp, ref, ov := "", "", ""
+				if t.Counterparty.Valid {
+					cp = t.Counterparty.String
+				}
+				if t.Reference.Valid {
+					ref = t.Reference.String
+				}
+				if t.Category.Valid {
+					ov = t.Category.String
+				}
+				cat := resolveTxnCategoryBucket(ov, t.Type, cp, ref)
+				if cat != categoryGroup {
+					continue
+				}
 			}
 			if !fromDate.IsZero() && t.Date.Before(fromDate) {
 				continue
@@ -138,10 +181,14 @@ func (h *TransactionsHandler) HandleList(w http.ResponseWriter, r *http.Request)
 	allowedIDs := userAccountIDs(r.Context(), h.queries.DB())
 	if allowedIDs != nil {
 		// Must fetch all and filter in memory for user isolation
-		allTxns, err := h.queries.ListTransactions(r.Context(), db.ListTransactionsParams{Limit: 10000, Offset: 0})
+		exportRows, err := h.queries.ListAllTransactionsForExport(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 			return
+		}
+		allTxns := make([]db.ListTransactionsRow, len(exportRows))
+		for i, er := range exportRows {
+			allTxns[i] = db.ListTransactionsRow(er)
 		}
 		allTxns = h.filterTxnsByUser(r.Context(), allTxns)
 		total := int32(len(allTxns))

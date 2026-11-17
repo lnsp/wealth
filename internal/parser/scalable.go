@@ -40,6 +40,9 @@ func (p *ScalableCapitalParser) Detect(header []string) bool {
 }
 
 func (p *ScalableCapitalParser) Parse(records [][]string, accountID uuid.UUID) ([]Transaction, []RSUVest, error) {
+	p.warnings = nil
+	p.detectedAccountType = ""
+
 	if len(records) < 2 {
 		return nil, nil, fmt.Errorf("no data rows")
 	}
@@ -112,9 +115,17 @@ func (p *ScalableCapitalParser) Parse(records [][]string, accountID uuid.UUID) (
 		subType := strings.ToLower(getField(record, subTypeCol))
 		side := strings.ToLower(getField(record, sideCol))
 
-		quantity, _ := parseStandardDecimal(getField(record, quantityCol))
+		quantity, qtyErr := parseStandardDecimal(getField(record, quantityCol))
+		if qtyErr != nil {
+			p.warnings = append(p.warnings, fmt.Sprintf("row %d: skipped (invalid quantity)", i+2))
+			continue
+		}
 		// amount is signed in the CSV: negative = money out, positive = money in
-		signedAmount, _ := parseStandardDecimal(getField(record, amountCol))
+		signedAmount, amtErr := parseStandardDecimal(getField(record, amountCol))
+		if amtErr != nil {
+			p.warnings = append(p.warnings, fmt.Sprintf("row %d: skipped (invalid amount)", i+2))
+			continue
+		}
 
 		currency := "EUR"
 		if c := getField(record, currencyCol); c != "" {
@@ -158,7 +169,23 @@ func (p *ScalableCapitalParser) Parse(records [][]string, accountID uuid.UUID) (
 		}
 
 		txns = append(txns, txn)
-		nonTrade = append(nonTrade, typeRaw == "non_trade_security_transaction" && !isCancellation)
+		isCloseout := false
+		if typeRaw == "non_trade_security_transaction" && !isCancellation {
+			switch subType {
+			case "knock_out", "knockout", "redemption", "tilgung", "maturity", "liquidation", "close_out", "worthless", "ausbuchung":
+				isCloseout = true
+			case "transfer_out":
+				isCloseout = false
+			default:
+				// Scalable books knock-out/certificate close-outs under TRANSFER_IN or blank sub_type
+				// with a negative nominal booking amount (e.g. -0.001 * qty) or on a derivative ISIN.
+				// Genuine inbound ETF/stock transfers have signedAmount >= 0 and non-derivative class.
+				if signedAmount < 0 || ClassifyAsset(isin, desc) == "derivative" {
+					isCloseout = true
+				}
+			}
+		}
+		nonTrade = append(nonTrade, isCloseout)
 	}
 
 	return p.mergeCloseouts(txns, nonTrade), nil, nil

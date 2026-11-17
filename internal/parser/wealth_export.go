@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -68,14 +69,17 @@ func (p *WealthExportParser) Parse(records [][]string, accountID uuid.UUID) ([]T
 
 	// The exporter writes floats with `%.8f` / `%.4f` (US locale, dot
 	// decimal). Use plain strconv.ParseFloat rather than the German
-	// parser used elsewhere.
-	parseAmount := func(s string) float64 {
+	// parser used elsewhere, rejecting malformed or non-finite values.
+	parseAmount := func(field, s string) (float64, error) {
 		s = strings.TrimSpace(s)
 		if s == "" {
-			return 0
+			return 0, nil
 		}
-		v, _ := strconv.ParseFloat(s, 64)
-		return v
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0, fmt.Errorf("invalid %s %q", field, s)
+		}
+		return v, nil
 	}
 
 	var txns []Transaction
@@ -91,17 +95,37 @@ func (p *WealthExportParser) Parse(records [][]string, accountID uuid.UUID) ([]T
 		if err != nil {
 			return nil, nil, fmt.Errorf("row %d: parse date %q: %w", i+2, dateStr, err)
 		}
+		amt, err := parseAmount("amount", getField(record, amountCol))
+		if err != nil {
+			return nil, nil, fmt.Errorf("row %d: %w", i+2, err)
+		}
+		qty, err := parseAmount("quantity", getField(record, qtyCol))
+		if err != nil {
+			return nil, nil, fmt.Errorf("row %d: %w", i+2, err)
+		}
+		price, err := parseAmount("price", getField(record, priceCol))
+		if err != nil {
+			return nil, nil, fmt.Errorf("row %d: %w", i+2, err)
+		}
+		fee, err := parseAmount("fee", getField(record, feeCol))
+		if err != nil {
+			return nil, nil, fmt.Errorf("row %d: %w", i+2, err)
+		}
+		tax, err := parseAmount("tax", getField(record, taxCol))
+		if err != nil {
+			return nil, nil, fmt.Errorf("row %d: %w", i+2, err)
+		}
 
 		txn := Transaction{
-			AccountID: accountID,
-			Date:      date,
-			Type:      strings.TrimSpace(getField(record, typeCol)),
-			Amount:    parseAmount(getField(record, amountCol)),
-			Quantity:  parseAmount(getField(record, qtyCol)),
-			Price:     parseAmount(getField(record, priceCol)),
-			Fee:       parseAmount(getField(record, feeCol)),
-			Tax:       parseAmount(getField(record, taxCol)),
-			Currency:  strings.TrimSpace(getField(record, currencyCol)),
+			AccountID:    accountID,
+			Date:         date,
+			Type:         strings.TrimSpace(getField(record, typeCol)),
+			Amount:       amt,
+			Quantity:     qty,
+			Price:        price,
+			Fee:          fee,
+			Tax:          tax,
+			Currency:     strings.TrimSpace(getField(record, currencyCol)),
 			Counterparty: strings.TrimSpace(getField(record, counterpartyCol)),
 			SecurityISIN: strings.TrimSpace(getField(record, isinCol)),
 			Reference:    strings.TrimSpace(getField(record, refCol)),

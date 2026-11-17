@@ -53,11 +53,12 @@ type Asset struct {
 }
 
 type AssetImprovement struct {
-	ID          uuid.UUID      `json:"id"`
-	AssetID     uuid.UUID      `json:"asset_id"`
-	Date        time.Time      `json:"date"`
-	Amount      pgtype.Numeric `json:"amount"`
-	Description string         `json:"description"`
+	ID            uuid.UUID      `json:"id"`
+	AssetID       uuid.UUID      `json:"asset_id"`
+	Date          time.Time      `json:"date"`
+	Amount        pgtype.Numeric `json:"amount"`
+	Description   string         `json:"description"`
+	TransactionID *uuid.UUID     `json:"transaction_id"`
 }
 
 type AssetObservation struct {
@@ -264,6 +265,7 @@ type Security struct {
 	SectorWeights     json.RawMessage    `json:"sector_weights"`
 	CountryWeights    json.RawMessage    `json:"country_weights"`
 	MetadataUpdatedAt pgtype.Timestamptz `json:"metadata_updated_at"`
+	EquityPct         pgtype.Numeric     `json:"equity_pct"`
 }
 
 type TargetAllocation struct {

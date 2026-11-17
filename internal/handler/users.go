@@ -2,7 +2,11 @@ package handler
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -14,25 +18,48 @@ import (
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
 
+type pendingTOTPEntry struct {
+	secret    string
+	expiresAt time.Time
+}
+
 type UsersHandler struct {
-	queries    *db.Queries
-	auth       *auth.Auth
-	cryptoKey  []byte // AES-256 key for TOTP secret encryption
+	queries     *db.Queries
+	auth        *auth.Auth
+	cryptoKey   []byte // AES-256 key for TOTP secret encryption
+	totpMu      sync.Mutex
+	pendingTOTP map[uuid.UUID]pendingTOTPEntry
 }
 
 func NewUsersHandler(q *db.Queries, a *auth.Auth, sessionSecret string) *UsersHandler {
-	return &UsersHandler{queries: q, auth: a, cryptoKey: auth.DeriveKey(sessionSecret)}
+	return &UsersHandler{
+		queries:     q,
+		auth:        a,
+		cryptoKey:   auth.DeriveKey(sessionSecret),
+		pendingTOTP: make(map[uuid.UUID]pendingTOTPEntry),
+	}
 }
 
-// requireAdmin checks if the requesting user has the admin role.
-// Returns true if authorized, false if denied (and writes 403 response).
+func (h *UsersHandler) callerUserID(r *http.Request) string {
+	if id := UserIDFromContext(r.Context()); id != "" {
+		return id
+	}
+	if h.auth != nil {
+		return h.auth.UserIDFromRequest(r)
+	}
+	return ""
+}
+
+// requireAdmin checks if the requesting user has an active admin role.
+// Returns true if authorized, false if denied (and writes error response).
 func (h *UsersHandler) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	if h.auth == nil {
 		return true // auth disabled
 	}
-	userID := h.auth.UserIDFromRequest(r)
+	userID := h.callerUserID(r)
 	if userID == "" {
-		return true // no auth context (dev mode)
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return false
 	}
 	uid, err := uuid.Parse(userID)
 	if err != nil {
@@ -40,8 +67,8 @@ func (h *UsersHandler) requireAdmin(w http.ResponseWriter, r *http.Request) bool
 		return false
 	}
 	user, err := h.queries.GetUserByID(r.Context(), uid)
-	if err != nil {
-		writeError(w, http.StatusForbidden, "user not found")
+	if err != nil || !user.IsActive {
+		writeError(w, http.StatusForbidden, "user not found or inactive")
 		return false
 	}
 	if user.Role != "admin" {
@@ -52,12 +79,14 @@ func (h *UsersHandler) requireAdmin(w http.ResponseWriter, r *http.Request) bool
 }
 
 func (h *UsersHandler) HandleListUsers(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAdmin(w, r) {
+		return
+	}
 	users, err := h.queries.ListUsers(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list users: "+err.Error())
 		return
 	}
-	// Enrich with TOTP status
 	type userWithTOTP struct {
 		ID          string `json:"id"`
 		Username    string `json:"username"`
@@ -96,6 +125,7 @@ func (h *UsersHandler) HandleCreateUser(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
+	req.Username = strings.TrimSpace(req.Username)
 	if req.Username == "" || req.Password == "" {
 		writeError(w, http.StatusBadRequest, "username and password are required")
 		return
@@ -109,6 +139,10 @@ func (h *UsersHandler) HandleCreateUser(w http.ResponseWriter, r *http.Request) 
 	}
 	if len(req.Password) < 8 {
 		writeError(w, http.StatusBadRequest, "password must be at least 8 characters")
+		return
+	}
+	if len([]byte(req.Password)) > 72 {
+		writeError(w, http.StatusBadRequest, "password must be at most 72 bytes")
 		return
 	}
 
@@ -133,6 +167,19 @@ func (h *UsersHandler) HandleCreateUser(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (h *UsersHandler) hasOtherActiveAdmin(r *http.Request, excludeID uuid.UUID) (bool, error) {
+	users, err := h.queries.ListUsers(r.Context())
+	if err != nil {
+		return false, err
+	}
+	for _, u := range users {
+		if u.ID != excludeID && u.IsActive && u.Role == "admin" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (h *UsersHandler) HandleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAdmin(w, r) {
 		return
@@ -142,10 +189,33 @@ func (h *UsersHandler) HandleDeleteUser(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid user id")
 		return
 	}
+	if callerID := h.callerUserID(r); callerID != "" && callerID == id.String() {
+		writeError(w, http.StatusBadRequest, "cannot delete your own user account")
+		return
+	}
+	target, err := h.queries.GetUserByID(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	if target.Role == "admin" && target.IsActive {
+		otherAdmin, err := h.hasOtherActiveAdmin(r, id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "check admins: "+err.Error())
+			return
+		}
+		if !otherAdmin {
+			writeError(w, http.StatusBadRequest, "cannot delete the last active admin")
+			return
+		}
+	}
 	if err := h.queries.DeleteUser(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, "delete user: "+err.Error())
 		return
 	}
+	h.totpMu.Lock()
+	delete(h.pendingTOTP, id)
+	h.totpMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -163,6 +233,23 @@ func (h *UsersHandler) HandleToggleUser(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "user not found")
 		return
 	}
+	if user.IsActive {
+		if callerID := h.callerUserID(r); callerID != "" && callerID == id.String() {
+			writeError(w, http.StatusBadRequest, "cannot deactivate your own user account")
+			return
+		}
+		if user.Role == "admin" {
+			otherAdmin, err := h.hasOtherActiveAdmin(r, id)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "check admins: "+err.Error())
+				return
+			}
+			if !otherAdmin {
+				writeError(w, http.StatusBadRequest, "cannot deactivate the last active admin")
+				return
+			}
+		}
+	}
 	if err := h.queries.UpdateUserActive(r.Context(), db.UpdateUserActiveParams{ID: id, IsActive: !user.IsActive}); err != nil {
 		writeError(w, http.StatusInternalServerError, "toggle user: "+err.Error())
 		return
@@ -170,44 +257,51 @@ func (h *UsersHandler) HandleToggleUser(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"is_active": !user.IsActive})
 }
 
-// requireSelfOrAdmin checks if the requesting user is either the target user or an admin.
-func (h *UsersHandler) requireSelfOrAdmin(w http.ResponseWriter, r *http.Request, targetID uuid.UUID) bool {
+// requireSelfOrAdmin checks if the requesting user is either the target user or an active admin.
+func (h *UsersHandler) requireSelfOrAdmin(w http.ResponseWriter, r *http.Request, targetID uuid.UUID) (*db.User, bool) {
 	if h.auth == nil {
-		return true
+		return nil, true
 	}
-	userID := h.auth.UserIDFromRequest(r)
+	userID := h.callerUserID(r)
 	if userID == "" {
-		return true // no auth context (dev mode)
-	}
-	if userID == targetID.String() {
-		return true // acting on own account
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return nil, false
 	}
 	uid, err := uuid.Parse(userID)
 	if err != nil {
 		writeError(w, http.StatusForbidden, "invalid session")
-		return false
+		return nil, false
 	}
-	user, err := h.queries.GetUserByID(r.Context(), uid)
-	if err != nil || user.Role != "admin" {
-		writeError(w, http.StatusForbidden, "can only manage your own 2FA or require admin")
-		return false
+	caller, err := h.queries.GetUserByID(r.Context(), uid)
+	if err != nil || !caller.IsActive {
+		writeError(w, http.StatusForbidden, "invalid or inactive session")
+		return nil, false
 	}
-	return true
+	if uid == targetID || caller.Role == "admin" {
+		return &caller, true
+	}
+	writeError(w, http.StatusForbidden, "can only manage your own 2FA or require admin")
+	return nil, false
 }
 
-// HandleSetupTOTP generates a TOTP secret and returns the provisioning URI.
+// HandleSetupTOTP generates a pending TOTP secret in memory and returns the provisioning URI.
+// The database secret is only updated once HandleVerifyTOTP confirms a valid 6-digit code.
 func (h *UsersHandler) HandleSetupTOTP(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid user id")
 		return
 	}
-	if !h.requireSelfOrAdmin(w, r, id) {
+	if _, ok := h.requireSelfOrAdmin(w, r, id); !ok {
 		return
 	}
 	user, err := h.queries.GetUserByID(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	if user.TOTPEnabled {
+		writeError(w, http.StatusConflict, "2FA is already enabled — disable it first")
 		return
 	}
 
@@ -220,18 +314,18 @@ func (h *UsersHandler) HandleSetupTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Encrypt the TOTP secret before storing
-	encrypted, err := auth.EncryptSecret(key.Secret(), h.cryptoKey)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encrypt TOTP secret: "+err.Error())
-		return
+	now := time.Now()
+	h.totpMu.Lock()
+	for uid, entry := range h.pendingTOTP {
+		if now.After(entry.expiresAt) {
+			delete(h.pendingTOTP, uid)
+		}
 	}
-	if err := h.queries.SetUserTOTPSecret(r.Context(), db.SetUserTOTPSecretParams{
-		ID: id, TOTPSecret: pgtype.Text{String: encrypted, Valid: true},
-	}); err != nil {
-		writeError(w, http.StatusInternalServerError, "store TOTP secret: "+err.Error())
-		return
+	h.pendingTOTP[id] = pendingTOTPEntry{
+		secret:    key.Secret(),
+		expiresAt: now.Add(10 * time.Minute),
 	}
+	h.totpMu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"secret": key.Secret(),
@@ -239,14 +333,14 @@ func (h *UsersHandler) HandleSetupTOTP(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleVerifyTOTP verifies a TOTP code and enables 2FA for the user.
+// HandleVerifyTOTP verifies a TOTP code and atomically stores + enables 2FA for the user.
 func (h *UsersHandler) HandleVerifyTOTP(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid user id")
 		return
 	}
-	if !h.requireSelfOrAdmin(w, r, id) {
+	if _, ok := h.requireSelfOrAdmin(w, r, id); !ok {
 		return
 	}
 
@@ -263,44 +357,118 @@ func (h *UsersHandler) HandleVerifyTOTP(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "user not found")
 		return
 	}
-	if !user.TOTPSecret.Valid || user.TOTPSecret.String == "" {
+	if user.TOTPEnabled {
+		h.totpMu.Lock()
+		delete(h.pendingTOTP, id)
+		h.totpMu.Unlock()
+		writeError(w, http.StatusConflict, "2FA is already enabled — disable it first")
+		return
+	}
+
+	now := time.Now()
+	h.totpMu.Lock()
+	pending, hasPending := h.pendingTOTP[id]
+	if hasPending && now.After(pending.expiresAt) {
+		delete(h.pendingTOTP, id)
+		hasPending = false
+	}
+	h.totpMu.Unlock()
+
+	var secret string
+	if hasPending {
+		secret = pending.secret
+	} else if !user.TOTPEnabled && user.TOTPSecret.Valid && user.TOTPSecret.String != "" {
+		secret, err = auth.DecryptSecret(user.TOTPSecret.String, h.cryptoKey)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "decrypt TOTP secret: "+err.Error())
+			return
+		}
+	} else {
 		writeError(w, http.StatusBadRequest, "TOTP not set up — call setup first")
 		return
 	}
 
-	// Decrypt the stored TOTP secret
-	secret, err := auth.DecryptSecret(user.TOTPSecret.String, h.cryptoKey)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "decrypt TOTP secret: "+err.Error())
-		return
-	}
-
-	if !totp.Validate(body.Code, secret) {
+	if !totp.Validate(strings.TrimSpace(body.Code), secret) {
 		writeError(w, http.StatusUnauthorized, "invalid TOTP code")
 		return
 	}
 
-	if err := h.queries.EnableUserTOTP(r.Context(), id); err != nil {
+	encrypted, err := auth.EncryptSecret(secret, h.cryptoKey)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "encrypt TOTP secret: "+err.Error())
+		return
+	}
+
+	if err := withTx(r.Context(), h.queries, func(qtx *db.Queries) error {
+		if err := qtx.SetUserTOTPSecret(r.Context(), db.SetUserTOTPSecretParams{
+			ID: id, TOTPSecret: pgtype.Text{String: encrypted, Valid: true},
+		}); err != nil {
+			return err
+		}
+		return qtx.EnableUserTOTP(r.Context(), id)
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "enable TOTP: "+err.Error())
 		return
 	}
 
+	h.totpMu.Lock()
+	delete(h.pendingTOTP, id)
+	h.totpMu.Unlock()
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "totp_enabled"})
 }
 
-// HandleDisableTOTP disables 2FA for a user.
+// HandleDisableTOTP disables 2FA for a user after verifying a TOTP code or caller password.
 func (h *UsersHandler) HandleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid user id")
 		return
 	}
-	if !h.requireSelfOrAdmin(w, r, id) {
+	caller, ok := h.requireSelfOrAdmin(w, r, id)
+	if !ok {
 		return
 	}
+
+	var body struct {
+		Code     string `json:"code"`
+		Password string `json:"password"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+	}
+
+	target, err := h.queries.GetUserByID(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+
+	if h.auth != nil && target.TOTPEnabled {
+		verified := false
+		if strings.TrimSpace(body.Code) != "" && target.TOTPSecret.Valid && target.TOTPSecret.String != "" {
+			if secret, decErr := auth.DecryptSecret(target.TOTPSecret.String, h.cryptoKey); decErr == nil {
+				verified = totp.Validate(strings.TrimSpace(body.Code), secret)
+			}
+		}
+		if !verified && body.Password != "" && caller != nil {
+			verified = bcrypt.CompareHashAndPassword([]byte(caller.PasswordHash), []byte(body.Password)) == nil
+		}
+		if !verified {
+			writeError(w, http.StatusUnauthorized, "current password or TOTP code is required to disable 2FA")
+			return
+		}
+	}
+
 	if err := h.queries.DisableUserTOTP(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, "disable TOTP: "+err.Error())
 		return
 	}
+	h.totpMu.Lock()
+	delete(h.pendingTOTP, id)
+	h.totpMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "totp_disabled"})
 }

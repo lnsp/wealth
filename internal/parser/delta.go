@@ -116,16 +116,16 @@ func (p *DeltaParser) Parse(records [][]string, accountID uuid.UUID) ([]Transact
 		way := strings.ToUpper(getField(record, wayCol))
 		quoteAmount, _ := parseStandardDecimal(getField(record, quoteAmountCol))
 		quoteCurrency := getField(record, quoteCurrencyCol)
-		feeAmount, _ := parseStandardDecimal(getField(record, feeAmountCol))
-		_, feeCurName := splitDeltaSymbol(getField(record, feeCurrencyCol))
-		_ = feeCurName // currently surfaced only via the fee amount
+		rawFeeAmount, _ := parseStandardDecimal(getField(record, feeAmountCol))
+		feeCurSymbol, _ := splitDeltaSymbol(getField(record, feeCurrencyCol))
 
 		var (
-			txnType  string
-			quantity float64
-			amount   float64
-			price    float64
-			currency string
+			txnType   string
+			quantity  float64
+			amount    float64
+			price     float64
+			currency  string
+			feeAmount float64
 		)
 
 		switch way {
@@ -167,6 +167,19 @@ func (p *DeltaParser) Parse(records [][]string, accountID uuid.UUID) ([]Transact
 
 		if currency == "" {
 			currency = "EUR"
+		}
+
+		if rawFeeAmount != 0 {
+			switch {
+			case feeCurSymbol == "" || strings.EqualFold(feeCurSymbol, currency):
+				feeAmount = abs(rawFeeAmount)
+			case strings.EqualFold(feeCurSymbol, baseSymbol) && price > 0:
+				// Native crypto fee denominated in the traded base asset: convert to quote currency.
+				feeAmount = abs(rawFeeAmount) * price
+			default:
+				p.warnings = append(p.warnings,
+					fmt.Sprintf("row %d: omitted fee %g %s (different from quote currency %s)", rowNum, rawFeeAmount, feeCurSymbol, currency))
+			}
 		}
 
 		// Custom hash includes the full ISO timestamp + Way + ISIN + base

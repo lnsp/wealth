@@ -138,6 +138,10 @@ func (p PropertyValuation) advance(s propertyState, t time.Time) propertyState {
 	s.land *= growth
 	if from := p.remainingLife(s.date); from > 0 {
 		s.building *= growth * p.remainingLife(t) / from
+	} else if s.building > 0 {
+		// Post-useful-life improvement or re-anchored building value grows with market drift
+		// rather than cliff-dropping to 0 on the day after the improvement.
+		s.building *= growth
 	} else {
 		s.building = 0
 	}
@@ -166,7 +170,7 @@ func (p PropertyValuation) Components(t time.Time) (land, building float64) {
 
 	var events []propertyEvent
 	for _, im := range p.Improvements {
-		if im.Date.After(p.PurchaseDate) && !im.Date.After(t) {
+		if !im.Date.Before(p.PurchaseDate) && !im.Date.After(t) {
 			events = append(events, propertyEvent{date: im.Date, improve: im.Amount})
 		}
 	}

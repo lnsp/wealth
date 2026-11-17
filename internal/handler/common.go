@@ -3,41 +3,78 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
 
-// fmtEUR formats a number with German thousands separator (e.g. 62348 -> "62.348")
+// fmtEUR formats a number with German thousands separator (e.g. 62348 -> "62.348").
+// Safely handles NaN, Inf, and large magnitudes without int64 overflow or recursion.
 func fmtEUR(v float64) string {
-	n := int64(math.Round(v))
-	if n < 0 {
-		return "-" + fmtEUR(-v)
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return "0"
 	}
-	s := fmt.Sprintf("%d", n)
-	if len(s) <= 3 {
-		return s
+	rounded := math.Round(v)
+	neg := rounded < 0
+	absVal := math.Abs(rounded)
+
+	var s string
+	if absVal >= 1e15 {
+		s = strconv.FormatFloat(absVal, 'f', 0, 64)
+	} else {
+		s = strconv.FormatInt(int64(absVal), 10)
 	}
-	// Insert dots every 3 digits from the right
-	result := make([]byte, 0, len(s)+len(s)/3)
-	for i, c := range s {
-		if i > 0 && (len(s)-i)%3 == 0 {
-			result = append(result, '.')
+	if s == "0" {
+		return "0"
+	}
+	if len(s) > 3 {
+		result := make([]byte, 0, len(s)+len(s)/3)
+		for i, c := range s {
+			if i > 0 && (len(s)-i)%3 == 0 {
+				result = append(result, '.')
+			}
+			result = append(result, byte(c))
 		}
-		result = append(result, byte(c))
+		s = string(result)
 	}
-	return string(result)
+	if neg {
+		return "-" + s
+	}
+	return s
+}
+
+// parseFiniteFloat parses s into a finite float64, rejecting NaN and ±Inf.
+func parseFiniteFloat(s string) (float64, error) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, errors.New("non-finite float")
+	}
+	return v, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	buf, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("ERROR [500]: marshal JSON response: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"internal server error"}` + "\n"))
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(buf)
+	_, _ = w.Write([]byte("\n"))
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
@@ -57,43 +94,38 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-// userAccountIDs returns account IDs belonging to the current user.
-// Returns nil if no user context (auth disabled / dev mode) — caller should skip filtering.
-func userAccountIDs(ctx context.Context, pool db.DBTX) []uuid.UUID {
-	userID := UserIDFromContext(ctx)
-	if userID == "" {
-		return nil // no auth — don't filter
-	}
-	uid, err := uuid.Parse(userID)
-	if err != nil {
-		return nil
-	}
-	rows, err := pool.Query(ctx, "SELECT id FROM accounts WHERE user_id = $1", uid)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var ids []uuid.UUID
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err == nil {
-			ids = append(ids, id)
-		}
-	}
-	return ids
+type txBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// isUserAccount checks if the given account ID belongs to the current user.
-// Returns true if no auth context (dev mode) or if the account belongs to the user.
-func isUserAccount(ctx context.Context, pool db.DBTX, accountID uuid.UUID) bool {
-	ids := userAccountIDs(ctx, pool)
-	if ids == nil {
-		return true // no auth — allow all
+// withTx executes fn inside a database transaction when q.DB() supports Begin.
+func withTx(ctx context.Context, q *db.Queries, fn func(qtx *db.Queries) error) error {
+	if q == nil {
+		return fn(nil)
 	}
-	for _, id := range ids {
-		if id == accountID {
-			return true
-		}
+	b, ok := q.DB().(txBeginner)
+	if !ok {
+		return fn(q)
 	}
-	return false
+	tx, err := b.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := fn(q.WithTx(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// userAccountIDs returns nil under single-user / single-household scope so all
+// authenticated logins access the shared household portfolio without per-user filtering.
+func userAccountIDs(_ context.Context, _ db.DBTX) []uuid.UUID {
+	return nil
+}
+
+// isUserAccount returns true under single-user / single-household scope;
+// request authentication is enforced upstream by AuthMiddlewareWithQueries.
+func isUserAccount(_ context.Context, _ db.DBTX, _ uuid.UUID) bool {
+	return true
 }

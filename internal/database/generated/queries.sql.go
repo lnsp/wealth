@@ -44,6 +44,51 @@ func (q *Queries) CountTransactions(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const countTransactionsByAccount = `-- name: CountTransactionsByAccount :one
+SELECT count(*) FROM transactions WHERE account_id = $1
+`
+
+func (q *Queries) CountTransactionsByAccount(ctx context.Context, accountID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countTransactionsByAccount, accountID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countTransactionsFiltered = `-- name: CountTransactionsFiltered :one
+SELECT count(*)
+FROM transactions t
+WHERE ($1::uuid IS NULL OR t.account_id = $1)
+  AND ($2::text IS NULL OR t.type = $2)
+  AND ($3::date IS NULL OR t.date >= $3)
+  AND ($4::date IS NULL OR t.date <= $4)
+  AND ($5::text IS NULL OR
+       COALESCE(t.counterparty, '') ILIKE '%' || $5 || '%' OR
+       COALESCE(t.security_isin, '') ILIKE '%' || $5 || '%' OR
+       COALESCE(t.reference, '') ILIKE '%' || $5 || '%')
+`
+
+type CountTransactionsFilteredParams struct {
+	AccountID *uuid.UUID  `json:"account_id"`
+	TxType    pgtype.Text `json:"tx_type"`
+	FromDate  pgtype.Date `json:"from_date"`
+	ToDate    pgtype.Date `json:"to_date"`
+	Search    pgtype.Text `json:"search"`
+}
+
+func (q *Queries) CountTransactionsFiltered(ctx context.Context, arg CountTransactionsFilteredParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countTransactionsFiltered,
+		arg.AccountID,
+		arg.TxType,
+		arg.FromDate,
+		arg.ToDate,
+		arg.Search,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countUnreadNotifications = `-- name: CountUnreadNotifications :one
 SELECT count(*) FROM notifications WHERE is_read = false
 `
@@ -196,16 +241,17 @@ func (q *Queries) CreateAsset(ctx context.Context, arg CreateAssetParams) (Asset
 }
 
 const createAssetImprovement = `-- name: CreateAssetImprovement :one
-INSERT INTO asset_improvements (asset_id, date, amount, description)
-VALUES ($1, $2, $3, $4)
-RETURNING id, asset_id, date, amount, description
+INSERT INTO asset_improvements (asset_id, date, amount, description, transaction_id)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, asset_id, date, amount, description, transaction_id
 `
 
 type CreateAssetImprovementParams struct {
-	AssetID     uuid.UUID      `json:"asset_id"`
-	Date        time.Time      `json:"date"`
-	Amount      pgtype.Numeric `json:"amount"`
-	Description string         `json:"description"`
+	AssetID       uuid.UUID      `json:"asset_id"`
+	Date          time.Time      `json:"date"`
+	Amount        pgtype.Numeric `json:"amount"`
+	Description   string         `json:"description"`
+	TransactionID *uuid.UUID     `json:"transaction_id"`
 }
 
 func (q *Queries) CreateAssetImprovement(ctx context.Context, arg CreateAssetImprovementParams) (AssetImprovement, error) {
@@ -214,6 +260,7 @@ func (q *Queries) CreateAssetImprovement(ctx context.Context, arg CreateAssetImp
 		arg.Date,
 		arg.Amount,
 		arg.Description,
+		arg.TransactionID,
 	)
 	var i AssetImprovement
 	err := row.Scan(
@@ -222,6 +269,7 @@ func (q *Queries) CreateAssetImprovement(ctx context.Context, arg CreateAssetImp
 		&i.Date,
 		&i.Amount,
 		&i.Description,
+		&i.TransactionID,
 	)
 	return i, err
 }
@@ -532,8 +580,9 @@ func (q *Queries) DeleteAsset(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-const deleteAssetImprovement = `-- name: DeleteAssetImprovement :exec
+const deleteAssetImprovement = `-- name: DeleteAssetImprovement :one
 DELETE FROM asset_improvements WHERE id = $1 AND asset_id = $2
+RETURNING transaction_id
 `
 
 type DeleteAssetImprovementParams struct {
@@ -541,9 +590,11 @@ type DeleteAssetImprovementParams struct {
 	AssetID uuid.UUID `json:"asset_id"`
 }
 
-func (q *Queries) DeleteAssetImprovement(ctx context.Context, arg DeleteAssetImprovementParams) error {
-	_, err := q.db.Exec(ctx, deleteAssetImprovement, arg.ID, arg.AssetID)
-	return err
+func (q *Queries) DeleteAssetImprovement(ctx context.Context, arg DeleteAssetImprovementParams) (*uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, deleteAssetImprovement, arg.ID, arg.AssetID)
+	var transaction_id *uuid.UUID
+	err := row.Scan(&transaction_id)
+	return transaction_id, err
 }
 
 const deleteAssetObservation = `-- name: DeleteAssetObservation :exec
@@ -566,6 +617,15 @@ DELETE FROM asset_transactions WHERE transaction_id = $1
 
 func (q *Queries) DeleteAssetTransaction(ctx context.Context, transactionID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteAssetTransaction, transactionID)
+	return err
+}
+
+const deleteETFHoldingsByETF = `-- name: DeleteETFHoldingsByETF :exec
+DELETE FROM etf_holdings WHERE etf_isin = $1
+`
+
+func (q *Queries) DeleteETFHoldingsByETF(ctx context.Context, etfIsin string) error {
+	_, err := q.db.Exec(ctx, deleteETFHoldingsByETF, etfIsin)
 	return err
 }
 
@@ -754,6 +814,52 @@ func (q *Queries) GetAccountByInstitutionAndType(ctx context.Context, arg GetAcc
 	return i, err
 }
 
+const getAccountCashByCurrency = `-- name: GetAccountCashByCurrency :many
+SELECT
+    currency,
+    COALESCE(SUM(
+        CASE
+            WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
+                THEN amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+            WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
+                THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+            WHEN type = 'transfer' AND security_isin IS NULL
+                THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+            ELSE 0
+        END
+    ), 0)::numeric(18,4) AS balance,
+    COALESCE(BOOL_OR(type IN ('deposit', 'withdrawal', 'cash_transfer_in', 'cash_transfer_out')), false)::boolean AS has_explicit_cash
+FROM transactions
+WHERE account_id = $1
+GROUP BY currency
+`
+
+type GetAccountCashByCurrencyRow struct {
+	Currency        string         `json:"currency"`
+	Balance         pgtype.Numeric `json:"balance"`
+	HasExplicitCash bool           `json:"has_explicit_cash"`
+}
+
+func (q *Queries) GetAccountCashByCurrency(ctx context.Context, accountID uuid.UUID) ([]GetAccountCashByCurrencyRow, error) {
+	rows, err := q.db.Query(ctx, getAccountCashByCurrency, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetAccountCashByCurrencyRow{}
+	for rows.Next() {
+		var i GetAccountCashByCurrencyRow
+		if err := rows.Scan(&i.Currency, &i.Balance, &i.HasExplicitCash); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getAsset = `-- name: GetAsset :one
 SELECT id, kind, name, list_price, purchase_price, purchase_date, first_registration, purchase_odometer_km, annual_depreciation, km_depreciation, expected_km_per_year, created_at, purchase_costs, notarized_date, land_value, year_built, useful_life_years, price_drift, self_used, living_area_m2, details, price_index FROM assets WHERE id = $1
 `
@@ -789,21 +895,42 @@ func (q *Queries) GetAsset(ctx context.Context, id uuid.UUID) (Asset, error) {
 }
 
 const getCashBalance = `-- name: GetCashBalance :one
-SELECT COALESCE(SUM(
+WITH raw_cash AS (
+    SELECT
+        COALESCE(SUM(
+            CASE
+                WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
+                    THEN amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
+                    THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                WHEN type = 'transfer' AND security_isin IS NULL
+                    THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                -- security transfers (in-kind) have no cash impact
+                ELSE 0
+            END
+        ), 0)::numeric(18,4) AS balance,
+        COALESCE(BOOL_OR(type IN ('deposit', 'withdrawal', 'cash_transfer_in', 'cash_transfer_out')), false) AS has_explicit_cash
+    FROM transactions
+    WHERE account_id = $1
+)
+SELECT (
     CASE
-        WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in') THEN amount
-        WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out') THEN -amount
-        WHEN type = 'transfer' AND security_isin IS NULL THEN -amount
-        -- security transfers (in-kind) have no cash impact
-        ELSE 0
+        WHEN rc.balance < 0
+         AND NOT rc.has_explicit_cash
+         AND EXISTS (
+             SELECT 1 FROM accounts a
+             WHERE a.id = $1
+               AND a.type IN ('brokerage', 'crypto', 'pension', 'precious_metals')
+         )
+        THEN 0::numeric(18,4)
+        ELSE rc.balance
     END
-), 0)::numeric(18,4) as balance
-FROM transactions
-WHERE account_id = $1
+)::numeric(18,4) AS balance
+FROM raw_cash rc
 `
 
-func (q *Queries) GetCashBalance(ctx context.Context, accountID uuid.UUID) (pgtype.Numeric, error) {
-	row := q.db.QueryRow(ctx, getCashBalance, accountID)
+func (q *Queries) GetCashBalance(ctx context.Context, id uuid.UUID) (pgtype.Numeric, error) {
+	row := q.db.QueryRow(ctx, getCashBalance, id)
 	var balance pgtype.Numeric
 	err := row.Scan(&balance)
 	return balance, err
@@ -917,7 +1044,7 @@ func (q *Queries) GetPriceAtDate(ctx context.Context, arg GetPriceAtDateParams) 
 }
 
 const getSecurity = `-- name: GetSecurity :one
-SELECT isin, wkn, symbol, name, asset_class, currency, ter, sector_weights, country_weights, metadata_updated_at FROM securities WHERE isin = $1
+SELECT isin, wkn, symbol, name, asset_class, currency, ter, sector_weights, country_weights, metadata_updated_at, equity_pct FROM securities WHERE isin = $1
 `
 
 func (q *Queries) GetSecurity(ctx context.Context, isin string) (Security, error) {
@@ -934,6 +1061,7 @@ func (q *Queries) GetSecurity(ctx context.Context, isin string) (Security, error
 		&i.SectorWeights,
 		&i.CountryWeights,
 		&i.MetadataUpdatedAt,
+		&i.EquityPct,
 	)
 	return i, err
 }
@@ -1180,7 +1308,11 @@ func (q *Queries) InsertRSUVest(ctx context.Context, arg InsertRSUVestParams) er
 const insertTransaction = `-- name: InsertTransaction :exec
 INSERT INTO transactions (account_id, date, type, security_isin, quantity, price, amount, fee, tax, currency, counterparty, reference, category, import_hash)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-ON CONFLICT (import_hash) DO UPDATE SET type = EXCLUDED.type
+ON CONFLICT (import_hash) DO UPDATE SET
+    type = EXCLUDED.type,
+    security_isin = COALESCE(EXCLUDED.security_isin, transactions.security_isin),
+    quantity = CASE WHEN EXCLUDED.quantity IS NOT NULL AND EXCLUDED.quantity > 0 THEN EXCLUDED.quantity ELSE transactions.quantity END,
+    price = CASE WHEN EXCLUDED.price IS NOT NULL AND EXCLUDED.price > 0 THEN EXCLUDED.price ELSE transactions.price END
 `
 
 type InsertTransactionParams struct {
@@ -1328,6 +1460,60 @@ func (q *Queries) ListActivePriceAlerts(ctx context.Context) ([]ListActivePriceA
 	return items, nil
 }
 
+const listAllAccountCashByCurrency = `-- name: ListAllAccountCashByCurrency :many
+SELECT
+    t.account_id,
+    t.currency,
+    COALESCE(SUM(
+        CASE
+            WHEN t.type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
+                THEN t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+            WHEN t.type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
+                THEN -t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+            WHEN t.type = 'transfer' AND t.security_isin IS NULL
+                THEN -t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+            ELSE 0
+        END
+    ), 0)::numeric(18,4) AS balance,
+    COALESCE(BOOL_OR(t.type IN ('deposit', 'withdrawal', 'cash_transfer_in', 'cash_transfer_out')), false)::boolean AS has_explicit_cash
+FROM transactions t
+JOIN accounts a ON a.id = t.account_id
+WHERE a.is_active = true
+GROUP BY t.account_id, t.currency
+`
+
+type ListAllAccountCashByCurrencyRow struct {
+	AccountID       uuid.UUID      `json:"account_id"`
+	Currency        string         `json:"currency"`
+	Balance         pgtype.Numeric `json:"balance"`
+	HasExplicitCash bool           `json:"has_explicit_cash"`
+}
+
+func (q *Queries) ListAllAccountCashByCurrency(ctx context.Context) ([]ListAllAccountCashByCurrencyRow, error) {
+	rows, err := q.db.Query(ctx, listAllAccountCashByCurrency)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllAccountCashByCurrencyRow{}
+	for rows.Next() {
+		var i ListAllAccountCashByCurrencyRow
+		if err := rows.Scan(
+			&i.AccountID,
+			&i.Currency,
+			&i.Balance,
+			&i.HasExplicitCash,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAllAccounts = `-- name: ListAllAccounts :many
 SELECT id, name, institution, type, currency, iban, is_active, created_at, user_id, tax_treatment, employer_match_pct, import_security_isin FROM accounts ORDER BY is_active DESC, name
 `
@@ -1365,8 +1551,169 @@ func (q *Queries) ListAllAccounts(ctx context.Context) ([]Account, error) {
 	return items, nil
 }
 
+const listAllExchangeRates = `-- name: ListAllExchangeRates :many
+SELECT date, currency, rate
+FROM exchange_rates
+ORDER BY date ASC
+`
+
+func (q *Queries) ListAllExchangeRates(ctx context.Context) ([]ExchangeRate, error) {
+	rows, err := q.db.Query(ctx, listAllExchangeRates)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ExchangeRate{}
+	for rows.Next() {
+		var i ExchangeRate
+		if err := rows.Scan(&i.Date, &i.Currency, &i.Rate); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAllTransactions = `-- name: ListAllTransactions :many
+SELECT t.id, t.account_id, t.date, t.type, t.security_isin, t.quantity, t.price, t.amount, t.fee, t.tax, t.currency, t.counterparty, t.reference, t.category, t.import_hash, a.name as account_name, a.institution
+FROM transactions t
+JOIN accounts a ON t.account_id = a.id
+WHERE a.is_active = true
+ORDER BY t.date DESC,
+         CASE WHEN t.type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 1 ELSE 0 END ASC,
+         t.id DESC
+`
+
+type ListAllTransactionsRow struct {
+	ID           uuid.UUID      `json:"id"`
+	AccountID    uuid.UUID      `json:"account_id"`
+	Date         time.Time      `json:"date"`
+	Type         string         `json:"type"`
+	SecurityISIN pgtype.Text    `json:"security_isin"`
+	Quantity     pgtype.Numeric `json:"quantity"`
+	Price        pgtype.Numeric `json:"price"`
+	Amount       pgtype.Numeric `json:"amount"`
+	Fee          pgtype.Numeric `json:"fee"`
+	Tax          pgtype.Numeric `json:"tax"`
+	Currency     string         `json:"currency"`
+	Counterparty pgtype.Text    `json:"counterparty"`
+	Reference    pgtype.Text    `json:"reference"`
+	Category     pgtype.Text    `json:"category"`
+	ImportHash   string         `json:"import_hash"`
+	AccountName  string         `json:"account_name"`
+	Institution  string         `json:"institution"`
+}
+
+func (q *Queries) ListAllTransactions(ctx context.Context) ([]ListAllTransactionsRow, error) {
+	rows, err := q.db.Query(ctx, listAllTransactions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllTransactionsRow{}
+	for rows.Next() {
+		var i ListAllTransactionsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.Date,
+			&i.Type,
+			&i.SecurityISIN,
+			&i.Quantity,
+			&i.Price,
+			&i.Amount,
+			&i.Fee,
+			&i.Tax,
+			&i.Currency,
+			&i.Counterparty,
+			&i.Reference,
+			&i.Category,
+			&i.ImportHash,
+			&i.AccountName,
+			&i.Institution,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAllTransactionsForExport = `-- name: ListAllTransactionsForExport :many
+SELECT t.id, t.account_id, t.date, t.type, t.security_isin, t.quantity, t.price, t.amount, t.fee, t.tax, t.currency, t.counterparty, t.reference, t.category, t.import_hash, a.name as account_name, a.institution
+FROM transactions t
+JOIN accounts a ON t.account_id = a.id
+ORDER BY t.date DESC,
+         CASE WHEN t.type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 1 ELSE 0 END ASC,
+         t.id DESC
+`
+
+type ListAllTransactionsForExportRow struct {
+	ID           uuid.UUID      `json:"id"`
+	AccountID    uuid.UUID      `json:"account_id"`
+	Date         time.Time      `json:"date"`
+	Type         string         `json:"type"`
+	SecurityISIN pgtype.Text    `json:"security_isin"`
+	Quantity     pgtype.Numeric `json:"quantity"`
+	Price        pgtype.Numeric `json:"price"`
+	Amount       pgtype.Numeric `json:"amount"`
+	Fee          pgtype.Numeric `json:"fee"`
+	Tax          pgtype.Numeric `json:"tax"`
+	Currency     string         `json:"currency"`
+	Counterparty pgtype.Text    `json:"counterparty"`
+	Reference    pgtype.Text    `json:"reference"`
+	Category     pgtype.Text    `json:"category"`
+	ImportHash   string         `json:"import_hash"`
+	AccountName  string         `json:"account_name"`
+	Institution  string         `json:"institution"`
+}
+
+func (q *Queries) ListAllTransactionsForExport(ctx context.Context) ([]ListAllTransactionsForExportRow, error) {
+	rows, err := q.db.Query(ctx, listAllTransactionsForExport)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllTransactionsForExportRow{}
+	for rows.Next() {
+		var i ListAllTransactionsForExportRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.Date,
+			&i.Type,
+			&i.SecurityISIN,
+			&i.Quantity,
+			&i.Price,
+			&i.Amount,
+			&i.Fee,
+			&i.Tax,
+			&i.Currency,
+			&i.Counterparty,
+			&i.Reference,
+			&i.Category,
+			&i.ImportHash,
+			&i.AccountName,
+			&i.Institution,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAssetImprovements = `-- name: ListAssetImprovements :many
-SELECT id, asset_id, date, amount, description FROM asset_improvements ORDER BY asset_id, date
+SELECT id, asset_id, date, amount, description, transaction_id FROM asset_improvements ORDER BY asset_id, date
 `
 
 func (q *Queries) ListAssetImprovements(ctx context.Context) ([]AssetImprovement, error) {
@@ -1384,6 +1731,7 @@ func (q *Queries) ListAssetImprovements(ctx context.Context) ([]AssetImprovement
 			&i.Date,
 			&i.Amount,
 			&i.Description,
+			&i.TransactionID,
 		); err != nil {
 			return nil, err
 		}
@@ -1497,14 +1845,15 @@ func (q *Queries) ListAssets(ctx context.Context) ([]Asset, error) {
 }
 
 const listCashTransactions = `-- name: ListCashTransactions :many
-SELECT t.id, t.date, t.type, t.amount, t.counterparty, t.reference, t.category,
+SELECT t.id, t.date, t.type, t.amount, t.fee, t.currency, t.counterparty, t.reference, t.category,
        a.name as account_name
 FROM transactions t
 JOIN accounts a ON t.account_id = a.id
 WHERE a.type IN ('checking', 'savings')
+  AND a.is_active = true
   AND t.date >= $1 AND t.date <= $2
   AND t.amount != 0
-ORDER BY t.date DESC
+ORDER BY t.date DESC, t.id DESC
 `
 
 type ListCashTransactionsParams struct {
@@ -1517,6 +1866,8 @@ type ListCashTransactionsRow struct {
 	Date         time.Time      `json:"date"`
 	Type         string         `json:"type"`
 	Amount       pgtype.Numeric `json:"amount"`
+	Fee          pgtype.Numeric `json:"fee"`
+	Currency     string         `json:"currency"`
 	Counterparty pgtype.Text    `json:"counterparty"`
 	Reference    pgtype.Text    `json:"reference"`
 	Category     pgtype.Text    `json:"category"`
@@ -1539,6 +1890,8 @@ func (q *Queries) ListCashTransactions(ctx context.Context, arg ListCashTransact
 			&i.Date,
 			&i.Type,
 			&i.Amount,
+			&i.Fee,
+			&i.Currency,
 			&i.Counterparty,
 			&i.Reference,
 			&i.Category,
@@ -1826,6 +2179,38 @@ func (q *Queries) ListJournalEntries(ctx context.Context, limit int32) ([]Decisi
 			&i.OutcomeDate,
 			&i.CreatedAt,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLatestExchangeRates = `-- name: ListLatestExchangeRates :many
+SELECT DISTINCT ON (currency) currency, rate, date
+FROM exchange_rates
+ORDER BY currency, date DESC
+`
+
+type ListLatestExchangeRatesRow struct {
+	Currency string         `json:"currency"`
+	Rate     pgtype.Numeric `json:"rate"`
+	Date     time.Time      `json:"date"`
+}
+
+func (q *Queries) ListLatestExchangeRates(ctx context.Context) ([]ListLatestExchangeRatesRow, error) {
+	rows, err := q.db.Query(ctx, listLatestExchangeRates)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListLatestExchangeRatesRow{}
+	for rows.Next() {
+		var i ListLatestExchangeRatesRow
+		if err := rows.Scan(&i.Currency, &i.Rate, &i.Date); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -2160,14 +2545,15 @@ func (q *Queries) ListPriceAlerts(ctx context.Context) ([]ListPriceAlertsRow, er
 }
 
 const listPriceHistory = `-- name: ListPriceHistory :many
-SELECT date, close FROM market_data
+SELECT date, close, currency FROM market_data
 WHERE security_isin = $1
 ORDER BY date ASC
 `
 
 type ListPriceHistoryRow struct {
-	Date  time.Time      `json:"date"`
-	Close pgtype.Numeric `json:"close"`
+	Date     time.Time      `json:"date"`
+	Close    pgtype.Numeric `json:"close"`
+	Currency string         `json:"currency"`
 }
 
 func (q *Queries) ListPriceHistory(ctx context.Context, securityIsin string) ([]ListPriceHistoryRow, error) {
@@ -2179,7 +2565,7 @@ func (q *Queries) ListPriceHistory(ctx context.Context, securityIsin string) ([]
 	items := []ListPriceHistoryRow{}
 	for rows.Next() {
 		var i ListPriceHistoryRow
-		if err := rows.Scan(&i.Date, &i.Close); err != nil {
+		if err := rows.Scan(&i.Date, &i.Close, &i.Currency); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -2215,7 +2601,7 @@ func (q *Queries) ListPriceIndexPoints(ctx context.Context) ([]PriceIndexPoint, 
 }
 
 const listSecurities = `-- name: ListSecurities :many
-SELECT isin, wkn, symbol, name, asset_class, currency, ter, sector_weights, country_weights, metadata_updated_at FROM securities ORDER BY name
+SELECT isin, wkn, symbol, name, asset_class, currency, ter, sector_weights, country_weights, metadata_updated_at, equity_pct FROM securities ORDER BY name
 `
 
 func (q *Queries) ListSecurities(ctx context.Context) ([]Security, error) {
@@ -2238,6 +2624,7 @@ func (q *Queries) ListSecurities(ctx context.Context) ([]Security, error) {
 			&i.SectorWeights,
 			&i.CountryWeights,
 			&i.MetadataUpdatedAt,
+			&i.EquityPct,
 		); err != nil {
 			return nil, err
 		}
@@ -2386,7 +2773,9 @@ const listTransactions = `-- name: ListTransactions :many
 SELECT t.id, t.account_id, t.date, t.type, t.security_isin, t.quantity, t.price, t.amount, t.fee, t.tax, t.currency, t.counterparty, t.reference, t.category, t.import_hash, a.name as account_name, a.institution
 FROM transactions t
 JOIN accounts a ON t.account_id = a.id
-ORDER BY t.date DESC
+ORDER BY t.date DESC,
+         CASE WHEN t.type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 1 ELSE 0 END ASC,
+         t.id DESC
 LIMIT $1 OFFSET $2
 `
 
@@ -2458,7 +2847,9 @@ SELECT t.id, t.account_id, t.date, t.type, t.security_isin, t.quantity, t.price,
 FROM transactions t
 JOIN accounts a ON t.account_id = a.id
 WHERE t.account_id = $1
-ORDER BY t.date DESC
+ORDER BY t.date DESC,
+         CASE WHEN t.type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 1 ELSE 0 END ASC,
+         t.id DESC
 LIMIT $2 OFFSET $3
 `
 
@@ -2527,7 +2918,11 @@ func (q *Queries) ListTransactionsByAccount(ctx context.Context, arg ListTransac
 }
 
 const listTransactionsByISIN = `-- name: ListTransactionsByISIN :many
-SELECT id, account_id, date, type, security_isin, quantity, price, amount, fee, tax, currency, counterparty, reference, category, import_hash FROM transactions WHERE security_isin = $1 ORDER BY date
+SELECT id, account_id, date, type, security_isin, quantity, price, amount, fee, tax, currency, counterparty, reference, category, import_hash FROM transactions
+WHERE security_isin = $1
+ORDER BY date ASC,
+         CASE WHEN type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 0 ELSE 1 END ASC,
+         id ASC
 `
 
 func (q *Queries) ListTransactionsByISIN(ctx context.Context, securityIsin pgtype.Text) ([]Transaction, error) {
@@ -2555,6 +2950,98 @@ func (q *Queries) ListTransactionsByISIN(ctx context.Context, securityIsin pgtyp
 			&i.Reference,
 			&i.Category,
 			&i.ImportHash,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTransactionsFiltered = `-- name: ListTransactionsFiltered :many
+SELECT t.id, t.account_id, t.date, t.type, t.security_isin, t.quantity, t.price, t.amount, t.fee, t.tax, t.currency, t.counterparty, t.reference, t.category, t.import_hash, a.name as account_name, a.institution
+FROM transactions t
+JOIN accounts a ON t.account_id = a.id
+WHERE ($1::uuid IS NULL OR t.account_id = $1)
+  AND ($2::text IS NULL OR t.type = $2)
+  AND ($3::date IS NULL OR t.date >= $3)
+  AND ($4::date IS NULL OR t.date <= $4)
+  AND ($5::text IS NULL OR
+       COALESCE(t.counterparty, '') ILIKE '%' || $5 || '%' OR
+       COALESCE(t.security_isin, '') ILIKE '%' || $5 || '%' OR
+       COALESCE(t.reference, '') ILIKE '%' || $5 || '%')
+ORDER BY t.date DESC, t.id DESC
+LIMIT $7 OFFSET $6
+`
+
+type ListTransactionsFilteredParams struct {
+	AccountID *uuid.UUID  `json:"account_id"`
+	TxType    pgtype.Text `json:"tx_type"`
+	FromDate  pgtype.Date `json:"from_date"`
+	ToDate    pgtype.Date `json:"to_date"`
+	Search    pgtype.Text `json:"search"`
+	Offset    int32       `json:"offset"`
+	Limit     int32       `json:"limit"`
+}
+
+type ListTransactionsFilteredRow struct {
+	ID           uuid.UUID      `json:"id"`
+	AccountID    uuid.UUID      `json:"account_id"`
+	Date         time.Time      `json:"date"`
+	Type         string         `json:"type"`
+	SecurityISIN pgtype.Text    `json:"security_isin"`
+	Quantity     pgtype.Numeric `json:"quantity"`
+	Price        pgtype.Numeric `json:"price"`
+	Amount       pgtype.Numeric `json:"amount"`
+	Fee          pgtype.Numeric `json:"fee"`
+	Tax          pgtype.Numeric `json:"tax"`
+	Currency     string         `json:"currency"`
+	Counterparty pgtype.Text    `json:"counterparty"`
+	Reference    pgtype.Text    `json:"reference"`
+	Category     pgtype.Text    `json:"category"`
+	ImportHash   string         `json:"import_hash"`
+	AccountName  string         `json:"account_name"`
+	Institution  string         `json:"institution"`
+}
+
+func (q *Queries) ListTransactionsFiltered(ctx context.Context, arg ListTransactionsFilteredParams) ([]ListTransactionsFilteredRow, error) {
+	rows, err := q.db.Query(ctx, listTransactionsFiltered,
+		arg.AccountID,
+		arg.TxType,
+		arg.FromDate,
+		arg.ToDate,
+		arg.Search,
+		arg.Offset,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTransactionsFilteredRow{}
+	for rows.Next() {
+		var i ListTransactionsFilteredRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.Date,
+			&i.Type,
+			&i.SecurityISIN,
+			&i.Quantity,
+			&i.Price,
+			&i.Amount,
+			&i.Fee,
+			&i.Tax,
+			&i.Currency,
+			&i.Counterparty,
+			&i.Reference,
+			&i.Category,
+			&i.ImportHash,
+			&i.AccountName,
+			&i.Institution,
 		); err != nil {
 			return nil, err
 		}
@@ -3162,7 +3649,9 @@ func (q *Queries) UpsertExchangeRate(ctx context.Context, arg UpsertExchangeRate
 const upsertMarketData = `-- name: UpsertMarketData :exec
 INSERT INTO market_data (security_isin, date, close, currency)
 VALUES ($1, $2, $3, $4)
-ON CONFLICT (security_isin, date) DO UPDATE SET close = EXCLUDED.close
+ON CONFLICT (security_isin, date) DO UPDATE SET
+    close = EXCLUDED.close,
+    currency = EXCLUDED.currency
 `
 
 type UpsertMarketDataParams struct {

@@ -19,6 +19,7 @@ import (
 	"github.com/lnsp/wealth/internal/analytics"
 	"github.com/lnsp/wealth/internal/assets"
 	db "github.com/lnsp/wealth/internal/database/generated"
+	"github.com/lnsp/wealth/internal/market"
 )
 
 // holdingKey returns a matching key for an ETF constituent holding.
@@ -32,24 +33,182 @@ func holdingKey(isin, name string) string {
 type securityMap map[string]db.Security
 type priceMapAnalysis map[string]float64
 
-// enrichedHolding bundles a holding with its pre-loaded security and market value.
+// enrichedHolding bundles a holding with its pre-loaded security and EUR market/cost values.
 type enrichedHolding struct {
-	holding  db.ListCurrentHoldingsRow
-	security db.Security
-	value    float64
+	holding   db.ListCurrentHoldingsRow
+	security  db.Security
+	value     float64 // EUR market value (or EUR cost basis fallback)
+	costValue float64 // EUR cost basis total (qty * avg_cost_basis converted to EUR)
 }
 
 type AnalysisHandler struct {
-	queries *db.Queries
+	queries              *db.Queries
+	benchmarkISIN        string
+	benchmarkTicker      string
+	overlapWarnPct       float64
+	concentrationWarnPct float64
 }
 
 func NewAnalysisHandler(q *db.Queries) *AnalysisHandler {
-	return &AnalysisHandler{queries: q}
+	return &AnalysisHandler{
+		queries:              q,
+		benchmarkISIN:        "IE00B4L5Y983",
+		benchmarkTicker:      "IWDA.AS",
+		overlapWarnPct:       70.0,
+		concentrationWarnPct: 5.0,
+	}
+}
+
+// SetConfig configures benchmark ISIN/ticker and overlap/concentration alert thresholds.
+func (h *AnalysisHandler) SetConfig(benchmarkISIN, benchmarkTicker string, overlapWarnPct, concentrationWarnPct float64) {
+	if strings.TrimSpace(benchmarkISIN) != "" {
+		h.benchmarkISIN = strings.TrimSpace(benchmarkISIN)
+	}
+	if strings.TrimSpace(benchmarkTicker) != "" {
+		h.benchmarkTicker = strings.TrimSpace(benchmarkTicker)
+	}
+	if overlapWarnPct > 0 {
+		h.overlapWarnPct = overlapWarnPct
+	}
+	if concentrationWarnPct > 0 {
+		h.concentrationWarnPct = concentrationWarnPct
+	}
+}
+
+// buildTaxTransactions converts newest-first DB transaction rows into chronologically
+// ordered analytics.TaxTransaction records with trade-date EUR amounts, fee-adjusted
+// buy/sell basis (§ 20 Abs. 4 EStG), per-depot AccountID, trade Date, and InvStG TFS.
+func buildTaxTransactions(
+	txns []db.ListTransactionsRow,
+	secs []db.Security,
+	histFX []market.HistoricalFXRate,
+	fxRates map[string]float64,
+) ([]analytics.TaxTransaction, map[string]string, map[string]float64, map[string]bool) {
+	secMap := make(map[string]db.Security, len(secs))
+	names := make(map[string]string, len(secs))
+	tfsMap := make(map[string]float64, len(secs))
+	equityMap := make(map[string]bool, len(secs))
+	for _, s := range secs {
+		secMap[s.ISIN] = s
+		names[s.ISIN] = s.Name
+		tfs := securityTFSRate(s)
+		tfsMap[s.ISIN] = tfs
+		equityMap[s.ISIN] = tfs >= analytics.TeilfreistellungEquity
+	}
+
+	taxTxns := make([]analytics.TaxTransaction, 0, len(txns))
+	for i := len(txns) - 1; i >= 0; i-- {
+		txn := txns[i]
+		isin := ""
+		if txn.SecurityISIN.Valid {
+			isin = txn.SecurityISIN.String
+		}
+		amt := 0.0
+		if txn.Amount.Valid {
+			f, _ := txn.Amount.Float64Value()
+			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
+		}
+		fee := 0.0
+		if txn.Fee.Valid {
+			f, _ := txn.Fee.Float64Value()
+			fee = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
+		}
+		qty := 0.0
+		if txn.Quantity.Valid {
+			f, _ := txn.Quantity.Float64Value()
+			qty = f.Float64
+		}
+
+		taxAmt := amt
+		switch txn.Type {
+		case "buy", "savings_plan", "transfer":
+			taxAmt = amt + fee
+		case "sell":
+			taxAmt = math.Max(0, amt-fee)
+		}
+
+		name := names[isin]
+		if name == "" && txn.Counterparty.Valid {
+			name = txn.Counterparty.String
+		}
+		_, hasSec := secMap[isin]
+		tfs := tfsMap[isin]
+
+		taxTxns = append(taxTxns, analytics.TaxTransaction{
+			AccountID:      txn.AccountID.String(),
+			Date:           txn.Date.Format("2006-01-02"),
+			Year:           txn.Date.Year(),
+			Type:           txn.Type,
+			ISIN:           isin,
+			Name:           name,
+			Quantity:       qty,
+			Amount:         taxAmt,
+			IsEquityFund:   equityMap[isin],
+			TFS:            tfs,
+			HasExplicitTFS: hasSec,
+		})
+	}
+	return taxTxns, names, tfsMap, equityMap
+}
+
+// buildExternalFlowsForRisk loads portfolio-level external cashflows (+deposit/in-kind
+// contribution, -withdrawal, plus implicit cash clamp deltas) in EUR so risk and
+// volatility endpoints neutralize deposit/withdrawal jumps via BuildCashflowAdjustedSeries.
+func (h *AnalysisHandler) buildExternalFlowsForRisk(ctx context.Context) []analytics.CashFlow {
+	txns, err := listAllTransactionsRows(ctx, h.queries)
+	if err != nil || len(txns) == 0 {
+		return nil
+	}
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	accts, _ := h.queries.ListAccounts(ctx)
+	physHoldings, _ := assets.Load(ctx, h.queries)
+	linkedIDs := physHoldings.LinkedIDs()
+
+	var inkind []analytics.InKindTransfer
+	for _, t := range txns {
+		if t.SecurityISIN.Valid && (t.Type == "transfer" || t.Type == "transfer_out") {
+			inkind = append(inkind, analytics.InKindTransfer{
+				ID: t.ID, Date: t.Date, Type: t.Type,
+				ISIN: t.SecurityISIN.String, Quantity: numericToFloat(t.Quantity),
+			})
+		}
+	}
+	washed := analytics.MatchInKindTransferPairs(inkind)
+
+	txnsChrono := make([]db.ListTransactionsRow, len(txns))
+	for i := range txns {
+		txnsChrono[i] = txns[len(txns)-1-i]
+	}
+	impEvents := computeImplicitCashClampEvents(accts, txnsChrono, histFX, fxRates)
+
+	var flows []analytics.CashFlow
+	for _, ev := range impEvents {
+		flows = append(flows, analytics.CashFlow{Date: ev.Date, Amount: ev.DeltaEUR})
+	}
+	for _, t := range txnsChrono {
+		if _, ok := washed[t.ID]; ok {
+			continue
+		}
+		if linkedIDs[t.ID] {
+			continue
+		}
+		amt := convertAmountToEURAtDate(numericToFloat(t.Amount), t.Currency, t.Date, histFX, fxRates)
+		if amt == 0 {
+			continue
+		}
+		switch analytics.ClassifyForAttribution(t.Type, t.SecurityISIN.Valid, analytics.ScopePortfolio) {
+		case analytics.BucketContribution:
+			flows = append(flows, analytics.CashFlow{Date: t.Date, Amount: amt})
+		case analytics.BucketWithdrawal:
+			flows = append(flows, analytics.CashFlow{Date: t.Date, Amount: -amt})
+		}
+	}
+	return flows
 }
 
 // loadEnrichedHoldings batch-loads all current holdings with their securities
-// and market values in 3 queries (holdings + securities + prices) instead of
-// 2N+1 queries from per-holding GetSecurity + GetLatestPrice calls.
+// and EUR market values in 4 queries (holdings + securities + prices + FX rates).
 func (h *AnalysisHandler) loadEnrichedHoldings(ctx context.Context) ([]enrichedHolding, error) {
 	holdings, err := h.queries.ListCurrentHoldings(ctx)
 	if err != nil {
@@ -59,10 +218,14 @@ func (h *AnalysisHandler) loadEnrichedHoldings(ctx context.Context) ([]enrichedH
 	// Filter by user's accounts if auth is enabled
 	if allowedIDs := userAccountIDs(ctx, h.queries.DB()); allowedIDs != nil {
 		allowed := make(map[uuid.UUID]bool, len(allowedIDs))
-		for _, id := range allowedIDs { allowed[id] = true }
+		for _, id := range allowedIDs {
+			allowed[id] = true
+		}
 		filtered := holdings[:0]
 		for _, hld := range holdings {
-			if allowed[hld.AccountID] { filtered = append(filtered, hld) }
+			if allowed[hld.AccountID] {
+				filtered = append(filtered, hld)
+			}
 		}
 		holdings = filtered
 	}
@@ -76,6 +239,7 @@ func (h *AnalysisHandler) loadEnrichedHoldings(ctx context.Context) ([]enrichedH
 		secMap[s.ISIN] = s
 	}
 
+	fxRates := loadFXRatesMap(ctx, h.queries)
 	prices, err := h.queries.ListLatestPrices(ctx)
 	if err != nil {
 		prices = nil // non-fatal: fall back to cost basis
@@ -84,7 +248,10 @@ func (h *AnalysisHandler) loadEnrichedHoldings(ctx context.Context) ([]enrichedH
 	for _, p := range prices {
 		if p.Close.Valid {
 			f, _ := p.Close.Float64Value()
-			pm[p.SecurityISIN] = f.Float64
+			eurPrice := convertAmountToEUR(f.Float64, p.Currency, fxRates)
+			if eurPrice > 0 {
+				pm[p.SecurityISIN] = eurPrice
+			}
 		}
 	}
 
@@ -102,17 +269,20 @@ func (h *AnalysisHandler) loadEnrichedHoldings(ctx context.Context) ([]enrichedH
 		if qty <= 0 {
 			continue
 		}
-		value := 0.0
-		if price, ok := pm[hold.SecurityISIN]; ok {
-			value = qty * price
-		} else if hold.AvgCostBasis.Valid {
+		costValue := 0.0
+		if hold.AvgCostBasis.Valid {
 			f, _ := hold.AvgCostBasis.Float64Value()
-			value = qty * f.Float64
+			costValue = qty * convertAmountToEUR(f.Float64, hold.Currency, fxRates)
+		}
+		value := costValue
+		if price, ok := pm[hold.SecurityISIN]; ok && price > 0 {
+			value = qty * price
 		}
 		result = append(result, enrichedHolding{
-			holding:  hold,
-			security: sec,
-			value:    value,
+			holding:   hold,
+			security:  sec,
+			value:     value,
+			costValue: costValue,
 		})
 	}
 	return result, nil
@@ -484,7 +654,9 @@ func (h *AnalysisHandler) HandleAlerts(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	alerts := analytics.ComputeConcentrationAlerts(etfs, holdingsWithETF, holdingNames)
+	alerts := analytics.ComputeConcentrationAlertsWithThresholds(
+		etfs, holdingsWithETF, holdingNames, h.overlapWarnPct, h.concentrationWarnPct,
+	)
 	if alerts == nil {
 		alerts = []analytics.Alert{}
 	}
@@ -541,17 +713,20 @@ func (h *AnalysisHandler) HandleOverlap(w http.ResponseWriter, r *http.Request) 
 func (h *AnalysisHandler) HandleSectorHistory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 	if len(txns) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"history": []any{}})
+		writeJSON(w, http.StatusOK, map[string]any{"history": []any{}, "sectors": []string{}})
 		return
 	}
 
-	// Sort chronologically (ListTransactions returns DESC)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+
+	// Sort chronologically (ListAllTransactions returns DESC)
 	for i, j := 0, len(txns)-1; i < j; i, j = i+1, j-1 {
 		txns[i], txns[j] = txns[j], txns[i]
 	}
@@ -582,21 +757,21 @@ func (h *AnalysisHandler) HandleSectorHistory(w http.ResponseWriter, r *http.Req
 		Date    string             `json:"date"`
 		Sectors map[string]float64 `json:"sectors"`
 	}
-	var snapshots []sectorSnapshot
+	snapshots := []sectorSnapshot{}
 
 	// Emit a snapshot of sector allocation from current holdings state
 	emitSnapshot := func(date string) {
 		totalValue := 0.0
 		isinValues := make(map[string]float64)
 		for isin, hs := range holdings {
-			if hs.quantity <= 0 {
+			if hs.quantity <= 1e-9 {
 				continue
 			}
-			val := hs.totalCost // use cost basis for historical
+			val := hs.totalCost // use EUR cost basis for historical
 			isinValues[isin] = val
 			totalValue += val
 		}
-		if totalValue == 0 {
+		if totalValue <= 0 {
 			return
 		}
 
@@ -616,7 +791,7 @@ func (h *AnalysisHandler) HandleSectorHistory(w http.ResponseWriter, r *http.Req
 
 	lastMonth := ""
 	for _, txn := range txns {
-		amt := numericToFloat(txn.Amount)
+		amt := convertAmountToEURAtDate(numericToFloat(txn.Amount), txn.Currency, txn.Date, histFX, fxRates)
 		qty := numericToFloat(txn.Quantity)
 		isin := ""
 		if txn.SecurityISIN.Valid {
@@ -647,7 +822,7 @@ func (h *AnalysisHandler) HandleSectorHistory(w http.ResponseWriter, r *http.Req
 					costPerUnit := hs.totalCost / hs.quantity
 					hs.quantity -= qty
 					hs.totalCost -= costPerUnit * qty
-					if hs.quantity <= 0.001 {
+					if hs.quantity <= 1e-9 {
 						delete(holdings, isin)
 					}
 				}
@@ -669,7 +844,7 @@ func (h *AnalysisHandler) HandleSectorHistory(w http.ResponseWriter, r *http.Req
 					costPerUnit := hs.totalCost / hs.quantity
 					hs.quantity -= qty
 					hs.totalCost -= costPerUnit * qty
-					if hs.quantity <= 0.001 {
+					if hs.quantity <= 1e-9 {
 						delete(holdings, isin)
 					}
 				}
@@ -677,18 +852,21 @@ func (h *AnalysisHandler) HandleSectorHistory(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// Final snapshot using market prices where available
+	// Final snapshot using EUR market prices where available
 	if lastMonth != "" {
 		totalValue := 0.0
 		isinValues := make(map[string]float64)
 		for isin, hs := range holdings {
-			if hs.quantity <= 0 {
+			if hs.quantity <= 1e-9 {
 				continue
 			}
 			val := hs.totalCost
 			if price, err := h.queries.GetLatestPrice(ctx, isin); err == nil && price.Close.Valid {
 				f, _ := price.Close.Float64Value()
-				val = hs.quantity * f.Float64
+				eurPrice := convertAmountToEUR(f.Float64, price.Currency, fxRates)
+				if eurPrice > 0 {
+					val = hs.quantity * eurPrice
+				}
 			}
 			isinValues[isin] = val
 			totalValue += val
@@ -728,7 +906,7 @@ func (h *AnalysisHandler) HandleSectorHistory(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// HandleRisk computes portfolio risk metrics from daily net worth snapshots.
+// HandleRisk computes portfolio risk metrics from cashflow-adjusted daily net worth snapshots.
 func (h *AnalysisHandler) HandleRisk(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -770,7 +948,7 @@ func (h *AnalysisHandler) HandleRisk(w http.ResponseWriter, r *http.Request) {
 	const riskFreeRate = 0.03 // ECB deposit facility rate (approximate)
 
 	// Compute benchmark risk metrics if available
-	benchPrices := loadBenchmarkPrices(ctx, h.queries)
+	benchPrices := loadBenchmarkPrices(ctx, h.queries, h.benchmarkISIN, h.benchmarkTicker)
 	var benchMetrics *analytics.RiskMetrics
 	if len(benchPrices) > 1 {
 		portfolioStart := points[0].Date
@@ -790,8 +968,10 @@ func (h *AnalysisHandler) HandleRisk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	currentValue := points[len(points)-1].Value
-	metrics := analytics.ComputeRiskMetrics(points, riskFreeRate, currentValue)
-	rolling := analytics.ComputeRollingMetrics(points, riskFreeRate)
+	externalFlows := h.buildExternalFlowsForRisk(ctx)
+	adjustedPoints := analytics.BuildCashflowAdjustedSeries(points, externalFlows)
+	metrics := analytics.ComputeRiskMetrics(adjustedPoints, riskFreeRate, currentValue)
+	rolling := analytics.ComputeRollingMetrics(adjustedPoints, riskFreeRate)
 
 	result := map[string]any{"risk": metrics}
 	if benchMetrics != nil {
@@ -816,13 +996,15 @@ func (h *AnalysisHandler) HandleTax(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 
-	// Load securities to determine equity fund status
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+
 	secs, err := h.queries.ListSecurities(ctx)
 	if err != nil {
 		secs = nil
@@ -832,75 +1014,40 @@ func (h *AnalysisHandler) HandleTax(w http.ResponseWriter, r *http.Request) {
 		secMap[s.ISIN] = s
 	}
 
-	// Convert transactions to TaxTransaction format
-	var taxTxns []analytics.TaxTransaction
-	for _, txn := range txns {
-		isin := ""
-		if txn.SecurityISIN.Valid {
-			isin = txn.SecurityISIN.String
-		}
-		amt := 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
-		}
-		qty := 0.0
-		if txn.Quantity.Valid {
-			f, _ := txn.Quantity.Float64Value()
-			qty = f.Float64
-		}
+	taxTxns, _, tfsMap, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
 
-		name := ""
-		isEquity := false
-		if sec, ok := secMap[isin]; ok {
-			name = sec.Name
-			isEquity = sec.AssetClass == "etf" // simplified: treat all ETFs as equity funds
-		}
-		if txn.Counterparty.Valid && name == "" {
-			name = txn.Counterparty.String
-		}
-
-		taxTxns = append(taxTxns, analytics.TaxTransaction{
-			Year:         txn.Date.Year(),
-			Type:         txn.Type,
-			ISIN:         isin,
-			Name:         name,
-			Quantity:     qty,
-			Amount:       amt,
-			IsEquityFund: isEquity,
-		})
-	}
-
-	// Sort chronologically (ListTransactions returns DESC)
-	for i, j := 0, len(taxTxns)-1; i < j; i, j = i+1, j-1 {
-		taxTxns[i], taxTxns[j] = taxTxns[j], taxTxns[i]
-	}
-
-	// Compute tax-loss harvesting hints from current holdings
+	// Compute tax-loss harvesting hints aggregated across accounts per ISIN (in EUR)
 	enriched, _ := h.loadEnrichedHoldings(ctx)
-	var hints []analytics.TaxLossHint
-	pm := make(map[string]float64)
+	type aggHolding struct {
+		name      string
+		value     float64
+		costValue float64
+		tfs       float64
+	}
+	aggByISIN := make(map[string]*aggHolding)
+	var isinOrder []string
 	for _, eh := range enriched {
-		qty := 0.0
-		if eh.holding.Quantity.Valid {
-			f, _ := eh.holding.Quantity.Float64Value()
-			qty = f.Float64
+		ah, ok := aggByISIN[eh.security.ISIN]
+		if !ok {
+			ah = &aggHolding{
+				name: eh.security.Name,
+				tfs:  securityTFSRate(eh.security),
+			}
+			aggByISIN[eh.security.ISIN] = ah
+			isinOrder = append(isinOrder, eh.security.ISIN)
 		}
-		costBasis := 0.0
-		if eh.holding.AvgCostBasis.Valid {
-			f, _ := eh.holding.AvgCostBasis.Float64Value()
-			costBasis = f.Float64 * qty
-		}
-		if _, seen := pm[eh.security.ISIN]; seen {
-			continue // skip duplicates from multi-account
-		}
-		pm[eh.security.ISIN] = eh.value
-		unrealizedPL := eh.value - costBasis
+		ah.value += eh.value
+		ah.costValue += eh.costValue
+	}
+	var hints []analytics.TaxLossHint
+	for _, isin := range isinOrder {
+		ah := aggByISIN[isin]
+		unrealizedPL := ah.value - ah.costValue
 		if unrealizedPL < -10 { // only suggest if meaningful loss
-			saving := (-unrealizedPL) * analytics.EffectiveTaxRate
+			saving := (-unrealizedPL) * (1 - ah.tfs) * analytics.EffectiveTaxRate
 			hints = append(hints, analytics.TaxLossHint{
-				ISIN:            eh.security.ISIN,
-				Name:            eh.security.Name,
+				ISIN:            isin,
+				Name:            ah.name,
 				UnrealizedPL:    math.Round(unrealizedPL*100) / 100,
 				PotentialSaving: math.Round(saving*100) / 100,
 			})
@@ -910,11 +1057,11 @@ func (h *AnalysisHandler) HandleTax(w http.ResponseWriter, r *http.Request) {
 	// Compute available years from transactions
 	yearSet := make(map[int]bool)
 	for _, t := range taxTxns {
-		if t.Type == "sell" || t.Type == "dividend" {
+		if t.Type == "sell" || t.Type == "dividend" || t.Type == "interest" {
 			yearSet[t.Year] = true
 		}
 	}
-	var availableYears []int
+	availableYears := []int{}
 	for y := range yearSet {
 		availableYears = append(availableYears, y)
 	}
@@ -922,36 +1069,13 @@ func (h *AnalysisHandler) HandleTax(w http.ResponseWriter, r *http.Request) {
 
 	summary := analytics.ComputeTaxSummary(taxTxns, year, hints)
 
-	// Compute Vorabpauschale for accumulating ETFs
-	jan1Holdings := make(map[string]float64)
-	yearEndHoldings := make(map[string]float64)
-	vpNames := make(map[string]string)
-
-	// Use current holdings quantities × price at Jan 1 (approximation)
-	jan1Date := time.Date(year, 1, 1, 0, 0, 0, 0, time.Local)
+	curValByISIN := make(map[string]float64, len(aggByISIN))
+	curQtyByISIN := make(map[string]float64, len(enriched))
 	for _, eh := range enriched {
-		if eh.security.AssetClass != "etf" {
-			continue
-		}
-		qty := 0.0
-		if eh.holding.Quantity.Valid {
-			f, _ := eh.holding.Quantity.Float64Value()
-			qty = f.Float64
-		}
-		if qty <= 0 {
-			continue
-		}
-		vpNames[eh.security.ISIN] = eh.security.Name
-		yearEndHoldings[eh.security.ISIN] += eh.value
-
-		// Get price near Jan 1
-		if priceRow, err := h.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{SecurityISIN: eh.security.ISIN, Date: jan1Date}); err == nil {
-			p := numericToFloat(priceRow.Close)
-			jan1Holdings[eh.security.ISIN] += qty * p
-		}
+		curValByISIN[eh.security.ISIN] += eh.value
+		curQtyByISIN[eh.security.ISIN] += numericToFloat(eh.holding.Quantity)
 	}
-
-	vorabpauschale := analytics.ComputeVorabpauschale(year, jan1Holdings, yearEndHoldings, vpNames)
+	vorabpauschale := h.computeYearVorabpauschale(ctx, year, txns, secMap, tfsMap, curValByISIN, curQtyByISIN, histFX, fxRates)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"summary":         summary,
@@ -960,9 +1084,95 @@ func (h *AnalysisHandler) HandleTax(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// computeYearVorabpauschale computes § 18 InvStG Vorabpauschale entries for `year`,
+// FIFO-deducting in-year sales/transfers per depot via analytics.ReconstructVorabpauschaleYear.
+func (h *AnalysisHandler) computeYearVorabpauschale(
+	ctx context.Context,
+	year int,
+	txns []db.ListTransactionsRow,
+	secMap map[string]db.Security,
+	tfsMap map[string]float64,
+	curValByISIN map[string]float64,
+	curQtyByISIN map[string]float64,
+	histFX []market.HistoricalFXRate,
+	fxRates map[string]float64,
+) []analytics.VorabpauschaleEntry {
+	jan1Date := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+	yearEndDate := time.Date(year, 12, 31, 0, 0, 0, 0, time.UTC)
+
+	vpTxns := make([]analytics.VorabpauschaleTxn, 0, len(txns))
+	for i := len(txns) - 1; i >= 0; i-- {
+		txn := txns[i]
+		if txn.Date.After(yearEndDate) || !txn.SecurityISIN.Valid {
+			continue
+		}
+		isin := txn.SecurityISIN.String
+		sec, ok := secMap[isin]
+		if !ok || (sec.AssetClass != "etf" && sec.AssetClass != "fund") {
+			continue
+		}
+		qty := numericToFloat(txn.Quantity)
+		amtEUR := convertAmountToEURAtDate(numericToFloat(txn.Amount), txn.Currency, txn.Date, histFX, fxRates)
+		feeEUR := convertAmountToEURAtDate(numericToFloat(txn.Fee), txn.Currency, txn.Date, histFX, fxRates)
+		if txn.Type == "buy" || txn.Type == "savings_plan" || txn.Type == "transfer" {
+			amtEUR += feeEUR
+		}
+		vpTxns = append(vpTxns, analytics.VorabpauschaleTxn{
+			AccountID: txn.AccountID.String(),
+			ISIN:      isin,
+			Year:      txn.Date.Year(),
+			Month:     int(txn.Date.Month()),
+			Type:      txn.Type,
+			Quantity:  qty,
+			AmountEUR: amtEUR,
+		})
+	}
+
+	positions := analytics.ReconstructVorabpauschaleYear(year, vpTxns)
+	var vpInputs []analytics.VorabpauschaleInput
+	for isin, pos := range positions {
+		sec := secMap[isin]
+		jan1Val := 0.0
+		if pos.Jan1Qty > 1e-9 {
+			if priceRow, err := h.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{SecurityISIN: isin, Date: jan1Date}); err == nil && priceRow.Close.Valid {
+				p := convertAmountToEURAtDate(numericToFloat(priceRow.Close), priceRow.Currency, priceRow.Date, histFX, fxRates)
+				jan1Val = pos.Jan1Qty * p
+			}
+			if jan1Val <= 0 {
+				jan1Val = pos.Jan1CostEUR
+			}
+		}
+		yearEndVal := 0.0
+		if year == time.Now().Year() {
+			if v := curValByISIN[isin]; v > 0 {
+				yearEndVal = v
+			}
+		}
+		if yearEndVal <= 0 {
+			if priceRow, err := h.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{SecurityISIN: isin, Date: yearEndDate}); err == nil && priceRow.Close.Valid {
+				p := convertAmountToEURAtDate(numericToFloat(priceRow.Close), priceRow.Currency, priceRow.Date, histFX, fxRates)
+				yearEndVal = pos.YearEndQty * p
+			} else if curValByISIN[isin] > 0 && curQtyByISIN[isin] > 0 {
+				yearEndVal = pos.YearEndQty * (curValByISIN[isin] / curQtyByISIN[isin])
+			}
+		}
+		vpInputs = append(vpInputs, analytics.VorabpauschaleInput{
+			ISIN:          isin,
+			Name:          sec.Name,
+			Jan1Value:     jan1Val,
+			YearEndValue:  yearEndVal,
+			Distributions: pos.Distributions,
+			MidYearBuys:   pos.MidYearBuys,
+			TFSRate:       tfsMap[isin],
+		})
+	}
+	return analytics.ComputeVorabpauschaleDetailed(year, vpInputs)
+}
+
 // HandleCosts computes ETF cost analysis from TER data and current holdings.
 func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
-	enriched, err := h.loadEnrichedHoldings(r.Context())
+	ctx := r.Context()
+	enriched, err := h.loadEnrichedHoldings(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "load holdings: "+err.Error())
 		return
@@ -982,7 +1192,7 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 		totalValue += eh.value
 	}
 
-	var entries []costEntry
+	entries := []costEntry{}
 	totalCost := 0.0
 	weightedTER := 0.0
 	coveredValue := 0.0 // sum of value across holdings with a known TER
@@ -1011,17 +1221,10 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Coverage % = how much of total portfolio value has a known TER. When
-	// some holdings lack metadata, the weighted_ter understates the true
-	// portfolio TER (unpriced rows contribute 0). Frontend surfaces this
-	// caveat when coverage < 100%.
 	coveragePct := 0.0
 	if totalValue > 0 {
 		coveragePct = (coveredValue / totalValue) * 100
 	}
-	// Normalized TER: weighted_ter divided by coverage fraction. Represents
-	// the average TER among priced holdings, useful when metadata is partial
-	// but the user wants to extrapolate.
 	weightedTERCovered := 0.0
 	if coveredValue > 0 {
 		weightedTERCovered = weightedTER * (totalValue / coveredValue)
@@ -1032,8 +1235,8 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 		return entries[i].AnnualCost > entries[j].AnnualCost
 	})
 
-	// 10-year projection
-	var projection []map[string]any
+	// 30-year milestones projection
+	projection := []map[string]any{}
 	cumulative := 0.0
 	for year := 1; year <= 30; year++ {
 		cumulative += totalCost
@@ -1045,8 +1248,6 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Cost benchmarking: compare against typical German ETF investor
-	// Average German ETF investor weighted TER is ~0.35-0.40% (BVI/Morningstar data)
 	avgTER := 0.38
 	grade := "A+"
 	gradeDetail := "Excellent — well below average German ETF investor costs"
@@ -1073,8 +1274,10 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 	annualSaving := (avgTER - weightedTER) / 100 * totalValue
 	tenYearSaving := annualSaving * 10
 
-	// Total cost of ownership: TER + estimated transaction costs + estimated spread
-	txns, _ := h.queries.ListTransactions(r.Context(), db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	// Total cost of ownership: TER + estimated transaction costs + estimated spread (in EUR)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
 	totalTxnVolume := 0.0
 	txnCount := 0
 	totalFees := 0.0
@@ -1082,44 +1285,48 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 		if txn.Type == "buy" || txn.Type == "sell" || txn.Type == "savings_plan" {
 			if txn.Amount.Valid {
 				f, _ := txn.Amount.Float64Value()
-				totalTxnVolume += math.Abs(f.Float64)
+				totalTxnVolume += math.Abs(convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates))
 				txnCount++
 			}
 			if txn.Fee.Valid {
 				f, _ := txn.Fee.Float64Value()
-				totalFees += math.Abs(f.Float64)
+				totalFees += math.Abs(convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates))
 			}
 		}
 	}
-	// Estimate spread cost: ~0.05% of total volume for liquid ETFs
 	spreadCostEst := totalTxnVolume * 0.0005
-	// Annual transaction costs: assume similar volume per year going forward
 	years := 1.0
 	if len(txns) > 1 {
 		first := txns[len(txns)-1].Date
 		last := txns[0].Date
 		y := last.Sub(first).Hours() / (365.25 * 24)
-		if y > 0.5 { years = y }
+		if y > 0.5 {
+			years = y
+		}
 	}
 	annualTxnCost := totalFees / years
 	annualSpreadCost := spreadCostEst / years
 	totalAnnualCost := totalCost + annualTxnCost + annualSpreadCost
+	totalAnnualPct := 0.0
+	if totalValue > 0 {
+		totalAnnualPct = math.Round(totalAnnualCost/totalValue*10000) / 100
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"holdings":     entries,
-		"total_value":  math.Round(totalValue*100) / 100,
-		"weighted_ter": math.Round(weightedTER*100) / 100,
+		"holdings":                  entries,
+		"total_value":               math.Round(totalValue*100) / 100,
+		"weighted_ter":              math.Round(weightedTER*100) / 100,
 		"weighted_ter_covered_only": math.Round(weightedTERCovered*100) / 100,
-		"coverage_pct": math.Round(coveragePct*10) / 10,
-		"annual_cost":  math.Round(totalCost*100) / 100,
-		"daily_cost":   math.Round(totalCost/365*100) / 100,
-		"projection":   projection,
+		"coverage_pct":              math.Round(coveragePct*10) / 10,
+		"annual_cost":               math.Round(totalCost*100) / 100,
+		"daily_cost":                math.Round(totalCost/365*100) / 100,
+		"projection":                projection,
 		"benchmark": map[string]any{
-			"avg_ter":       avgTER,
-			"your_ter":      math.Round(weightedTER*100) / 100,
-			"grade":         grade,
-			"detail":        gradeDetail,
-			"annual_saving": math.Round(annualSaving*100) / 100,
+			"avg_ter":         avgTER,
+			"your_ter":        math.Round(weightedTER*100) / 100,
+			"grade":           grade,
+			"detail":          gradeDetail,
+			"annual_saving":   math.Round(annualSaving*100) / 100,
 			"ten_year_saving": math.Round(tenYearSaving*100) / 100,
 		},
 		"total_cost_ownership": map[string]any{
@@ -1127,7 +1334,7 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 			"transaction_fees":  math.Round(annualTxnCost*100) / 100,
 			"spread_estimate":   math.Round(annualSpreadCost*100) / 100,
 			"total_annual":      math.Round(totalAnnualCost*100) / 100,
-			"total_annual_pct":  math.Round(totalAnnualCost/totalValue*10000) / 100,
+			"total_annual_pct":  totalAnnualPct,
 			"lifetime_fees":     math.Round(totalFees*100) / 100,
 			"lifetime_volume":   math.Round(totalTxnVolume),
 			"transaction_count": txnCount,
@@ -1248,6 +1455,11 @@ func (h *AnalysisHandler) HandleCorrelation(w http.ResponseWriter, r *http.Reque
 				}
 				if varA > 0 && varB > 0 {
 					corr = cov / (math.Sqrt(varA) * math.Sqrt(varB))
+					if math.IsNaN(corr) || math.IsInf(corr, 0) {
+						corr = 0
+					} else {
+						corr = math.Max(-1, math.Min(1, corr))
+					}
 				}
 			}
 
@@ -1302,11 +1514,13 @@ func (h *AnalysisHandler) HandleFXHistory(w http.ResponseWriter, r *http.Request
 // HandleCashFlow computes monthly income/expense summary and forward projection.
 func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
 	holdings, _ := assets.Load(ctx, h.queries)
 
 	type monthFlow struct {
@@ -1321,7 +1535,7 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 		amt := 0.0
 		if txn.Amount.Valid {
 			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
+			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
 		}
 		if isAssetPurchase(txn.Category) {
 			continue // cash → physical asset, not an expense
@@ -1351,7 +1565,7 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 	}
 	sort.Strings(months)
 
-	var history []monthFlow
+	history := []monthFlow{}
 	for _, m := range months {
 		mf := monthly[m]
 		mf.Net = math.Round((mf.Income-mf.Expenses)*100) / 100
@@ -1398,14 +1612,14 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 		sm.Expenses += mf.Expenses
 		sm.Count++
 	}
-	var seasonalData []seasonalMonth
+	seasonalData := []seasonalMonth{}
 	for m := 1; m <= 12; m++ {
 		sm := seasonal[m]
 		if sm != nil && sm.Count > 0 {
 			seasonalData = append(seasonalData, seasonalMonth{
 				CalMonth: m,
-				Income:   math.Round(sm.Income / float64(sm.Count) * 100) / 100,
-				Expenses: math.Round(sm.Expenses / float64(sm.Count) * 100) / 100,
+				Income:   math.Round(sm.Income/float64(sm.Count)*100) / 100,
+				Expenses: math.Round(sm.Expenses/float64(sm.Count)*100) / 100,
 			})
 		}
 	}
@@ -1432,11 +1646,13 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 		amt := 0.0
 		if txn.Amount.Valid {
 			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
+			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
 		}
-		depositsBySource[cp] = append(depositsBySource[cp], amt)
+		if amt > 0 {
+			depositsBySource[cp] = append(depositsBySource[cp], amt)
+		}
 	}
-	var incomeSources []incomeSource
+	incomeSources := []incomeSource{}
 	for name, amounts := range depositsBySource {
 		if len(amounts) < 3 {
 			continue
@@ -1446,6 +1662,9 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 		copy(sorted, amounts)
 		sort.Float64s(sorted)
 		median := sorted[len(sorted)/2]
+		if median <= 0 {
+			continue
+		}
 		consistent := 0
 		for _, a := range amounts {
 			if math.Abs(a-median)/median < 0.2 {
@@ -1464,10 +1683,10 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 	})
 
 	// Project 12 months forward using seasonal patterns when available
-	var projection []monthFlow
+	projection := []monthFlow{}
 	now := time.Now()
 	for i := 1; i <= 12; i++ {
-		d := now.AddDate(0, i, 0)
+		d := addMonthsFirstOfMonth(now, i)
 		cm := int(d.Month())
 		inc := avgIncome
 		exp := avgExpenses
@@ -1498,7 +1717,7 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 // HandleAllocationHistory computes monthly holding weight history.
 func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
@@ -1508,16 +1727,34 @@ func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http
 		return
 	}
 
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+
 	// Sort chronologically
 	for i, j := 0, len(txns)-1; i < j; i, j = i+1, j-1 {
 		txns[i], txns[j] = txns[j], txns[i]
 	}
 
-	// Load security names
+	// Load security names and build collision-free display labels so sold
+	// historical positions resolve directly via weights[label] on the frontend.
 	secs, _ := h.queries.ListSecurities(ctx)
-	secNames := make(map[string]string)
+	rawNames := make(map[string]string, len(secs))
+	nameCount := make(map[string]int, len(secs))
 	for _, s := range secs {
-		secNames[s.ISIN] = s.Name
+		rawNames[s.ISIN] = s.Name
+		if s.Name != "" {
+			nameCount[s.Name]++
+		}
+	}
+	labelForISIN := func(isin string) string {
+		name := rawNames[isin]
+		if name == "" {
+			return isin
+		}
+		if nameCount[name] > 1 {
+			return name + " (" + isin + ")"
+		}
+		return name
 	}
 
 	type holdState struct{ qty, cost float64 }
@@ -1527,43 +1764,55 @@ func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http
 		Date    string             `json:"date"`
 		Weights map[string]float64 `json:"weights"`
 	}
-	var snapshots []snapshot
+	snapshots := []snapshot{}
 	lastMonth := ""
 
 	emitSnapshot := func(date string) {
 		totalValue := 0.0
 		for _, hs := range holdings {
-			if hs.qty > 0 { totalValue += hs.cost }
+			if hs.qty > 1e-9 && hs.cost > 0 {
+				totalValue += hs.cost
+			}
 		}
-		if totalValue == 0 { return }
+		if totalValue <= 0 {
+			return
+		}
 		weights := make(map[string]float64)
 		var sum float64
-		var largestISIN string
+		var largestKey string
 		var largestWeight float64
 		for isin, hs := range holdings {
-			if hs.qty > 0 {
+			if hs.qty > 1e-9 && hs.cost > 0 {
+				label := labelForISIN(isin)
 				w := math.Round((hs.cost/totalValue)*1000) / 10
-				weights[isin] = w
+				weights[label] += w
 				sum += w
-				if w > largestWeight {
-					largestWeight = w
-					largestISIN = isin
+				if weights[label] > largestWeight {
+					largestWeight = weights[label]
+					largestKey = label
 				}
 			}
 		}
-		// Adjust largest weight so total is exactly 100
-		if largestISIN != "" && sum != 100 {
-			weights[largestISIN] += math.Round((100-sum)*10) / 10
+		if largestKey != "" && sum != 100 {
+			weights[largestKey] += math.Round((100-sum)*10) / 10
 		}
 		snapshots = append(snapshots, snapshot{Date: date, Weights: weights})
 	}
 
 	for _, txn := range txns {
 		isin := ""
-		if txn.SecurityISIN.Valid { isin = txn.SecurityISIN.String }
+		if txn.SecurityISIN.Valid {
+			isin = txn.SecurityISIN.String
+		}
 		amt, qty := 0.0, 0.0
-		if txn.Amount.Valid { f, _ := txn.Amount.Float64Value(); amt = f.Float64 }
-		if txn.Quantity.Valid { f, _ := txn.Quantity.Float64Value(); qty = f.Float64 }
+		if txn.Amount.Valid {
+			f, _ := txn.Amount.Float64Value()
+			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
+		}
+		if txn.Quantity.Valid {
+			f, _ := txn.Quantity.Float64Value()
+			qty = f.Float64
+		}
 
 		month := txn.Date.Format("2006-01")
 		if month != lastMonth && lastMonth != "" {
@@ -1571,32 +1820,42 @@ func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http
 		}
 		lastMonth = month
 
-		if isin == "" { continue }
+		if isin == "" {
+			continue
+		}
 		switch txn.Type {
 		case "buy", "savings_plan", "transfer":
 			hs := holdings[isin]
-			if hs == nil { hs = &holdState{}; holdings[isin] = hs }
-			hs.qty += qty; hs.cost += amt
+			if hs == nil {
+				hs = &holdState{}
+				holdings[isin] = hs
+			}
+			hs.qty += qty
+			hs.cost += amt
 		case "sell", "transfer_out":
 			if hs := holdings[isin]; hs != nil && hs.qty > 0 {
 				costPer := hs.cost / hs.qty
-				hs.qty -= qty; hs.cost -= costPer * qty
-				if hs.qty <= 0.001 { delete(holdings, isin) }
+				hs.qty -= qty
+				hs.cost -= costPer * qty
+				if hs.qty <= 1e-9 {
+					delete(holdings, isin)
+				}
 			}
 		}
 	}
-	if lastMonth != "" { emitSnapshot(lastMonth + "-01") }
+	if lastMonth != "" {
+		emitSnapshot(lastMonth + "-01")
+	}
 
-	// Collect all holding ISINs
 	holdingSet := make(map[string]bool)
 	for _, s := range snapshots {
-		for isin := range s.Weights { holdingSet[isin] = true }
+		for label := range s.Weights {
+			holdingSet[label] = true
+		}
 	}
-	var holdingNames []string
-	for isin := range holdingSet {
-		name := secNames[isin]
-		if name == "" { name = isin }
-		holdingNames = append(holdingNames, name)
+	holdingNames := []string{}
+	for label := range holdingSet {
+		holdingNames = append(holdingNames, label)
 	}
 	sort.Strings(holdingNames)
 
@@ -1614,46 +1873,15 @@ func (h *AnalysisHandler) HandleExportTaxReport(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
 	secs, _ := h.queries.ListSecurities(ctx)
-	secMap := make(map[string]db.Security, len(secs))
-	for _, s := range secs {
-		secMap[s.ISIN] = s
-	}
-
-	var taxTxns []analytics.TaxTransaction
-	for _, txn := range txns {
-		isin := ""
-		if txn.SecurityISIN.Valid {
-			isin = txn.SecurityISIN.String
-		}
-		amt, qty := 0.0, 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
-		}
-		if txn.Quantity.Valid {
-			f, _ := txn.Quantity.Float64Value()
-			qty = f.Float64
-		}
-		name := ""
-		isEquity := false
-		if sec, ok := secMap[isin]; ok {
-			name = sec.Name
-			isEquity = sec.AssetClass == "etf"
-		}
-		taxTxns = append(taxTxns, analytics.TaxTransaction{
-			Year: txn.Date.Year(), Type: txn.Type, ISIN: isin,
-			Name: name, Quantity: qty, Amount: amt, IsEquityFund: isEquity,
-		})
-	}
-	for i, j := 0, len(taxTxns)-1; i < j; i, j = i+1, j-1 {
-		taxTxns[i], taxTxns[j] = taxTxns[j], taxTxns[i]
-	}
+	taxTxns, _, _, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
 
 	summary := analytics.ComputeTaxSummary(taxTxns, year, nil)
 
@@ -1699,7 +1927,9 @@ func (h *AnalysisHandler) HandleExportDATEV(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	txns, _ := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
 	secs, _ := h.queries.ListSecurities(ctx)
 	accts, _ := h.queries.ListAccounts(ctx)
 
@@ -1726,14 +1956,13 @@ func (h *AnalysisHandler) HandleExportDATEV(w http.ResponseWriter, r *http.Reque
 		if txn.Date.Year() != year {
 			continue
 		}
-		// Only export capital income relevant transactions
 		if txn.Type != "dividend" && txn.Type != "interest" && txn.Type != "sell" && txn.Type != "fee" {
 			continue
 		}
 		amt := 0.0
 		if txn.Amount.Valid {
 			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
+			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
 		}
 		isin := ""
 		if txn.SecurityISIN.Valid {
@@ -1745,16 +1974,15 @@ func (h *AnalysisHandler) HandleExportDATEV(w http.ResponseWriter, r *http.Reque
 		}
 		acctName := acctNames[txn.AccountID.String()]
 
-		sollHaben := "S" // Soll (debit)
-		if amt > 0 {
-			sollHaben = "H" // Haben (credit)
+		sollHaben := "S"
+		if amt > 0 && txn.Type != "fee" {
+			sollHaben = "H"
 		}
 
-		// DATEV Kontenrahmen: 2650 = Kapitalerträge, 1800 = Bank
-		konto := "1800"    // Bank account
-		gegenkonto := "2650" // Kapitalerträge
+		konto := "1800"
+		gegenkonto := "2650"
 		if txn.Type == "fee" {
-			gegenkonto = "4900" // Sonstige Aufwendungen
+			gegenkonto = "4900"
 		}
 
 		buchungstext := fmt.Sprintf("%s: %s", txn.Type, name)
@@ -1762,7 +1990,7 @@ func (h *AnalysisHandler) HandleExportDATEV(w http.ResponseWriter, r *http.Reque
 			buchungstext = buchungstext[:60]
 		}
 
-		belegdatum := txn.Date.Format("0201") // DDMM format for DATEV
+		belegdatum := txn.Date.Format("0201")
 		belegfeld := acctName
 
 		fmt.Fprintf(w, "%.2f;%s;EUR;%s;%s;%s;\"%s\";\"%s\"\n",
@@ -1781,11 +2009,13 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
 	accts, _ := h.queries.ListAccounts(ctx)
 	secs, _ := h.queries.ListSecurities(ctx)
 
@@ -1795,25 +2025,23 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 		acctNames[a.ID.String()] = a.Name
 		acctInstitution[a.ID.String()] = a.Institution
 	}
-	equityMap := make(map[string]bool)
-	secNames := make(map[string]string)
+	tfsMap := make(map[string]float64, len(secs))
 	for _, s := range secs {
-		equityMap[s.ISIN] = s.AssetClass == "etf"
-		secNames[s.ISIN] = s.Name
+		tfsMap[s.ISIN] = securityTFSRate(s)
 	}
 
 	// Per-broker aggregation
 	type brokerData struct {
 		BrokerName    string  `json:"broker_name"`
 		AccountName   string  `json:"account_name"`
-		Dividends     float64 `json:"dividends"`        // Zeile 7: Kapitalerträge
-		Interest      float64 `json:"interest"`          // Zeile 7: Zinsen
-		RealizedGains float64 `json:"realized_gains"`    // Zeile 7: Gewinne
-		RealizedLoss  float64 `json:"realized_losses"`   // Zeile 12: Verluste
-		TeilfreiAmt   float64 `json:"teilfreistellung"`  // Zeile 7: Teilfreistellung (abgezogen)
-		WithheldTax   float64 `json:"withheld_tax"`      // Zeile 37: Einbehaltene KapSt
-		SoliPaid      float64 `json:"soli_paid"`         // Zeile 38: Solidaritätszuschlag
-		FSAUsed       float64 `json:"fsa_used"`          // Zeile 37: Beanspruchter FSA
+		Dividends     float64 `json:"dividends"`       // Zeile 7: Kapitalerträge
+		Interest      float64 `json:"interest"`        // Zeile 7: Zinsen
+		RealizedGains float64 `json:"realized_gains"`  // Zeile 7: Gewinne
+		RealizedLoss  float64 `json:"realized_losses"` // Zeile 12: Verluste
+		TeilfreiAmt   float64 `json:"teilfreistellung"` // Zeile 8: Teilfreistellung
+		WithheldTax   float64 `json:"withheld_tax"`    // Zeile 37: Einbehaltene KapESt (ohne Soli)
+		SoliPaid      float64 `json:"soli_paid"`       // Zeile 38: Solidaritätszuschlag
+		FSAUsed       float64 `json:"fsa_used"`        // Zeile 16: Beanspruchter FSA
 	}
 	brokers := make(map[string]*brokerData)
 	getBroker := func(acctID string) *brokerData {
@@ -1832,9 +2060,47 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 		return b
 	}
 
-	// Track cost basis for gain computation (FIFO simplified to avg cost per broker)
-	type lot struct{ qty, totalCost float64 }
-	holdings := make(map[string]*lot) // ISIN -> lot
+	// Decompose total withheld broker tax (KapESt + Soli) into Zeile 37 KapESt
+	// and Zeile 38 Soli so Zeile 50 (37 + 38) equals the exact tax withheld.
+	addWithheldTax := func(b *brokerData, totalWithheld float64) {
+		if totalWithheld <= 0 {
+			return
+		}
+		kapESt := totalWithheld / (1 + analytics.Solidaritaetszuschlag)
+		soli := totalWithheld - kapESt
+		b.WithheldTax += kapESt
+		b.SoliPaid += soli
+	}
+
+	// Per-depot FIFO lots (§ 20 Abs. 4 Satz 7 EStG)
+	type depotKey struct {
+		acctID string
+		isin   string
+	}
+	type fifoLot struct {
+		qty     float64
+		costPer float64
+	}
+	lots := make(map[depotKey][]fifoLot)
+	consumeFIFO := func(k depotKey, qty float64) (soldQty, costBasis float64) {
+		rem := qty
+		q := lots[k]
+		for rem > 1e-9 && len(q) > 0 {
+			if q[0].qty <= rem+1e-9 {
+				soldQty += q[0].qty
+				costBasis += q[0].qty * q[0].costPer
+				rem -= q[0].qty
+				q = q[1:]
+			} else {
+				soldQty += rem
+				costBasis += rem * q[0].costPer
+				q[0].qty -= rem
+				rem = 0
+			}
+		}
+		lots[k] = q
+		return soldQty, costBasis
+	}
 
 	for i := len(txns) - 1; i >= 0; i-- { // chronological
 		txn := txns[i]
@@ -1848,7 +2114,7 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 		amt := 0.0
 		if txn.Amount.Valid {
 			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
+			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
 		}
 		qty := 0.0
 		if txn.Quantity.Valid {
@@ -1858,72 +2124,54 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 		fee := 0.0
 		if txn.Fee.Valid {
 			f, _ := txn.Fee.Float64Value()
-			fee = f.Float64
+			fee = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
 		}
 		tax := 0.0
 		if txn.Tax.Valid {
 			f, _ := txn.Tax.Float64Value()
-			tax = f.Float64
+			tax = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
 		}
 		acctID := txn.AccountID.String()
+		dk := depotKey{acctID: acctID, isin: isin}
 
 		switch txn.Type {
 		case "buy", "savings_plan", "transfer":
-			if isin == "" {
+			if isin == "" || qty <= 0 {
 				continue
 			}
-			l, ok := holdings[isin]
-			if !ok {
-				l = &lot{}
-				holdings[isin] = l
-			}
-			l.qty += qty
-			l.totalCost += amt
+			lots[dk] = append(lots[dk], fifoLot{qty: qty, costPer: (amt + fee) / qty})
 		case "transfer_out":
-			if isin == "" {
+			if isin == "" || qty <= 0 {
 				continue
 			}
-			l := holdings[isin]
-			if l != nil && l.qty > 0 {
-				avg := l.totalCost / l.qty
-				l.qty -= qty
-				l.totalCost -= qty * avg
-			}
+			consumeFIFO(dk, qty)
 		case "sell":
-			if txn.Date.Year() != year || isin == "" {
-				// Still track cost basis for pre-year sells
-				if txn.Date.Year() < year && isin != "" {
-					l := holdings[isin]
-					if l != nil && l.qty > 0 {
-						avg := l.totalCost / l.qty
-						l.qty -= qty
-						l.totalCost -= qty * avg
-					}
-				}
+			if isin == "" || qty <= 0 {
 				continue
 			}
-			l := holdings[isin]
-			if l == nil || l.qty <= 0 {
+			soldQty, costBasis := consumeFIFO(dk, qty)
+			if txn.Date.Year() != year || soldQty <= 1e-9 {
 				continue
 			}
-			avg := l.totalCost / l.qty
-			gain := amt - qty*avg - fee
-			l.qty -= qty
-			l.totalCost -= qty * avg
+			proceeds := amt - fee
+			if soldQty < qty {
+				proceeds = (amt - fee) * (soldQty / qty)
+			}
+			gain := proceeds - costBasis
 
 			b := getBroker(acctID)
 			if gain > 0 {
-				// Apply Teilfreistellung for equity funds
-				if equityMap[isin] {
-					b.TeilfreiAmt += gain * analytics.TeilfreistellungEquity
-					gain *= (1 - analytics.TeilfreistellungEquity)
+				tfs := tfsMap[isin]
+				if tfs > 0 {
+					b.TeilfreiAmt += gain * tfs
+					gain *= (1 - tfs)
 				}
 				b.RealizedGains += gain
 			} else {
-				b.RealizedLoss += gain // negative
+				// Preserved at full negative magnitude per anlage_kap_test.go contract
+				b.RealizedLoss += gain
 			}
-			b.WithheldTax += tax
-			b.SoliPaid += tax * 0.055
+			addWithheldTax(b, tax)
 
 		case "dividend":
 			if txn.Date.Year() != year {
@@ -1931,13 +2179,13 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 			}
 			b := getBroker(acctID)
 			divAmt := amt
-			if equityMap[isin] {
-				b.TeilfreiAmt += divAmt * analytics.TeilfreistellungEquity
-				divAmt *= (1 - analytics.TeilfreistellungEquity)
+			tfs := tfsMap[isin]
+			if tfs > 0 {
+				b.TeilfreiAmt += divAmt * tfs
+				divAmt *= (1 - tfs)
 			}
 			b.Dividends += divAmt
-			b.WithheldTax += tax
-			b.SoliPaid += tax * 0.055
+			addWithheldTax(b, tax)
 
 		case "interest":
 			if txn.Date.Year() != year {
@@ -1945,8 +2193,7 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 			}
 			b := getBroker(acctID)
 			b.Interest += amt
-			b.WithheldTax += tax
-			b.SoliPaid += tax * 0.055
+			addWithheldTax(b, tax)
 		}
 	}
 
@@ -1990,7 +2237,6 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 	afterFSA := math.Max(netTaxable-fsaApplied, 0)
 	estimatedTax := afterFSA * analytics.EffectiveTaxRate
 
-	// Anlage KAP line mapping
 	type kapLine struct {
 		Line        int     `json:"line"`
 		Description string  `json:"description"`
@@ -2004,15 +2250,9 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 		{16, "In Anspruch genommener Sparer-Pauschbetrag", math.Round(fsaApplied*100) / 100},
 		{37, "Einbehaltene Kapitalertragsteuer", math.Round(totalWithheld*100) / 100},
 		{38, "Einbehaltener Solidaritätszuschlag", math.Round(totalSoli*100) / 100},
-		{50, "Anzurechnende Steuer (Zeile 37 + 38)", math.Round((totalWithheld + totalSoli) * 100) / 100},
+		{50, "Anzurechnende Steuer (Zeile 37 + 38)", math.Round((totalWithheld+totalSoli)*100) / 100},
 	}
 
-	// Cross-broker note — fires whenever taxable income spans 2+ institutions,
-	// since the Sparerpauschbetrag is bank-specific (each broker withholds
-	// against its own FSA allocation) and Anlage KAP is the mechanism for
-	// reconciling unused FSA at one broker against income at another. The
-	// stronger loss-offset message wins when a gain/loss split is also
-	// available — that's the higher-value action.
 	crossBrokerNote := ""
 	if len(brokerList) > 1 {
 		hasGainBroker := false
@@ -2042,7 +2282,7 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 		"net_taxable":       math.Round(netTaxable*100) / 100,
 		"fsa_applied":       math.Round(fsaApplied*100) / 100,
 		"estimated_tax":     math.Round(estimatedTax*100) / 100,
-		"total_withheld":    math.Round(totalWithheld*100) / 100,
+		"total_withheld":    math.Round((totalWithheld+totalSoli)*100) / 100,
 		"cross_broker_note": crossBrokerNote,
 		"broker_count":      len(brokerList),
 	})
@@ -2052,7 +2292,6 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 func (h *AnalysisHandler) HandleInflation(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// German HVPI annual rates (Statistisches Bundesamt, approximate)
 	cpiRates := map[int]float64{
 		2020: 0.5, 2021: 3.1, 2022: 6.9, 2023: 5.9, 2024: 2.2, 2025: 2.0, 2026: 2.0,
 	}
@@ -2063,8 +2302,6 @@ func (h *AnalysisHandler) HandleInflation(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Build monthly CPI index (base = latest month = 100)
-	// Work backwards from most recent, deflating by annual rate / 12
 	type inflPoint struct {
 		Date     string  `json:"date"`
 		Nominal  float64 `json:"nominal"`
@@ -2072,7 +2309,6 @@ func (h *AnalysisHandler) HandleInflation(w http.ResponseWriter, r *http.Request
 		CpiIndex float64 `json:"cpi_index"`
 	}
 
-	// Compute CPI index per month relative to present
 	cpiIndex := make(map[string]float64)
 	now := snaps[0].Date
 	cpiIndex[now.Format("2006-01")] = 100.0
@@ -2082,19 +2318,24 @@ func (h *AnalysisHandler) HandleInflation(w http.ResponseWriter, r *http.Request
 		if _, exists := cpiIndex[month]; exists {
 			continue
 		}
-		// Monthly inflation = annual rate / 12
 		yr := d.Year()
 		annualRate := cpiRates[yr]
 		if annualRate == 0 {
 			annualRate = 2.0
 		}
+		if annualRate <= -99.99 {
+			annualRate = -99.99
+		}
 		monthsFromNow := now.Sub(d).Hours() / (24 * 30.44)
-		// CPI at date = 100 / (1 + rate)^(months/12)
-		cpiIndex[month] = 100.0 / math.Pow(1+annualRate/100, monthsFromNow/12)
+		denom := math.Pow(1+annualRate/100, monthsFromNow/12)
+		if denom <= 0 || math.IsNaN(denom) || math.IsInf(denom, 0) {
+			cpiIndex[month] = 100.0
+		} else {
+			cpiIndex[month] = 100.0 / denom
+		}
 	}
 
-	// Build time series
-	var history []inflPoint
+	history := []inflPoint{}
 	lastMonth := ""
 	for i := len(snaps) - 1; i >= 0; i-- {
 		s := snaps[i]
@@ -2109,10 +2350,10 @@ func (h *AnalysisHandler) HandleInflation(w http.ResponseWriter, r *http.Request
 			nominal = f.Float64
 		}
 		cpi := cpiIndex[month]
-		if cpi <= 0 {
+		if cpi <= 0 || math.IsNaN(cpi) || math.IsInf(cpi, 0) {
 			cpi = 100
 		}
-		real := nominal * (100.0 / cpi) // adjust to today's euros
+		real := nominal * (100.0 / cpi)
 		history = append(history, inflPoint{
 			Date:     month,
 			Nominal:  math.Round(nominal),
@@ -2121,18 +2362,16 @@ func (h *AnalysisHandler) HandleInflation(w http.ResponseWriter, r *http.Request
 		})
 	}
 
-	// Compute summary — use 12-month return if available, else total return
 	if len(history) > 1 {
 		last := history[len(history)-1]
-		// Find the point ~12 months ago for annualized comparison
 		baseIdx := 0
 		if len(history) > 12 {
-			baseIdx = len(history) - 13 // ~12 months ago
+			baseIdx = len(history) - 13
 		}
 		base := history[baseIdx]
 		nominalReturn := 0.0
 		realReturn := 0.0
-		if base.Nominal > 1000 { // only show % when base is meaningful
+		if base.Nominal > 1000 {
 			nominalReturn = ((last.Nominal - base.Nominal) / base.Nominal) * 100
 		}
 		if base.Real > 1000 {
@@ -2141,9 +2380,9 @@ func (h *AnalysisHandler) HandleInflation(w http.ResponseWriter, r *http.Request
 		erosion := last.Nominal - last.Real
 
 		writeJSON(w, http.StatusOK, map[string]any{
-			"history":        history,
-			"nominal_return": math.Round(nominalReturn*10) / 10,
-			"real_return":    math.Round(realReturn*10) / 10,
+			"history":               history,
+			"nominal_return":        math.Round(nominalReturn*10) / 10,
+			"real_return":           math.Round(realReturn*10) / 10,
 			"purchasing_power_lost": math.Round(erosion),
 		})
 		return
@@ -2159,95 +2398,144 @@ func (h *AnalysisHandler) HandleBenchmarkComparison(w http.ResponseWriter, r *ht
 
 	benchISIN := r.URL.Query().Get("isin")
 	if benchISIN == "" {
-		benchISIN = "IE00B4L5Y983" // default MSCI World
+		benchISIN = h.benchmarkISIN
+		if benchISIN == "" {
+			benchISIN = "IE00B4L5Y983" // default MSCI World
+		}
 	}
 
-	// Load benchmark price history
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+
 	benchPrices, err := h.queries.ListPriceHistory(ctx, benchISIN)
-	if err != nil || len(benchPrices) < 30 {
-		writeError(w, http.StatusBadRequest, "insufficient benchmark price data")
+	if err != nil || len(benchPrices) < benchmarkMinPrices {
+		// Not an error: the benchmark simply has too little history yet. Answer 200 with a
+		// machine-readable shape so the page can explain what is missing instead of failing.
+		benchName := benchISIN
+		if sec, secErr := h.queries.GetSecurity(ctx, benchISIN); secErr == nil && sec.Name != "" {
+			benchName = sec.Name
+		}
+		have := 0
+		if err == nil {
+			have = len(benchPrices)
+		}
+		writeJSON(w, http.StatusOK, benchmarkInsufficientResponse(benchISIN, benchName, have))
 		return
 	}
-	priceByDate := make(map[string]float64)
+	priceByDate := make(map[string]float64, len(benchPrices))
 	for _, p := range benchPrices {
 		if p.Close.Valid {
 			f, _ := p.Close.Float64Value()
-			priceByDate[p.Date.Format("2006-01-02")] = f.Float64
+			eurP := convertAmountToEURAtDate(f.Float64, p.Currency, p.Date, histFX, fxRates)
+			if eurP > 0 {
+				priceByDate[p.Date.Format("2006-01-02")] = eurP
+			}
 		}
 	}
-	// Get latest benchmark price
 	latestBenchPrice := 0.0
-	if benchPrices[len(benchPrices)-1].Close.Valid {
-		f, _ := benchPrices[len(benchPrices)-1].Close.Float64Value()
-		latestBenchPrice = f.Float64
+	lastRow := benchPrices[len(benchPrices)-1]
+	if lastRow.Close.Valid {
+		f, _ := lastRow.Close.Float64Value()
+		latestBenchPrice = convertAmountToEUR(f.Float64, lastRow.Currency, fxRates)
 	}
 
-	// Helper: find closest price on or before date
 	closestPrice := func(date time.Time) float64 {
 		for d := 0; d < 14; d++ {
 			key := date.AddDate(0, 0, -d).Format("2006-01-02")
-			if p, ok := priceByDate[key]; ok { return p }
+			if p, ok := priceByDate[key]; ok {
+				return p
+			}
 		}
 		return 0
 	}
 
-	// Load user transactions (deposits only)
-	txns, _ := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
+	accts, _ := h.queries.ListAccounts(ctx)
+	txnsChrono := make([]db.ListTransactionsRow, len(txns))
+	for i := range txns {
+		txnsChrono[i] = txns[len(txns)-1-i]
+	}
+	impEvents := computeImplicitCashClampEvents(accts, txnsChrono, histFX, fxRates)
 
-	// Replay: for each deposit, compute how many benchmark shares user could have bought
+	type flowEvent struct {
+		date time.Time
+		amt  float64
+	}
+	var contribFlows []flowEvent
+	for _, ev := range impEvents {
+		if ev.DeltaEUR != 0 {
+			contribFlows = append(contribFlows, flowEvent{date: ev.Date, amt: ev.DeltaEUR})
+		}
+	}
+	for _, txn := range txnsChrono {
+		switch txn.Type {
+		case "deposit":
+			if txn.Amount.Valid {
+				f, _ := txn.Amount.Float64Value()
+				amt := convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
+				if amt > 0 {
+					contribFlows = append(contribFlows, flowEvent{date: txn.Date, amt: amt})
+				}
+			}
+		case "withdrawal":
+			if txn.Amount.Valid {
+				f, _ := txn.Amount.Float64Value()
+				amt := convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
+				if amt > 0 {
+					contribFlows = append(contribFlows, flowEvent{date: txn.Date, amt: -amt})
+				}
+			}
+		}
+	}
+	sort.SliceStable(contribFlows, func(i, j int) bool {
+		if contribFlows[i].date.Equal(contribFlows[j].date) {
+			return (contribFlows[i].amt > 0) && !(contribFlows[j].amt > 0)
+		}
+		return contribFlows[i].date.Before(contribFlows[j].date)
+	})
+
 	benchShares := 0.0
-	totalDeposited := 0.0
+	for _, cf := range contribFlows {
+		price := closestPrice(cf.date)
+		if price > 0 {
+			benchShares = math.Max(0, benchShares+cf.amt/price)
+		}
+	}
+	benchValue := benchShares * latestBenchPrice
+
 	type replayPoint struct {
-		Date       string  `json:"date"`
-		Actual     float64 `json:"actual"`
-		Benchmark  float64 `json:"benchmark"`
+		Date      string  `json:"date"`
+		Actual    float64 `json:"actual"`
+		Benchmark float64 `json:"benchmark"`
 	}
 
-	// Build monthly snapshots
 	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 5000)
 	snapByMonth := make(map[string]float64)
 	for _, s := range snaps {
 		m := s.Date.Format("2006-01")
-		if s.Total.Valid {
+		if _, exists := snapByMonth[m]; !exists && s.Total.Valid {
 			f, _ := s.Total.Float64Value()
 			snapByMonth[m] = f.Float64
 		}
 	}
 
-	// Process deposits chronologically
-	for i := len(txns) - 1; i >= 0; i-- {
-		txn := txns[i]
-		if txn.Type != "deposit" && txn.Type != "cash_transfer_in" { continue }
-		amt := 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
-		}
-		price := closestPrice(txn.Date)
-		if price > 0 {
-			benchShares += amt / price
-		}
-		totalDeposited += amt
-	}
-
-	benchValue := benchShares * latestBenchPrice
-
-	// Build comparison chart (monthly)
-	var comparison []replayPoint
+	comparison := []replayPoint{}
 	lastMonth := ""
 	runningShares := 0.0
-	for i := len(txns) - 1; i >= 0; i-- {
-		txn := txns[i]
-		if txn.Type == "deposit" || txn.Type == "cash_transfer_in" {
-			amt := 0.0
-			if txn.Amount.Valid { f, _ := txn.Amount.Float64Value(); amt = f.Float64 }
-			price := closestPrice(txn.Date)
-			if price > 0 { runningShares += amt / price }
+	cfIdx := 0
+	for _, txn := range txnsChrono {
+		for cfIdx < len(contribFlows) && !contribFlows[cfIdx].date.After(txn.Date) {
+			price := closestPrice(contribFlows[cfIdx].date)
+			if price > 0 {
+				runningShares = math.Max(0, runningShares+contribFlows[cfIdx].amt/price)
+			}
+			cfIdx++
 		}
 		m := txn.Date.Format("2006-01")
-		if m == lastMonth { continue }
+		if m == lastMonth {
+			continue
+		}
 		lastMonth = m
-		// Benchmark value at this month
 		bPrice := closestPrice(txn.Date)
 		bVal := runningShares * bPrice
 		actual := snapByMonth[m]
@@ -2258,7 +2546,6 @@ func (h *AnalysisHandler) HandleBenchmarkComparison(w http.ResponseWriter, r *ht
 		}
 	}
 
-	// Get benchmark name
 	benchName := benchISIN
 	if sec, err := h.queries.GetSecurity(ctx, benchISIN); err == nil {
 		benchName = sec.Name
@@ -2278,7 +2565,35 @@ func (h *AnalysisHandler) HandleBenchmarkComparison(w http.ResponseWriter, r *ht
 		"benchmark_value": math.Round(benchValue),
 		"difference":      math.Round(diff),
 		"comparison":      comparison,
+		"available":       true,
+		"have":            len(benchPrices),
+		"need":            benchmarkMinPrices,
 	})
+}
+
+// benchmarkMinPrices is the number of benchmark price rows needed before the
+// "what if you had bought the benchmark" replay is meaningful.
+const benchmarkMinPrices = 30
+
+// benchmarkInsufficientResponse is the 200 body returned when the benchmark has fewer
+// than benchmarkMinPrices price rows. It keeps every field of the normal response
+// (zeroed, with an empty comparison array) and adds available/have/need/reason.
+func benchmarkInsufficientResponse(isin, name string, have int) map[string]any {
+	if have < 0 {
+		have = 0
+	}
+	return map[string]any{
+		"benchmark_name":  name,
+		"benchmark_isin":  isin,
+		"actual_value":    0.0,
+		"benchmark_value": 0.0,
+		"difference":      0.0,
+		"comparison":      []any{},
+		"available":       false,
+		"reason":          "insufficient_data",
+		"have":            have,
+		"need":            benchmarkMinPrices,
+	}
 }
 
 // HandleHealthScore computes a 0-100 portfolio health score from existing metrics.
@@ -2291,95 +2606,136 @@ func (h *AnalysisHandler) HandleHealthScore(w http.ResponseWriter, r *http.Reque
 	}
 
 	type subScore struct {
-		Name   string  `json:"name"`
-		Score  int     `json:"score"`
-		Weight int     `json:"weight"`
-		Status string  `json:"status"`
-		Detail string  `json:"detail"`
+		Name   string `json:"name"`
+		Score  int    `json:"score"`
+		Weight int    `json:"weight"`
+		Status string `json:"status"`
+		Detail string `json:"detail"`
 	}
 
-	// 1. Diversification (25%) — based on number of holdings and max weight
-	maxWeight := 0.0
+	// 1. Diversification (25%) — aggregate multi-account positions by ISIN
+	valByISIN := make(map[string]float64)
 	totalValue := 0.0
 	for _, eh := range enriched {
 		totalValue += eh.value
+		valByISIN[eh.security.ISIN] += eh.value
 	}
-	seen := make(map[string]bool)
-	for _, eh := range enriched {
-		if seen[eh.security.ISIN] { continue }
-		seen[eh.security.ISIN] = true
-		w := eh.value / totalValue * 100
-		if w > maxWeight { maxWeight = w }
+	maxWeight := 0.0
+	if totalValue > 0 {
+		for _, v := range valByISIN {
+			w := v / totalValue * 100
+			if w > maxWeight {
+				maxWeight = w
+			}
+		}
 	}
-	numHoldings := len(seen)
+	numHoldings := len(valByISIN)
 	divScore := 50
-	if numHoldings >= 5 { divScore = 70 }
-	if numHoldings >= 8 { divScore = 85 }
-	if maxWeight < 40 { divScore += 15 }
-	if maxWeight < 25 { divScore += 10 }
-	if divScore > 100 { divScore = 100 }
+	if numHoldings >= 5 {
+		divScore = 70
+	}
+	if numHoldings >= 8 {
+		divScore = 85
+	}
+	if maxWeight < 40 {
+		divScore += 15
+	}
+	if maxWeight < 25 {
+		divScore += 10
+	}
+	if divScore > 100 {
+		divScore = 100
+	}
 	divDetail := fmt.Sprintf("%d holdings, max weight %.0f%%", numHoldings, maxWeight)
 
 	// 2. Cost Efficiency (15%) — based on weighted avg TER
 	weightedTER := 0.0
-	for _, eh := range enriched {
-		ter := numericToFloat(eh.security.TER)
-		if ter > 0 {
-			weightedTER += (eh.value / totalValue) * ter
+	if totalValue > 0 {
+		for _, eh := range enriched {
+			ter := numericToFloat(eh.security.TER)
+			if ter > 0 {
+				weightedTER += (eh.value / totalValue) * ter
+			}
 		}
 	}
 	costScore := 90
-	if weightedTER > 0.10 { costScore = 80 }
-	if weightedTER > 0.20 { costScore = 65 }
-	if weightedTER > 0.40 { costScore = 40 }
+	if weightedTER > 0.10 {
+		costScore = 80
+	}
+	if weightedTER > 0.20 {
+		costScore = 65
+	}
+	if weightedTER > 0.40 {
+		costScore = 40
+	}
 	costDetail := fmt.Sprintf("Weighted TER %.2f%%", weightedTER)
 
-	// 3. Risk Balance (20%) — based on Sharpe ratio from risk endpoint
+	// 3. Risk Balance (20%) — based on cashflow-adjusted Sharpe ratio
 	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 3000)
 	points := make([]analytics.DailyValuation, 0, len(snaps))
 	for i := len(snaps) - 1; i >= 0; i-- {
 		val := 0.0
-		if snaps[i].Total.Valid { f, _ := snaps[i].Total.Float64Value(); val = f.Float64 }
-		if val > 0 { points = append(points, analytics.DailyValuation{Date: snaps[i].Date, Value: val}) }
+		if snaps[i].Total.Valid {
+			f, _ := snaps[i].Total.Float64Value()
+			val = f.Float64
+		}
+		if val > 0 {
+			points = append(points, analytics.DailyValuation{Date: snaps[i].Date, Value: val})
+		}
 	}
 	riskScore := 50
 	riskDetail := "insufficient data"
 	if len(points) > 60 {
-		metrics := analytics.ComputeRiskMetrics(points, 0.03, points[len(points)-1].Value)
+		adjustedPoints := analytics.BuildCashflowAdjustedSeries(points, h.buildExternalFlowsForRisk(ctx))
+		metrics := analytics.ComputeRiskMetrics(adjustedPoints, 0.03, points[len(points)-1].Value)
 		sharpe := metrics.SharpeRatio
-		if sharpe >= 1.0 { riskScore = 95 } else if sharpe >= 0.5 { riskScore = 80 } else if sharpe >= 0 { riskScore = 60 } else { riskScore = 30 }
+		if sharpe >= 1.0 {
+			riskScore = 95
+		} else if sharpe >= 0.5 {
+			riskScore = 80
+		} else if sharpe >= 0 {
+			riskScore = 60
+		} else {
+			riskScore = 30
+		}
 		riskDetail = fmt.Sprintf("Sharpe %.2f, Vol %.1f%%", sharpe, metrics.AnnualizedVolatility)
 	}
 
-	// 4. Allocation Discipline (25%) — 100 if no targets, score based on max drift if targets set
+	// 4. Allocation Discipline (25%) — score based on max drift if targets set
 	allocScore := 75 // default when no targets
 	allocDetail := "no targets set"
 	targets, _ := h.queries.ListTargetAllocations(ctx)
-	if len(targets) > 0 {
+	if len(targets) > 0 && totalValue > 0 {
 		maxDrift := 0.0
-		for _, eh := range enriched {
-			actual := eh.value / totalValue * 100
-			for _, t := range targets {
-				if t.SecurityISIN == eh.security.ISIN {
-					drift := math.Abs(actual - numericToFloat(t.TargetWeightPct))
-					if drift > maxDrift { maxDrift = drift }
-				}
+		for _, t := range targets {
+			actual := valByISIN[t.SecurityISIN] / totalValue * 100
+			drift := math.Abs(actual - numericToFloat(t.TargetWeightPct))
+			if drift > maxDrift {
+				maxDrift = drift
 			}
 		}
 		allocScore = 95
-		if maxDrift > 2 { allocScore = 80 }
-		if maxDrift > 5 { allocScore = 60 }
-		if maxDrift > 10 { allocScore = 35 }
+		if maxDrift > 2 {
+			allocScore = 80
+		}
+		if maxDrift > 5 {
+			allocScore = 60
+		}
+		if maxDrift > 10 {
+			allocScore = 35
+		}
 		allocDetail = fmt.Sprintf("max drift %.1f%%", maxDrift)
 	}
 
 	// 5. Income Stability (15%) — based on dividend consistency
 	incScore := 70
 	incDetail := "no dividend data"
-	txns, _ := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
 	divMonths := make(map[string]bool)
 	for _, txn := range txns {
-		if txn.Type == "dividend" { divMonths[txn.Date.Format("2006-01")] = true }
+		if txn.Type == "dividend" {
+			divMonths[txn.Date.Format("2006-01")] = true
+		}
 	}
 	if len(divMonths) > 0 {
 		incScore = 50
@@ -2413,47 +2769,28 @@ func (h *AnalysisHandler) HandleHealthScore(w http.ResponseWriter, r *http.Reque
 // HandleTaxLots returns FIFO lot inventory with per-lot tax impact.
 func (h *AnalysisHandler) HandleTaxLots(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
 	secs, _ := h.queries.ListSecurities(ctx)
-	secMap := make(map[string]db.Security)
-	names := make(map[string]string)
-	equityMap := make(map[string]bool)
-	for _, s := range secs {
-		secMap[s.ISIN] = s
-		names[s.ISIN] = s.Name
-		equityMap[s.ISIN] = s.AssetClass == "etf"
-	}
+	taxTxns, names, _, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
 
-	var taxTxns []analytics.TaxTransaction
-	for _, txn := range txns {
-		isin := ""
-		if txn.SecurityISIN.Valid { isin = txn.SecurityISIN.String }
-		amt, qty := 0.0, 0.0
-		if txn.Amount.Valid { f, _ := txn.Amount.Float64Value(); amt = f.Float64 }
-		if txn.Quantity.Valid { f, _ := txn.Quantity.Float64Value(); qty = f.Float64 }
-		taxTxns = append(taxTxns, analytics.TaxTransaction{
-			Year: txn.Date.Year(), Type: txn.Type, ISIN: isin,
-			Name: names[isin], Quantity: qty, Amount: amt, IsEquityFund: equityMap[isin],
-		})
-	}
-	// Reverse to chronological
-	for i, j := 0, len(taxTxns)-1; i < j; i, j = i+1, j-1 {
-		taxTxns[i], taxTxns[j] = taxTxns[j], taxTxns[i]
-	}
-
-	// Get current prices from active holdings
+	// Get current EUR prices from active holdings
 	prices := make(map[string]float64)
 	activeISINs := make(map[string]bool)
 	enriched, _ := h.loadEnrichedHoldings(ctx)
 	for _, eh := range enriched {
 		if eh.value > 0 {
 			qty := 0.0
-			if eh.holding.Quantity.Valid { f, _ := eh.holding.Quantity.Float64Value(); qty = f.Float64 }
+			if eh.holding.Quantity.Valid {
+				f, _ := eh.holding.Quantity.Float64Value()
+				qty = f.Float64
+			}
 			if qty > 0 {
 				prices[eh.security.ISIN] = eh.value / qty
 				activeISINs[eh.security.ISIN] = true
@@ -2464,7 +2801,7 @@ func (h *AnalysisHandler) HandleTaxLots(w http.ResponseWriter, r *http.Request) 
 	lots := analytics.ComputeTaxLots(taxTxns, prices, names, equityMap)
 
 	// Filter out lots for ISINs no longer held (price=0 means sold/no market data)
-	filtered := lots[:0]
+	filtered := make([]analytics.TaxLot, 0, len(lots))
 	for _, lot := range lots {
 		if activeISINs[lot.ISIN] || prices[lot.ISIN] > 0 {
 			filtered = append(filtered, lot)
@@ -2481,37 +2818,24 @@ func (h *AnalysisHandler) HandleSellSimulator(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
+	for _, req := range requests {
+		if math.IsNaN(req.AmountEUR) || math.IsInf(req.AmountEUR, 0) || req.AmountEUR < 0 {
+			writeError(w, http.StatusBadRequest, "sell amount must be a finite non-negative number")
+			return
+		}
+	}
 
 	ctx := r.Context()
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
 	secs, _ := h.queries.ListSecurities(ctx)
-	names := make(map[string]string)
-	equityMap := make(map[string]bool)
-	for _, s := range secs {
-		names[s.ISIN] = s.Name
-		equityMap[s.ISIN] = s.AssetClass == "etf"
-	}
-
-	var taxTxns []analytics.TaxTransaction
-	for _, txn := range txns {
-		isin := ""
-		if txn.SecurityISIN.Valid { isin = txn.SecurityISIN.String }
-		amt, qty := 0.0, 0.0
-		if txn.Amount.Valid { f, _ := txn.Amount.Float64Value(); amt = f.Float64 }
-		if txn.Quantity.Valid { f, _ := txn.Quantity.Float64Value(); qty = f.Float64 }
-		taxTxns = append(taxTxns, analytics.TaxTransaction{
-			Year: txn.Date.Year(), Type: txn.Type, ISIN: isin,
-			Name: names[isin], Quantity: qty, Amount: amt, IsEquityFund: equityMap[isin],
-		})
-	}
-	for i, j := 0, len(taxTxns)-1; i < j; i, j = i+1, j-1 {
-		taxTxns[i], taxTxns[j] = taxTxns[j], taxTxns[i]
-	}
+	taxTxns, names, _, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
 
 	prices := make(map[string]float64)
 	activeISINs := make(map[string]bool)
@@ -2519,7 +2843,10 @@ func (h *AnalysisHandler) HandleSellSimulator(w http.ResponseWriter, r *http.Req
 	for _, eh := range enriched {
 		if eh.value > 0 {
 			qty := 0.0
-			if eh.holding.Quantity.Valid { f, _ := eh.holding.Quantity.Float64Value(); qty = f.Float64 }
+			if eh.holding.Quantity.Valid {
+				f, _ := eh.holding.Quantity.Float64Value()
+				qty = f.Float64
+			}
 			if qty > 0 {
 				prices[eh.security.ISIN] = eh.value / qty
 				activeISINs[eh.security.ISIN] = true
@@ -2528,7 +2855,6 @@ func (h *AnalysisHandler) HandleSellSimulator(w http.ResponseWriter, r *http.Req
 	}
 
 	allLots := analytics.ComputeTaxLots(taxTxns, prices, names, equityMap)
-	// Filter to active
 	var lots []analytics.TaxLot
 	for _, lot := range allLots {
 		if activeISINs[lot.ISIN] {
@@ -2536,62 +2862,46 @@ func (h *AnalysisHandler) HandleSellSimulator(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// Church tax (Kirchensteuer) surcharge on the Abgeltungssteuer. 0 (no
-	// church) is the safe default; 0.08 (BY/BW) and 0.09 (other) are the
-	// real-world configurable values. Read from query so the simulator can
-	// be re-run without persisting state server-side.
 	churchTaxRate := 0.0
 	if v := r.URL.Query().Get("church_tax"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
+		if f, err := parseFiniteFloat(v); err == nil && f >= 0 && f <= 1 {
 			churchTaxRate = f
 		}
 	}
 	results, totalTax, totalProceeds := analytics.SimulateSell(lots, requests, churchTaxRate)
+	if results == nil {
+		results = []analytics.SellSimResult{}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"results":              results,
-		"total_tax":            totalTax,
-		"total_proceeds":       totalProceeds,
-		"effective_rate":       math.Round(analytics.SellTaxRate(churchTaxRate)*100000) / 100000,
-		"church_tax_rate":      churchTaxRate,
+		"results":         results,
+		"total_tax":       totalTax,
+		"total_proceeds":  totalProceeds,
+		"effective_rate":  math.Round(analytics.SellTaxRate(churchTaxRate)*100000) / 100000,
+		"church_tax_rate": churchTaxRate,
 	})
 }
 
 // HandleLossPots returns the German Aktienverlusttopf / allgemeiner Verlusttopf per year.
 func (h *AnalysisHandler) HandleLossPots(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
 	secs, _ := h.queries.ListSecurities(ctx)
-	equityMap := make(map[string]bool)
-	for _, s := range secs {
-		equityMap[s.ISIN] = s.AssetClass == "etf" // simplified: ETFs are equity
-	}
-
-	var taxTxns []analytics.TaxTransaction
-	for _, txn := range txns {
-		isin := ""
-		if txn.SecurityISIN.Valid { isin = txn.SecurityISIN.String }
-		amt, qty := 0.0, 0.0
-		if txn.Amount.Valid { f, _ := txn.Amount.Float64Value(); amt = f.Float64 }
-		if txn.Quantity.Valid { f, _ := txn.Quantity.Float64Value(); qty = f.Float64 }
-		taxTxns = append(taxTxns, analytics.TaxTransaction{
-			Year: txn.Date.Year(), Type: txn.Type, ISIN: isin,
-			Quantity: qty, Amount: amt, IsEquityFund: equityMap[isin],
-		})
-	}
-	// Reverse to chronological
-	for i, j := 0, len(taxTxns)-1; i < j; i, j = i+1, j-1 {
-		taxTxns[i], taxTxns[j] = taxTxns[j], taxTxns[i]
-	}
+	taxTxns, _, tfsMap, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
 
 	pots := analytics.ComputeLossPots(taxTxns)
+	if pots == nil {
+		pots = []analytics.LossPotYear{}
+	}
 
-	// Per-account loss pots for current year (cross-broker netting)
+	// Per-account loss pots for current year (cross-broker netting, per-depot FIFO)
 	accts, _ := h.queries.ListAccounts(ctx)
 	acctNames := make(map[string]string)
 	for _, a := range accts {
@@ -2600,72 +2910,120 @@ func (h *AnalysisHandler) HandleLossPots(w http.ResponseWriter, r *http.Request)
 
 	currentYear := time.Now().Year()
 	type acctPot struct {
-		Account      string  `json:"account"`
-		EquityGains  float64 `json:"equity_gains"`
-		EquityLosses float64 `json:"equity_losses"`
-		GeneralGains float64 `json:"general_gains"`
+		Account       string  `json:"account"`
+		EquityGains   float64 `json:"equity_gains"`
+		EquityLosses  float64 `json:"equity_losses"`
+		GeneralGains  float64 `json:"general_gains"`
 		GeneralLosses float64 `json:"general_losses"`
 	}
 	acctPots := make(map[string]*acctPot)
-	// Track cost basis per ISIN
-	type lot struct{ qty, totalCost float64 }
-	holdings := make(map[string]*lot)
+	type depotKey struct {
+		acctID string
+		isin   string
+	}
+	type fifoLot struct {
+		qty     float64
+		costPer float64
+	}
+	lots := make(map[depotKey][]fifoLot)
+	consumeFIFO := func(k depotKey, qty float64) (soldQty, costBasis float64) {
+		rem := qty
+		q := lots[k]
+		for rem > 1e-9 && len(q) > 0 {
+			if q[0].qty <= rem+1e-9 {
+				soldQty += q[0].qty
+				costBasis += q[0].qty * q[0].costPer
+				rem -= q[0].qty
+				q = q[1:]
+			} else {
+				soldQty += rem
+				costBasis += rem * q[0].costPer
+				q[0].qty -= rem
+				rem = 0
+			}
+		}
+		lots[k] = q
+		return soldQty, costBasis
+	}
 
-	for i := len(txns) - 1; i >= 0; i-- { // chronological
-		txn := txns[i]
-		isin := ""
-		if txn.SecurityISIN.Valid { isin = txn.SecurityISIN.String }
-		amt, qty := 0.0, 0.0
-		if txn.Amount.Valid { f, _ := txn.Amount.Float64Value(); amt = f.Float64 }
-		if txn.Quantity.Valid { f, _ := txn.Quantity.Float64Value(); qty = f.Float64 }
-		acctID := txn.AccountID.String()
-
+	for _, txn := range taxTxns { // already chronological
+		dk := depotKey{acctID: txn.AccountID, isin: txn.ISIN}
 		switch txn.Type {
 		case "buy", "savings_plan", "transfer":
-			if isin == "" { continue }
-			l, ok := holdings[isin]; if !ok { l = &lot{}; holdings[isin] = l }
-			l.qty += qty; l.totalCost += amt
-		case "transfer_out":
-			if isin == "" { continue }
-			if l := holdings[isin]; l != nil && l.qty > 0 {
-				avg := l.totalCost / l.qty; l.qty -= qty; l.totalCost -= qty * avg
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
 			}
+			lots[dk] = append(lots[dk], fifoLot{qty: txn.Quantity, costPer: txn.Amount / txn.Quantity})
+		case "transfer_out":
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
+			}
+			consumeFIFO(dk, txn.Quantity)
 		case "sell":
-			if isin == "" || txn.Date.Year() != currentYear { continue }
-			l := holdings[isin]; if l == nil || l.qty <= 0 { continue }
-			avg := l.totalCost / l.qty
-			pl := amt - qty*avg
-			l.qty -= qty; l.totalCost -= qty * avg
-			if equityMap[isin] { pl *= (1 - analytics.TeilfreistellungEquity) }
-			ap, ok := acctPots[acctID]; if !ok { ap = &acctPot{Account: acctNames[acctID]}; acctPots[acctID] = ap }
-			if equityMap[isin] {
-				if pl >= 0 { ap.EquityGains += pl } else { ap.EquityLosses += pl }
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
+			}
+			// Always deduct sold lots across all prior years BEFORE filtering by currentYear!
+			soldQty, costBasis := consumeFIFO(dk, txn.Quantity)
+			if txn.Year != currentYear || soldQty <= 1e-9 {
+				continue
+			}
+			proceeds := txn.Amount
+			if soldQty < txn.Quantity {
+				proceeds = txn.Amount * (soldQty / txn.Quantity)
+			}
+			pl := (proceeds - costBasis) * (1 - tfsMap[txn.ISIN])
+			ap, ok := acctPots[txn.AccountID]
+			if !ok {
+				ap = &acctPot{Account: acctNames[txn.AccountID]}
+				acctPots[txn.AccountID] = ap
+			}
+			if equityMap[txn.ISIN] {
+				if pl >= 0 {
+					ap.EquityGains += pl
+				} else {
+					ap.EquityLosses += pl
+				}
 			} else {
-				if pl >= 0 { ap.GeneralGains += pl } else { ap.GeneralLosses += pl }
+				if pl >= 0 {
+					ap.GeneralGains += pl
+				} else {
+					ap.GeneralLosses += pl
+				}
 			}
 		case "dividend":
-			if txn.Date.Year() != currentYear { continue }
-			divAmt := amt
-			if equityMap[isin] { divAmt *= (1 - analytics.TeilfreistellungEquity) }
-			ap, ok := acctPots[acctID]; if !ok { ap = &acctPot{Account: acctNames[acctID]}; acctPots[acctID] = ap }
+			if txn.Year != currentYear {
+				continue
+			}
+			divAmt := txn.Amount * (1 - tfsMap[txn.ISIN])
+			ap, ok := acctPots[txn.AccountID]
+			if !ok {
+				ap = &acctPot{Account: acctNames[txn.AccountID]}
+				acctPots[txn.AccountID] = ap
+			}
 			ap.GeneralGains += divAmt
 		case "interest":
-			if txn.Date.Year() != currentYear { continue }
-			ap, ok := acctPots[acctID]; if !ok { ap = &acctPot{Account: acctNames[acctID]}; acctPots[acctID] = ap }
-			ap.GeneralGains += amt
+			if txn.Year != currentYear {
+				continue
+			}
+			ap, ok := acctPots[txn.AccountID]
+			if !ok {
+				ap = &acctPot{Account: acctNames[txn.AccountID]}
+				acctPots[txn.AccountID] = ap
+			}
+			ap.GeneralGains += txn.Amount
 		}
 	}
 
-	var perAccount []acctPot
+	perAccount := []acctPot{}
 	for _, ap := range acctPots {
-		ap.EquityGains = math.Round(ap.EquityGains*100)/100
-		ap.EquityLosses = math.Round(ap.EquityLosses*100)/100
-		ap.GeneralGains = math.Round(ap.GeneralGains*100)/100
-		ap.GeneralLosses = math.Round(ap.GeneralLosses*100)/100
+		ap.EquityGains = math.Round(ap.EquityGains*100) / 100
+		ap.EquityLosses = math.Round(ap.EquityLosses*100) / 100
+		ap.GeneralGains = math.Round(ap.GeneralGains*100) / 100
+		ap.GeneralLosses = math.Round(ap.GeneralLosses*100) / 100
 		perAccount = append(perAccount, *ap)
 	}
 
-	// Cross-broker netting: check if losses at one broker could offset gains at another
 	totalEquityLoss, totalEquityGain := 0.0, 0.0
 	totalGeneralLoss, totalGeneralGain := 0.0, 0.0
 	for _, ap := range perAccount {
@@ -2676,17 +3034,16 @@ func (h *AnalysisHandler) HandleLossPots(w http.ResponseWriter, r *http.Request)
 	}
 	crossBrokerSaving := 0.0
 	if len(perAccount) > 1 {
-		// If any broker has losses and another has gains in the same pot, filing Anlage KAP helps
 		offsetableEquity := math.Min(math.Abs(totalEquityLoss), totalEquityGain)
 		offsetableGeneral := math.Min(math.Abs(totalGeneralLoss), totalGeneralGain)
 		crossBrokerSaving = (offsetableEquity + offsetableGeneral) * analytics.EffectiveTaxRate
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"years":              pots,
-		"per_account":        perAccount,
-		"cross_broker_saving": math.Round(crossBrokerSaving*100)/100,
-		"file_anlage_kap":    crossBrokerSaving > 0,
+		"years":               pots,
+		"per_account":         perAccount,
+		"cross_broker_saving": math.Round(crossBrokerSaving*100) / 100,
+		"file_anlage_kap":     crossBrokerSaving > 0,
 	})
 }
 
@@ -2697,7 +3054,9 @@ func (h *AnalysisHandler) HandleFSAStatus(w http.ResponseWriter, r *http.Request
 	ctx := r.Context()
 	year := time.Now().Year()
 	if y := r.URL.Query().Get("year"); y != "" {
-		if v, err := strconv.Atoi(y); err == nil { year = v }
+		if v, err := strconv.Atoi(y); err == nil {
+			year = v
+		}
 	}
 	allowance := analytics.Sparerpauschbetrag
 	joint := r.URL.Query().Get("joint") == "1"
@@ -2705,20 +3064,18 @@ func (h *AnalysisHandler) HandleFSAStatus(w http.ResponseWriter, r *http.Request
 		allowance *= 2
 	}
 
-	txns, _ := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
 	accts, _ := h.queries.ListAccounts(ctx)
 	secs, _ := h.queries.ListSecurities(ctx)
+	taxTxns, _, tfsMap, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
 
 	acctNames := make(map[string]string)
 	for _, a := range accts {
 		acctNames[a.ID.String()] = a.Name
 	}
-	equityMap := make(map[string]bool)
-	for _, s := range secs {
-		equityMap[s.ISIN] = s.AssetClass == "etf"
-	}
 
-	// Per-account taxable income for the year
 	type acctIncome struct {
 		AccountID   string  `json:"account_id"`
 		AccountName string  `json:"account_name"`
@@ -2729,72 +3086,100 @@ func (h *AnalysisHandler) HandleFSAStatus(w http.ResponseWriter, r *http.Request
 	}
 	incomeByAcct := make(map[string]*acctIncome)
 	getAcct := func(id string) *acctIncome {
-		if a, ok := incomeByAcct[id]; ok { return a }
+		if a, ok := incomeByAcct[id]; ok {
+			return a
+		}
 		a := &acctIncome{AccountID: id, AccountName: acctNames[id]}
-		if a.AccountName == "" { a.AccountName = "Unknown" }
+		if a.AccountName == "" {
+			a.AccountName = "Unknown"
+		}
 		incomeByAcct[id] = a
 		return a
 	}
 
-	// Track cost basis for gain computation
-	type lot struct{ qty, totalCost float64 }
-	holdings := make(map[string]*lot)
+	type depotKey struct {
+		acctID string
+		isin   string
+	}
+	type fifoLot struct {
+		qty     float64
+		costPer float64
+	}
+	lots := make(map[depotKey][]fifoLot)
+	consumeFIFO := func(k depotKey, qty float64) (soldQty, costBasis float64) {
+		rem := qty
+		q := lots[k]
+		for rem > 1e-9 && len(q) > 0 {
+			if q[0].qty <= rem+1e-9 {
+				soldQty += q[0].qty
+				costBasis += q[0].qty * q[0].costPer
+				rem -= q[0].qty
+				q = q[1:]
+			} else {
+				soldQty += rem
+				costBasis += rem * q[0].costPer
+				q[0].qty -= rem
+				rem = 0
+			}
+		}
+		lots[k] = q
+		return soldQty, costBasis
+	}
 
-	for i := len(txns) - 1; i >= 0; i-- { // chronological
-		txn := txns[i]
-		isin := ""
-		if txn.SecurityISIN.Valid { isin = txn.SecurityISIN.String }
-		amt := 0.0
-		if txn.Amount.Valid { f, _ := txn.Amount.Float64Value(); amt = f.Float64 }
-		qty := 0.0
-		if txn.Quantity.Valid { f, _ := txn.Quantity.Float64Value(); qty = f.Float64 }
-		acctID := txn.AccountID.String()
+	for _, txn := range taxTxns { // already chronological
+		if txn.Year > year {
+			continue
+		}
+		dk := depotKey{acctID: txn.AccountID, isin: txn.ISIN}
 
 		switch txn.Type {
 		case "buy", "savings_plan", "transfer":
-			if isin == "" { continue }
-			l, ok := holdings[isin]
-			if !ok { l = &lot{}; holdings[isin] = l }
-			l.qty += qty; l.totalCost += amt
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
+			}
+			lots[dk] = append(lots[dk], fifoLot{qty: txn.Quantity, costPer: txn.Amount / txn.Quantity})
 
 		case "transfer_out":
-			if isin == "" { continue }
-			l := holdings[isin]
-			if l != nil && l.qty > 0 {
-				avg := l.totalCost / l.qty
-				l.qty -= qty; l.totalCost -= qty * avg
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
 			}
+			consumeFIFO(dk, txn.Quantity)
 
 		case "sell":
-			if isin == "" || txn.Date.Year() != year { continue }
-			l := holdings[isin]
-			if l == nil || l.qty <= 0 { continue }
-			avg := l.totalCost / l.qty
-			gain := amt - qty*avg
-			l.qty -= qty; l.totalCost -= qty * avg
-			// Apply Teilfreistellung
-			if equityMap[isin] && gain > 0 {
-				gain *= (1 - analytics.TeilfreistellungEquity)
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
 			}
+			// Always consume prior-year sells so sold shares don't inflate future basis!
+			soldQty, costBasis := consumeFIFO(dk, txn.Quantity)
+			if txn.Year != year || soldQty <= 1e-9 {
+				continue
+			}
+			proceeds := txn.Amount
+			if soldQty < txn.Quantity {
+				proceeds = txn.Amount * (soldQty / txn.Quantity)
+			}
+			gain := proceeds - costBasis
 			if gain > 0 {
-				getAcct(acctID).Gains += gain
+				gain *= (1 - tfsMap[txn.ISIN])
+				getAcct(txn.AccountID).Gains += gain
 			}
 
 		case "dividend":
-			if txn.Date.Year() != year { continue }
-			divAmt := amt
-			if equityMap[isin] {
-				divAmt *= (1 - analytics.TeilfreistellungEquity)
+			if txn.Year != year {
+				continue
 			}
-			getAcct(acctID).Dividends += divAmt
+			divAmt := txn.Amount * (1 - tfsMap[txn.ISIN])
+			getAcct(txn.AccountID).Dividends += divAmt
 
 		case "interest":
-			if txn.Date.Year() != year { continue }
-			getAcct(acctID).Interest += amt
+			if txn.Year != year {
+				continue
+			}
+			getAcct(txn.AccountID).Interest += txn.Amount
 		}
 	}
 
-	var accounts []acctIncome
+	accounts := []acctIncome{}
 	totalIncome := 0.0
 	for _, a := range incomeByAcct {
 		a.Total = math.Round((a.Dividends+a.Interest+a.Gains)*100) / 100
@@ -2815,7 +3200,7 @@ func (h *AnalysisHandler) HandleFSAStatus(w http.ResponseWriter, r *http.Request
 		ProjectedIncome float64 `json:"projected_income"`
 		RecommendedFSA float64 `json:"recommended_fsa"`
 	}
-	var recs []recommendation
+	recs := []recommendation{}
 	if len(accounts) > 0 {
 		// Annualize current YTD income to project full year
 		monthsElapsed := float64(time.Now().Month())
@@ -2892,7 +3277,7 @@ func (h *AnalysisHandler) HandleAlternatives(w http.ResponseWriter, r *http.Requ
 		} `json:"alternatives"`
 	}
 
-	var results []altResult
+	results := []altResult{}
 	for _, eh := range enriched {
 		alt, ok := altMap[eh.security.ISIN]
 		if !ok || len(alt.Alternatives) == 0 {
@@ -2935,12 +3320,14 @@ func (h *AnalysisHandler) HandleAlternatives(w http.ResponseWriter, r *http.Requ
 // HandleSpending categorizes transactions and computes spending analytics.
 func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	txns, err := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 	holdings, _ := assets.Load(ctx, h.queries)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
 
 	// Category patterns: match counterparty or reference
 	type pattern struct {
@@ -3028,7 +3415,10 @@ func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request)
 		ref := ""
 		if txn.Reference.Valid { ref = txn.Reference.String }
 		amt := 0.0
-		if txn.Amount.Valid { f, _ := txn.Amount.Float64Value(); amt = f.Float64 }
+		if txn.Amount.Valid {
+			f, _ := txn.Amount.Float64Value()
+			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
+		}
 
 		cat := categorize(cp, ref, txn.Type)
 		// Use user-assigned category if set
@@ -3102,7 +3492,7 @@ func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request)
 	}
 	sort.Strings(months)
 
-	var monthlySeries []monthlySpend
+	monthlySeries := []monthlySpend{}
 	for _, m := range months {
 		ms := monthMap[m]
 		ms.Net = ms.Income - ms.Expenses
@@ -3112,7 +3502,7 @@ func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request)
 	// Build category totals
 	numMonths := float64(len(months))
 	if numMonths < 1 { numMonths = 1 }
-	var categories []categoryTotal
+	categories := []categoryTotal{}
 	for _, ct := range catTotals {
 		ct.AvgMonthly = math.Round(ct.Total/numMonths*100) / 100
 		ct.Total = math.Round(ct.Total*100) / 100
@@ -3186,11 +3576,15 @@ func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// taxCalendarFSATitle is a plain string constant (not a format string), so the percent
+// sign is written once. FSA = Freistellungsauftrag, the tax exemption order filed with a broker.
+const taxCalendarFSATitle = "Freistellungsauftrag (tax exemption order) use below 80 %"
+
 // HandleTaxCalendar generates a 12-month German tax compliance calendar
 // with auto-computed amounts based on portfolio data.
 func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	now := time.Now()
+	now := time.Now().UTC()
 	year := now.Year()
 
 	type calendarEvent struct {
@@ -3199,43 +3593,50 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 		Title       string  `json:"title"`
 		Description string  `json:"description"`
 		Amount      float64 `json:"amount,omitempty"` // EUR amount if applicable
-		Category    string  `json:"category"`          // vorabpauschale, steuererklaerung, fsa, verlust, harvest, schenkung
-		Urgency     string  `json:"urgency"`           // info, action, deadline
+		Category    string  `json:"category"`         // vorabpauschale, steuererklaerung, fsa, verlust, harvest, schenkung
+		Urgency     string  `json:"urgency"`          // info, action, deadline
 		ActionURL   string  `json:"action_url,omitempty"`
 	}
 	var events []calendarEvent
 
 	// Load data for amount computation
 	enriched, _ := h.loadEnrichedHoldings(ctx)
-	txns, _ := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
 	secs, _ := h.queries.ListSecurities(ctx)
-	equityMap := make(map[string]bool)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	secMap := make(map[string]db.Security, len(secs))
 	for _, s := range secs {
-		equityMap[s.ISIN] = s.AssetClass == "etf"
+		secMap[s.ISIN] = s
+	}
+	taxTxns, names, tfsMap, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
+
+	valByISIN := make(map[string]float64)
+	qtyByISIN := make(map[string]float64)
+	for _, eh := range enriched {
+		if eh.value > 0 {
+			valByISIN[eh.security.ISIN] += eh.value
+			qtyByISIN[eh.security.ISIN] += numericToFloat(eh.holding.Quantity)
+		}
 	}
 
 	// --- 1. Vorabpauschale (Jan 2) ---
-	// Compute from ETF holdings at year start
+	// Jan 2 of `year` settles the Vorabpauschale for `year - 1` (§ 18 Abs. 3 InvStG).
+	vpEntries := h.computeYearVorabpauschale(ctx, year-1, txns, secMap, tfsMap, valByISIN, qtyByISIN, histFX, fxRates)
 	etfValueTotal := 0.0
-	for _, eh := range enriched {
-		if equityMap[eh.security.ISIN] {
-			etfValueTotal += eh.value
-		}
+	vpTax := 0.0
+	for _, vp := range vpEntries {
+		etfValueTotal += vp.YearEndValue
+		vpTax += vp.TaxOnVP
 	}
-	basiszins := analytics.BasiszinsByYear[year]
-	if basiszins <= 0 {
-		basiszins = 2.5
-	}
-	basisertrag := etfValueTotal * basiszins / 100 * 0.7
-	vpTax := basisertrag * (1 - analytics.TeilfreistellungEquity) * analytics.EffectiveTaxRate
 	if vpTax > 10 {
 		events = append(events, calendarEvent{
 			Month: 1, Date: fmt.Sprintf("%d-01-02", year),
-			Title:       "Vorabpauschale fällig",
-			Description: fmt.Sprintf("Steuer auf Basisertrag von %s EUR ETF-Vermögen. Verrechnungskonto muss gedeckt sein.", fmtEUR(etfValueTotal)),
+			Title:       "Vorabpauschale (advance flat-rate fund tax) due",
+			Description: fmt.Sprintf("Tax on the %d Basisertrag (base return) of %s € in fund holdings. Your broker's settlement account must hold enough cash.", year-1, fmtEUR(etfValueTotal)),
 			Amount:      math.Round(vpTax*100) / 100,
 			Category:    "vorabpauschale", Urgency: "deadline",
-			ActionURL:   "/analysis",
+			ActionURL: "/analysis",
 		})
 	}
 
@@ -3243,66 +3644,36 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 	// Check if current FSA allocation is optimal
 	events = append(events, calendarEvent{
 		Month: 1, Date: fmt.Sprintf("%d-01-15", year),
-		Title:       "Freistellungsauftrag prüfen",
-		Description: "Prüfen, ob der FSA (1.000 EUR Sparerpauschbetrag) optimal auf Depots verteilt ist.",
+		Title:       "Review your Freistellungsauftrag (tax exemption order)",
+		Description: "Check that the 1.000 € Sparer-Pauschbetrag (saver's allowance) is split sensibly across your brokers.",
 		Amount:      analytics.Sparerpauschbetrag,
 		Category:    "fsa", Urgency: "action",
-		ActionURL:   "/analysis",
+		ActionURL: "/analysis",
 	})
 
 	// --- 3. Steuererklärung deadline (Jul 31 or Sep 30 with Steuerberater) ---
 	events = append(events, calendarEvent{
 		Month: 7, Date: fmt.Sprintf("%d-07-31", year),
-		Title:       fmt.Sprintf("Steuererklärung %d Abgabe", year-1),
-		Description: fmt.Sprintf("Einkommensteuererklärung %d einreichen. Mit Steuerberater: 28.02.%d.", year-1, year+1),
+		Title:       fmt.Sprintf("Steuererklärung (income tax return) %d due", year-1),
+		Description: fmt.Sprintf("File your %d income tax return. With a Steuerberater (tax adviser) the deadline is 28.02.%d.", year-1, year+1),
 		Category:    "steuererklaerung", Urgency: "deadline",
-		ActionURL:   "/analysis",
+		ActionURL: "/analysis",
 	})
 
 	// --- 4. Verlustbescheinigung beantragen (Nov 15-Dec 15) ---
 	events = append(events, calendarEvent{
 		Month: 12, Date: fmt.Sprintf("%d-12-15", year),
-		Title:       "Verlustbescheinigung beantragen",
-		Description: "Bei der Bank Verlustbescheinigung für die Steuererklärung beantragen (Frist: 15.12.).",
+		Title:       "Request a Verlustbescheinigung (loss certificate)",
+		Description: "Ask your bank for a loss certificate for the tax return. The deadline is 15 December.",
 		Category:    "verlust", Urgency: "deadline",
 	})
 
 	// --- 5. Tax-Loss Harvesting Window (Q4) ---
 	// Identify positions with unrealized losses > 500 EUR
-	names := make(map[string]string)
-	for _, s := range secs {
-		names[s.ISIN] = s.Name
-	}
-	var taxTxns []analytics.TaxTransaction
-	for _, txn := range txns {
-		isin := ""
-		if txn.SecurityISIN.Valid {
-			isin = txn.SecurityISIN.String
-		}
-		amt, qty := 0.0, 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
-		}
-		if txn.Quantity.Valid {
-			f, _ := txn.Quantity.Float64Value()
-			qty = f.Float64
-		}
-		taxTxns = append(taxTxns, analytics.TaxTransaction{
-			Year: txn.Date.Year(), Type: txn.Type, ISIN: isin,
-			Name: names[isin], Quantity: qty, Amount: amt, IsEquityFund: equityMap[isin],
-		})
-	}
-	for i, j := 0, len(taxTxns)-1; i < j; i, j = i+1, j-1 {
-		taxTxns[i], taxTxns[j] = taxTxns[j], taxTxns[i]
-	}
-	prices := make(map[string]float64)
-	for _, eh := range enriched {
-		if eh.value > 0 {
-			qty := numericToFloat(eh.holding.Quantity)
-			if qty > 0 {
-				prices[eh.security.ISIN] = eh.value / qty
-			}
+	prices := make(map[string]float64, len(valByISIN))
+	for isin, val := range valByISIN {
+		if qty := qtyByISIN[isin]; qty > 0 {
+			prices[isin] = val / qty
 		}
 	}
 	lots := analytics.ComputeTaxLots(taxTxns, prices, names, equityMap)
@@ -3324,25 +3695,27 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	totalHarvestable := 0.0
-	for _, lp := range lossByISIN {
+	saving := 0.0
+	for isin, lp := range lossByISIN {
 		if lp.loss < -500 {
-			totalHarvestable += math.Abs(lp.loss)
+			absLoss := math.Abs(lp.loss)
+			totalHarvestable += absLoss
+			saving += absLoss * (1 - tfsMap[isin]) * analytics.EffectiveTaxRate
 		}
 	}
 	if totalHarvestable > 500 {
-		saving := totalHarvestable * 0.7 * analytics.EffectiveTaxRate
 		events = append(events, calendarEvent{
 			Month: 10, Date: fmt.Sprintf("%d-10-01", year),
-			Title:       "Tax-Loss Harvesting Fenster",
-			Description: fmt.Sprintf("%s EUR an Verlusten realisierbar. Potenzielle Steuerersparnis: ~%s EUR.", fmtEUR(totalHarvestable), fmtEUR(saving)),
+			Title:       "Tax-loss harvesting window",
+			Description: fmt.Sprintf("%s € of losses could be realised. Potential tax saving: about %s €.", fmtEUR(totalHarvestable), fmtEUR(saving)),
 			Amount:      math.Round(saving),
 			Category:    "harvest", Urgency: "action",
-			ActionURL:   "/analysis",
+			ActionURL: "/analysis",
 		})
 	}
 
 	// --- 6. FSA Mid-Year Check (Jul) ---
-	// Check YTD income vs FSA usage
+	// Check YTD taxable income vs FSA usage
 	ytdIncome := 0.0
 	for _, txn := range txns {
 		if txn.Date.Year() != year {
@@ -3351,7 +3724,11 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 		if txn.Type == "dividend" || txn.Type == "interest" {
 			if txn.Amount.Valid {
 				f, _ := txn.Amount.Float64Value()
-				ytdIncome += f.Float64
+				amtEUR := convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
+				if txn.Type == "dividend" && txn.SecurityISIN.Valid {
+					amtEUR *= 1 - tfsMap[txn.SecurityISIN.String]
+				}
+				ytdIncome += amtEUR
 			}
 		}
 	}
@@ -3362,11 +3739,11 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 			unused := analytics.Sparerpauschbetrag - projected
 			events = append(events, calendarEvent{
 				Month: 7, Date: fmt.Sprintf("%d-07-01", year),
-				Title:       "FSA-Nutzung unter 80%%",
-				Description: fmt.Sprintf("Voraussichtlich nur %s EUR von 1.000 EUR Sparerpauschbetrag genutzt. ~%s EUR verfallen.", fmtEUR(projected), fmtEUR(unused)),
+				Title:       taxCalendarFSATitle,
+				Description: fmt.Sprintf("On course to use only %s € of the 1.000 € Sparer-Pauschbetrag (saver's allowance). About %s € would go unused.", fmtEUR(projected), fmtEUR(unused)),
 				Amount:      math.Round(unused * analytics.EffectiveTaxRate),
 				Category:    "fsa", Urgency: "action",
-				ActionURL:   "/analysis",
+				ActionURL: "/analysis",
 			})
 		}
 	}
@@ -3374,18 +3751,18 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 	// --- 7. Schenkung Window (Year-round) ---
 	events = append(events, calendarEvent{
 		Month: 3, Date: fmt.Sprintf("%d-03-01", year),
-		Title:       "Schenkungsfreibetrag prüfen",
-		Description: "Alle 10 Jahre: Kinder 400K, Ehepartner 500K, Enkel 200K steuerfrei. Regelmäßige Schenkungen optimal nutzen.",
+		Title:       "Review the Schenkungsfreibetrag (gift tax allowance)",
+		Description: "Every 10 years you can give tax-free: 400.000 € per child, 500.000 € to a spouse, 200.000 € per grandchild. Regular gifts make full use of it.",
 		Category:    "schenkung", Urgency: "info",
 	})
 
 	// --- 8. Year-End Portfolio Review (Dec) ---
 	events = append(events, calendarEvent{
 		Month: 12, Date: fmt.Sprintf("%d-12-01", year),
-		Title:       "Jahresabschluss Portfolio-Review",
-		Description: "Rebalancing, Sparplan-Anpassung, Anlage KAP Vorbereitung für das Steuerjahr.",
+		Title:       "Year-end portfolio review",
+		Description: "Rebalance, adjust your Sparplan (savings plan) and prepare Anlage KAP (the capital income tax form) for the tax year.",
 		Category:    "steuererklaerung", Urgency: "action",
-		ActionURL:   "/portfolio",
+		ActionURL: "/portfolio",
 	})
 
 	// Sort by month
@@ -3420,7 +3797,7 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	snaps, err := h.queries.ListNetWorthSnapshots(ctx, 3000)
-	if err != nil || len(snaps) < 30 {
+	if err != nil || len(snaps) < 31 {
 		writeJSON(w, http.StatusOK, map[string]any{"elevated": false})
 		return
 	}
@@ -3440,7 +3817,8 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 		start++
 	}
 	points = points[start:]
-	if len(points) < 30 {
+	points = analytics.BuildCashflowAdjustedSeries(points, h.buildExternalFlowsForRisk(ctx))
+	if len(points) < 31 {
 		writeJSON(w, http.StatusOK, map[string]any{"elevated": false})
 		return
 	}
@@ -3454,11 +3832,18 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 			peakDate = p.Date.Format("2006-01-02")
 		}
 	}
-	drawdownPct := (current - peak) / peak * 100
+	drawdownPct := 0.0
+	if peak > 0 {
+		drawdownPct = (current - peak) / peak * 100
+	}
 
-	// Compute 30-day volatility
+	// Compute 30-day volatility (safe index bounds: startIdx >= 1)
 	returns := make([]float64, 0, 30)
-	for i := len(points) - 30; i < len(points); i++ {
+	startIdx := len(points) - 30
+	if startIdx < 1 {
+		startIdx = 1
+	}
+	for i := startIdx; i < len(points); i++ {
 		if points[i-1].Value > 0 {
 			r := (points[i].Value - points[i-1].Value) / points[i-1].Value
 			returns = append(returns, r)
@@ -3479,7 +3864,14 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 	if len(returns) > 1 {
 		variance /= float64(len(returns) - 1)
 	}
-	vol30d := math.Sqrt(variance) * math.Sqrt(252) * 100
+	periodsPerYear := 252.0
+	if len(points) >= 10 {
+		spanDays := points[len(points)-1].Date.Sub(points[0].Date).Hours() / 24.0
+		if spanDays >= 14 && float64(len(points)-1)/(spanDays/365.25) > 300 {
+			periodsPerYear = 365.25
+		}
+	}
+	vol30d := math.Sqrt(variance) * math.Sqrt(periodsPerYear) * 100
 
 	// Historical drawdown recovery analysis
 	type drawdownEpisode struct {
@@ -3489,7 +3881,7 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 		MaxDraw      float64 `json:"max_drawdown_pct"`
 		RecoveryDays int     `json:"recovery_days"`
 	}
-	var episodes []drawdownEpisode
+	episodes := []drawdownEpisode{}
 	// Find past drawdown episodes (>5%)
 	localPeak := points[0].Value
 	localPeakDate := points[0].Date
@@ -3499,7 +3891,7 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 	troughDate := localPeakDate
 	for _, p := range points {
 		if p.Value > localPeak {
-			if inDrawdown {
+			if inDrawdown && localPeak > 0 {
 				// Recovered
 				dd := (trough - localPeak) / localPeak * 100
 				if dd < -5 && dd > -80 { // skip >80% drops (data anomalies)
@@ -3563,12 +3955,19 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 // HandleOpportunityCost computes opportunity costs from cash drag, timing delays, and FSA waste.
 func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	now := time.Now()
+	now := time.Now().UTC()
 	year := now.Year()
 
 	accts, _ := h.queries.ListAccounts(ctx)
-	txns, _ := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
+	secs, _ := h.queries.ListSecurities(ctx)
 	enriched, _ := h.loadEnrichedHoldings(ctx)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	tfsMap := make(map[string]float64, len(secs))
+	for _, s := range secs {
+		tfsMap[s.ISIN] = securityTFSRate(s)
+	}
 
 	// Portfolio total and annual return estimate
 	portfolioValue := 0.0
@@ -3579,23 +3978,20 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 
 	// --- 1. Cash Drag Analysis ---
 	type accountCashDrag struct {
-		AccountName    string  `json:"account_name"`
-		AccountType    string  `json:"account_type"`
-		CashBalance    float64 `json:"cash_balance"`
+		AccountName     string  `json:"account_name"`
+		AccountType     string  `json:"account_type"`
+		CashBalance     float64 `json:"cash_balance"`
 		OpportunityCost float64 `json:"opportunity_cost_annual"`
 	}
-	var cashDragAccounts []accountCashDrag
+	cashDragAccounts := []accountCashDrag{}
 	totalCash := 0.0
+	cashByAcct, _ := computeAllAccountCashEUR(ctx, h.queries, accts, fxRates)
 
 	for _, acc := range accts {
 		if !acc.IsActive {
 			continue
 		}
-		bal, err := h.queries.GetCashBalance(ctx, acc.ID)
-		if err != nil {
-			continue
-		}
-		cash := numericToFloat(bal)
+		cash := cashByAcct[acc.ID]
 		if cash <= 0 {
 			continue
 		}
@@ -3603,7 +3999,7 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 		oc := cash * annualReturn
 		cashDragAccounts = append(cashDragAccounts, accountCashDrag{
 			AccountName: acc.Name, AccountType: acc.Type,
-			CashBalance: math.Round(cash*100) / 100,
+			CashBalance:     math.Round(cash*100) / 100,
 			OpportunityCost: math.Round(oc*100) / 100,
 		})
 	}
@@ -3634,7 +4030,7 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 		amt := 0.0
 		if txn.Amount.Valid {
 			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
+			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
 		}
 		m := txn.Date.Format("2006-01")
 		mi, ok := monthMap[m]
@@ -3699,7 +4095,11 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 		if txn.Type == "dividend" || txn.Type == "interest" {
 			if txn.Amount.Valid {
 				f, _ := txn.Amount.Float64Value()
-				ytdIncome += f.Float64
+				amtEUR := convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
+				if txn.Type == "dividend" && txn.SecurityISIN.Valid {
+					amtEUR *= 1 - tfsMap[txn.SecurityISIN.String]
+				}
+				ytdIncome += amtEUR
 			}
 		}
 	}
@@ -3727,7 +4127,7 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 	monthlyTiming := avgDelayCost / 12
 	monthlyRebal := rebalanceCost / 12
 	monthlyFSA := fsaWaste / 12
-	var monthlySeries []monthCost
+	monthlySeries := []monthCost{}
 	cumTotal := 0.0
 	for m := 1; m <= 12; m++ {
 		mTotal := monthlyCashDrag + monthlyTiming + monthlyRebal + monthlyFSA
@@ -3783,8 +4183,10 @@ func (h *AnalysisHandler) HandleDataQuality(w http.ResponseWriter, r *http.Reque
 
 	enriched, _ := h.loadEnrichedHoldings(ctx)
 	secs, _ := h.queries.ListSecurities(ctx)
-	txns, _ := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
-	now := time.Now()
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	now := time.Now().UTC()
 
 	secMap := make(map[string]db.Security)
 	for _, s := range secs {
@@ -3861,15 +4263,16 @@ func (h *AnalysisHandler) HandleDataQuality(w http.ResponseWriter, r *http.Reque
 		if !txn.Fee.Valid {
 			continue
 		}
-		fee, _ := txn.Fee.Float64Value()
-		amt := 0.0
+		feeRaw, _ := txn.Fee.Float64Value()
+		feeEUR := convertAmountToEURAtDate(feeRaw.Float64, txn.Currency, txn.Date, histFX, fxRates)
+		amtEUR := 0.0
 		if txn.Amount.Valid {
 			f, _ := txn.Amount.Float64Value()
-			amt = f.Float64
+			amtEUR = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
 		}
-		if fee.Float64 > 0 && amt > 0 {
-			feePct := fee.Float64 / amt * 100
-			if feePct > 1 && fee.Float64 > 10 {
+		if feeEUR > 0 && amtEUR > 0 {
+			feePct := feeEUR / amtEUR * 100
+			if feePct > 1 && feeEUR > 10 {
 				isin := ""
 				if txn.SecurityISIN.Valid {
 					isin = txn.SecurityISIN.String
@@ -3880,9 +4283,9 @@ func (h *AnalysisHandler) HandleDataQuality(w http.ResponseWriter, r *http.Reque
 				}
 				issues = append(issues, issue{
 					Type: "fee_anomaly", Severity: "warning",
-					Title: fmt.Sprintf("High fee: %.2f EUR (%.1f%%) on %s", fee.Float64, feePct, name),
-					Detail: fmt.Sprintf("Transaction on %s for %s EUR had %.2f EUR fee.", txn.Date.Format("2006-01-02"), fmtEUR(amt), fee.Float64),
-					ISIN: isin,
+					Title:  fmt.Sprintf("High fee: %.2f EUR (%.1f%%) on %s", feeEUR, feePct, name),
+					Detail: fmt.Sprintf("Transaction on %s for %s EUR had %.2f EUR fee.", txn.Date.Format("2006-01-02"), fmtEUR(amtEUR), feeEUR),
+					ISIN:   isin,
 				})
 			}
 		}
@@ -3899,7 +4302,7 @@ func (h *AnalysisHandler) HandleDataQuality(w http.ResponseWriter, r *http.Reque
 		if len(isins) > 1 {
 			issues = append(issues, issue{
 				Type: "duplicate", Severity: "info",
-				Title: fmt.Sprintf("Possible duplicate: %s (%d ISINs)", name, len(isins)),
+				Title:  fmt.Sprintf("Possible duplicate: %s (%d ISINs)", name, len(isins)),
 				Detail: fmt.Sprintf("ISINs: %s. These may be the same security listed separately.", strings.Join(isins, ", ")),
 			})
 		}
@@ -3907,24 +4310,31 @@ func (h *AnalysisHandler) HandleDataQuality(w http.ResponseWriter, r *http.Reque
 
 	// --- 5. Concentration Drift (single position >30% from pure appreciation) ---
 	totalValue := 0.0
+	valByISIN := make(map[string]float64)
+	costByISIN := make(map[string]float64)
+	nameByISIN := make(map[string]string)
+	var isinOrder []string
 	for _, eh := range enriched {
 		totalValue += eh.value
+		isin := eh.security.ISIN
+		if _, seen := nameByISIN[isin]; !seen {
+			nameByISIN[isin] = eh.security.Name
+			isinOrder = append(isinOrder, isin)
+		}
+		valByISIN[isin] += eh.value
+		costByISIN[isin] += eh.costValue
 	}
 	if totalValue > 0 {
-		for _, eh := range enriched {
-			pct := eh.value / totalValue * 100
+		for _, isin := range isinOrder {
+			pct := valByISIN[isin] / totalValue * 100
 			if pct > 30 {
-				// Check if drift is from appreciation vs intentional allocation
-				qty := numericToFloat(eh.holding.Quantity)
-				avg := numericToFloat(eh.holding.AvgCostBasis)
-				costValue := qty * avg
-				costPct := costValue / totalValue * 100
+				costPct := costByISIN[isin] / totalValue * 100
 				if pct-costPct > 5 {
 					issues = append(issues, issue{
 						Type: "concentration_drift", Severity: "warning",
-						Title: fmt.Sprintf("Concentration drift: %s at %.0f%%", eh.security.Name, pct),
+						Title:  fmt.Sprintf("Concentration drift: %s at %.0f%%", nameByISIN[isin], pct),
 						Detail: fmt.Sprintf("Cost-basis weight was %.0f%%, now %.0f%% from appreciation. Consider rebalancing.", costPct, pct),
-						ISIN: eh.security.ISIN,
+						ISIN:   isin,
 					})
 				}
 			}
@@ -4010,6 +4420,10 @@ func (h *AnalysisHandler) HandleJournalCreate(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "reason is required")
 		return
 	}
+	if math.IsNaN(body.Amount) || math.IsInf(body.Amount, 0) || body.Amount < 0 {
+		writeError(w, http.StatusBadRequest, "amount must be a non-negative finite number")
+		return
+	}
 	amt := pgtype.Numeric{}
 	if body.Amount > 0 {
 		amt.Scan(fmt.Sprintf("%.2f", body.Amount))
@@ -4080,7 +4494,7 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 	ctx := r.Context()
 	enriched, err := h.loadEnrichedHoldings(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"scenarios": scenarios, "portfolio_impact": nil})
+		writeJSON(w, http.StatusOK, map[string]any{"scenarios": scenarios, "portfolio_impact": []any{}})
 		return
 	}
 
@@ -4089,7 +4503,7 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 	for _, eh := range enriched {
 		val := eh.value
 		totalValue += val
-		if eh.security.AssetClass == "etf" || eh.security.AssetClass == "stock" {
+		if eh.security.AssetClass == "stock" || securityTFSRate(eh.security) > 0 {
 			equityValue += val
 		}
 	}
@@ -4122,14 +4536,14 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 		}
 	}
 
-	// Cash buffer: sum cash balances across all accounts
+	// Cash buffer: sum positive EUR cash balances across all active accounts
 	cashBuffer := 0.0
 	allAccounts, _ := h.queries.ListAccounts(ctx)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	cashByAcct, _ := computeAllAccountCashEUR(ctx, h.queries, allAccounts, fxRates)
 	for _, acc := range allAccounts {
-		bal, err := h.queries.GetCashBalance(ctx, acc.ID)
-		if err == nil && bal.Valid {
-			f, _ := bal.Float64Value()
-			cashBuffer += f.Float64
+		if acc.IsActive && cashByAcct[acc.ID] > 0 {
+			cashBuffer += cashByAcct[acc.ID]
 		}
 	}
 
@@ -4145,7 +4559,7 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 	worstDrawdown := scenarios[0].IndexReturn // GFC = -54%
 	holdingImpacts := make([]holdingImpact, 0, len(enriched))
 	for _, eh := range enriched {
-		isEq := eh.security.AssetClass == "etf" || eh.security.AssetClass == "stock"
+		isEq := eh.security.AssetClass == "stock" || securityTFSRate(eh.security) > 0
 		dd := 0.0
 		if isEq {
 			dd = worstDrawdown
@@ -4164,24 +4578,29 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 	// Assume monthly DCA of totalValue * 0.01 (1% of portfolio)
 	monthlyDCA := totalValue * 0.01
 	dcaRecovery := make([]struct {
-		Name        string `json:"name"`
-		WithoutDCA  int    `json:"without_dca_months"`
-		WithDCA     int    `json:"with_dca_months"`
-		Acceleration int   `json:"acceleration_months"`
+		Name         string `json:"name"`
+		WithoutDCA   int    `json:"without_dca_months"`
+		WithDCA      int    `json:"with_dca_months"`
+		Acceleration int    `json:"acceleration_months"`
 	}, len(scenarios))
 	for i, s := range scenarios {
 		withoutDCA := s.RecoveryMo
 		// With DCA: approximate recovery by simulating monthly contributions during drawdown recovery
 		// Each month of DCA buys at lower prices, accelerating recovery by ~20-30%
 		drawdownAbs := math.Abs(s.IndexReturn) / 100
-		dcaBoost := monthlyDCA * float64(withoutDCA) / (totalValue * drawdownAbs)
+		dcaBoost := 0.0
+		if totalValue > 0 && drawdownAbs > 0 {
+			dcaBoost = monthlyDCA * float64(withoutDCA) / (totalValue * drawdownAbs)
+		}
 		withDCA := int(math.Round(float64(withoutDCA) * (1 - math.Min(dcaBoost*0.5, 0.4))))
-		if withDCA < 1 { withDCA = 1 }
+		if withDCA < 1 {
+			withDCA = 1
+		}
 		dcaRecovery[i] = struct {
-			Name        string `json:"name"`
-			WithoutDCA  int    `json:"without_dca_months"`
-			WithDCA     int    `json:"with_dca_months"`
-			Acceleration int   `json:"acceleration_months"`
+			Name         string `json:"name"`
+			WithoutDCA   int    `json:"without_dca_months"`
+			WithDCA      int    `json:"with_dca_months"`
+			Acceleration int    `json:"acceleration_months"`
 		}{
 			Name:         s.Name,
 			WithoutDCA:   withoutDCA,

@@ -3,12 +3,14 @@ package assets
 import (
 	"context"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	db "github.com/lnsp/wealth/internal/database/generated"
+	"github.com/lnsp/wealth/internal/market"
 )
 
 // PaymentCandidate is a bank transaction that might be a loan instalment.
@@ -87,9 +89,29 @@ func MatchAllLoanPayments(ctx context.Context, q *db.Queries) (int, error) {
 	if err != nil || len(h.Loans) == 0 {
 		return 0, err
 	}
-	txns, err := q.ListTransactions(ctx, db.ListTransactionsParams{Limit: 100000, Offset: 0})
+	txns, err := q.ListAllTransactions(ctx)
 	if err != nil {
 		return 0, err
+	}
+	latestFX := map[string]float64{"EUR": 1.0}
+	if rows, fxErr := q.ListLatestExchangeRates(ctx); fxErr == nil {
+		for _, r := range rows {
+			if rate := Numeric(r.Rate); rate > 0 {
+				latestFX[strings.ToUpper(strings.TrimSpace(r.Currency))] = rate
+			}
+		}
+	}
+	var histFX []market.HistoricalFXRate
+	if rows, fxErr := q.ListAllExchangeRates(ctx); fxErr == nil {
+		for _, r := range rows {
+			if rate := Numeric(r.Rate); rate > 0 {
+				histFX = append(histFX, market.HistoricalFXRate{
+					Date:     CivilDate(r.Date),
+					Currency: strings.ToUpper(strings.TrimSpace(r.Currency)),
+					Rate:     rate,
+				})
+			}
+		}
 	}
 	taken := h.LinkedIDs()
 	var candidates []PaymentCandidate
@@ -97,7 +119,25 @@ func MatchAllLoanPayments(ctx context.Context, q *db.Queries) (int, error) {
 		if t.Type != "withdrawal" || t.SecurityISIN.Valid {
 			continue
 		}
-		candidates = append(candidates, PaymentCandidate{ID: t.ID, AccountID: t.AccountID, Date: t.Date, Amount: Numeric(t.Amount)})
+		amt := Numeric(t.Amount) + Numeric(t.Fee)
+		cur := strings.TrimSpace(t.Currency)
+		if cur != "" && !strings.EqualFold(cur, "EUR") {
+			scale := 1.0
+			norm := strings.ToUpper(cur)
+			if cur == "GBp" || cur == "GBX" {
+				norm = "GBP"
+				scale = 0.01
+			}
+			scaled := amt * scale
+			if rate := market.LookupRateForDate(histFX, norm, t.Date); rate > 0 {
+				amt = scaled / rate
+			} else if rate := latestFX[norm]; rate > 0 {
+				amt = scaled / rate
+			} else {
+				amt = scaled
+			}
+		}
+		candidates = append(candidates, PaymentCandidate{ID: t.ID, AccountID: t.AccountID, Date: CivilDate(t.Date), Amount: amt})
 	}
 	added := 0
 	today := CivilDate(time.Now())

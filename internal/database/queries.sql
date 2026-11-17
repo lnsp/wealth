@@ -60,28 +60,87 @@ WHERE isin = $1;
 -- name: InsertTransaction :exec
 INSERT INTO transactions (account_id, date, type, security_isin, quantity, price, amount, fee, tax, currency, counterparty, reference, category, import_hash)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-ON CONFLICT (import_hash) DO UPDATE SET type = EXCLUDED.type;
+ON CONFLICT (import_hash) DO UPDATE SET
+    type = EXCLUDED.type,
+    security_isin = COALESCE(EXCLUDED.security_isin, transactions.security_isin),
+    quantity = CASE WHEN EXCLUDED.quantity IS NOT NULL AND EXCLUDED.quantity > 0 THEN EXCLUDED.quantity ELSE transactions.quantity END,
+    price = CASE WHEN EXCLUDED.price IS NOT NULL AND EXCLUDED.price > 0 THEN EXCLUDED.price ELSE transactions.price END;
 
 -- name: ListTransactions :many
 SELECT t.*, a.name as account_name, a.institution
 FROM transactions t
 JOIN accounts a ON t.account_id = a.id
-ORDER BY t.date DESC
+ORDER BY t.date DESC,
+         CASE WHEN t.type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 1 ELSE 0 END ASC,
+         t.id DESC
 LIMIT $1 OFFSET $2;
 
+-- name: ListAllTransactions :many
+SELECT t.*, a.name as account_name, a.institution
+FROM transactions t
+JOIN accounts a ON t.account_id = a.id
+WHERE a.is_active = true
+ORDER BY t.date DESC,
+         CASE WHEN t.type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 1 ELSE 0 END ASC,
+         t.id DESC;
+
+-- name: ListAllTransactionsForExport :many
+SELECT t.*, a.name as account_name, a.institution
+FROM transactions t
+JOIN accounts a ON t.account_id = a.id
+ORDER BY t.date DESC,
+         CASE WHEN t.type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 1 ELSE 0 END ASC,
+         t.id DESC;
+
+-- name: ListTransactionsFiltered :many
+SELECT t.*, a.name as account_name, a.institution
+FROM transactions t
+JOIN accounts a ON t.account_id = a.id
+WHERE (sqlc.narg('account_id')::uuid IS NULL OR t.account_id = sqlc.narg('account_id'))
+  AND (sqlc.narg('tx_type')::text IS NULL OR t.type = sqlc.narg('tx_type'))
+  AND (sqlc.narg('from_date')::date IS NULL OR t.date >= sqlc.narg('from_date'))
+  AND (sqlc.narg('to_date')::date IS NULL OR t.date <= sqlc.narg('to_date'))
+  AND (sqlc.narg('search')::text IS NULL OR
+       COALESCE(t.counterparty, '') ILIKE '%' || sqlc.narg('search') || '%' OR
+       COALESCE(t.security_isin, '') ILIKE '%' || sqlc.narg('search') || '%' OR
+       COALESCE(t.reference, '') ILIKE '%' || sqlc.narg('search') || '%')
+ORDER BY t.date DESC, t.id DESC
+LIMIT sqlc.arg('limit') OFFSET sqlc.arg('offset');
+
+-- name: CountTransactionsFiltered :one
+SELECT count(*)
+FROM transactions t
+WHERE (sqlc.narg('account_id')::uuid IS NULL OR t.account_id = sqlc.narg('account_id'))
+  AND (sqlc.narg('tx_type')::text IS NULL OR t.type = sqlc.narg('tx_type'))
+  AND (sqlc.narg('from_date')::date IS NULL OR t.date >= sqlc.narg('from_date'))
+  AND (sqlc.narg('to_date')::date IS NULL OR t.date <= sqlc.narg('to_date'))
+  AND (sqlc.narg('search')::text IS NULL OR
+       COALESCE(t.counterparty, '') ILIKE '%' || sqlc.narg('search') || '%' OR
+       COALESCE(t.security_isin, '') ILIKE '%' || sqlc.narg('search') || '%' OR
+       COALESCE(t.reference, '') ILIKE '%' || sqlc.narg('search') || '%');
+
 -- name: ListTransactionsByISIN :many
-SELECT * FROM transactions WHERE security_isin = $1 ORDER BY date;
+SELECT * FROM transactions
+WHERE security_isin = $1
+ORDER BY date ASC,
+         CASE WHEN type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 0 ELSE 1 END ASC,
+         id ASC;
 
 -- name: ListTransactionsByAccount :many
 SELECT t.*, a.name as account_name, a.institution
 FROM transactions t
 JOIN accounts a ON t.account_id = a.id
 WHERE t.account_id = $1
-ORDER BY t.date DESC
+ORDER BY t.date DESC,
+         CASE WHEN t.type IN ('buy', 'savings_plan', 'transfer', 'deposit', 'cash_transfer_in') THEN 1 ELSE 0 END ASC,
+         t.id DESC
 LIMIT $2 OFFSET $3;
 
 -- name: CountTransactions :one
 SELECT count(*) FROM transactions;
+
+-- name: CountTransactionsByAccount :one
+SELECT count(*) FROM transactions WHERE account_id = $1;
 
 -- name: CheckFileImportedToOtherAccount :one
 SELECT a.name as account_name FROM import_history ih
@@ -90,17 +149,78 @@ WHERE ih.account_id != $1 AND ih.filename = $2 AND ih.imported > 0
 LIMIT 1;
 
 -- name: GetCashBalance :one
-SELECT COALESCE(SUM(
+WITH raw_cash AS (
+    SELECT
+        COALESCE(SUM(
+            CASE
+                WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
+                    THEN amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
+                    THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                WHEN type = 'transfer' AND security_isin IS NULL
+                    THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                -- security transfers (in-kind) have no cash impact
+                ELSE 0
+            END
+        ), 0)::numeric(18,4) AS balance,
+        COALESCE(BOOL_OR(type IN ('deposit', 'withdrawal', 'cash_transfer_in', 'cash_transfer_out')), false) AS has_explicit_cash
+    FROM transactions
+    WHERE account_id = $1
+)
+SELECT (
     CASE
-        WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in') THEN amount
-        WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out') THEN -amount
-        WHEN type = 'transfer' AND security_isin IS NULL THEN -amount
-        -- security transfers (in-kind) have no cash impact
-        ELSE 0
+        WHEN rc.balance < 0
+         AND NOT rc.has_explicit_cash
+         AND EXISTS (
+             SELECT 1 FROM accounts a
+             WHERE a.id = $1
+               AND a.type IN ('brokerage', 'crypto', 'pension', 'precious_metals')
+         )
+        THEN 0::numeric(18,4)
+        ELSE rc.balance
     END
-), 0)::numeric(18,4) as balance
+)::numeric(18,4) AS balance
+FROM raw_cash rc;
+
+-- name: GetAccountCashByCurrency :many
+SELECT
+    currency,
+    COALESCE(SUM(
+        CASE
+            WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
+                THEN amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+            WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
+                THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+            WHEN type = 'transfer' AND security_isin IS NULL
+                THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+            ELSE 0
+        END
+    ), 0)::numeric(18,4) AS balance,
+    COALESCE(BOOL_OR(type IN ('deposit', 'withdrawal', 'cash_transfer_in', 'cash_transfer_out')), false)::boolean AS has_explicit_cash
 FROM transactions
-WHERE account_id = $1;
+WHERE account_id = $1
+GROUP BY currency;
+
+-- name: ListAllAccountCashByCurrency :many
+SELECT
+    t.account_id,
+    t.currency,
+    COALESCE(SUM(
+        CASE
+            WHEN t.type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
+                THEN t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+            WHEN t.type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
+                THEN -t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+            WHEN t.type = 'transfer' AND t.security_isin IS NULL
+                THEN -t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+            ELSE 0
+        END
+    ), 0)::numeric(18,4) AS balance,
+    COALESCE(BOOL_OR(t.type IN ('deposit', 'withdrawal', 'cash_transfer_in', 'cash_transfer_out')), false)::boolean AS has_explicit_cash
+FROM transactions t
+JOIN accounts a ON a.id = t.account_id
+WHERE a.is_active = true
+GROUP BY t.account_id, t.currency;
 
 -- name: ListCurrentHoldings :many
 SELECT ch.*, s.name, s.symbol, s.asset_class, s.currency
@@ -116,7 +236,9 @@ WHERE ch.account_id = $1;
 -- name: UpsertMarketData :exec
 INSERT INTO market_data (security_isin, date, close, currency)
 VALUES ($1, $2, $3, $4)
-ON CONFLICT (security_isin, date) DO UPDATE SET close = EXCLUDED.close;
+ON CONFLICT (security_isin, date) DO UPDATE SET
+    close = EXCLUDED.close,
+    currency = EXCLUDED.currency;
 
 -- name: GetLatestPrice :one
 SELECT close, date, currency FROM market_data
@@ -134,7 +256,7 @@ WHERE security_isin = $1 AND date <= $2
 ORDER BY date DESC LIMIT 1;
 
 -- name: ListPriceHistory :many
-SELECT date, close FROM market_data
+SELECT date, close, currency FROM market_data
 WHERE security_isin = $1
 ORDER BY date ASC;
 
@@ -148,10 +270,23 @@ SELECT rate, date FROM exchange_rates
 WHERE currency = $1
 ORDER BY date DESC LIMIT 1;
 
+-- name: ListLatestExchangeRates :many
+SELECT DISTINCT ON (currency) currency, rate, date
+FROM exchange_rates
+ORDER BY currency, date DESC;
+
+-- name: ListAllExchangeRates :many
+SELECT date, currency, rate
+FROM exchange_rates
+ORDER BY date ASC;
+
 -- name: ListExchangeRateHistory :many
 SELECT date, rate FROM exchange_rates
 WHERE currency = $1
 ORDER BY date ASC;
+
+-- name: DeleteETFHoldingsByETF :exec
+DELETE FROM etf_holdings WHERE etf_isin = $1;
 
 -- name: UpsertETFHolding :exec
 INSERT INTO etf_holdings (etf_isin, holding_isin, holding_name, weight_pct, sector, country, as_of_date)
@@ -402,14 +537,15 @@ DELETE FROM rsu_vests WHERE account_id = $1 AND vested = false;
 -- name: ListCashTransactions :many
 -- Cash-account transactions used for cashflow classification. Excludes
 -- internal transfers and investment moves — only true income/spend events.
-SELECT t.id, t.date, t.type, t.amount, t.counterparty, t.reference, t.category,
+SELECT t.id, t.date, t.type, t.amount, t.fee, t.currency, t.counterparty, t.reference, t.category,
        a.name as account_name
 FROM transactions t
 JOIN accounts a ON t.account_id = a.id
 WHERE a.type IN ('checking', 'savings')
+  AND a.is_active = true
   AND t.date >= $1 AND t.date <= $2
   AND t.amount != 0
-ORDER BY t.date DESC;
+ORDER BY t.date DESC, t.id DESC;
 
 -- name: UpdateTransactionCategory :exec
 UPDATE transactions SET category = $2 WHERE id = $1;
@@ -471,12 +607,13 @@ DELETE FROM asset_transactions WHERE transaction_id = $1;
 SELECT * FROM asset_improvements ORDER BY asset_id, date;
 
 -- name: CreateAssetImprovement :one
-INSERT INTO asset_improvements (asset_id, date, amount, description)
-VALUES ($1, $2, $3, $4)
+INSERT INTO asset_improvements (asset_id, date, amount, description, transaction_id)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING *;
 
--- name: DeleteAssetImprovement :exec
-DELETE FROM asset_improvements WHERE id = $1 AND asset_id = $2;
+-- name: DeleteAssetImprovement :one
+DELETE FROM asset_improvements WHERE id = $1 AND asset_id = $2
+RETURNING transaction_id;
 
 -- name: ListLoans :many
 SELECT * FROM loans ORDER BY payout_date, created_at;

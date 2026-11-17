@@ -77,15 +77,39 @@ func ComputeConcentrationAlerts(
 	holdingsWithETF []HoldingWithETF,
 	holdingNames map[string]string,
 ) []Alert {
+	return ComputeConcentrationAlertsWithThresholds(
+		etfs,
+		holdingsWithETF,
+		holdingNames,
+		OverlapWarningThreshold,
+		ConcentrationWarningThreshold,
+	)
+}
+
+// ComputeConcentrationAlertsWithThresholds checks for overlap redundancy and single-stock concentration
+// using configurable warning thresholds.
+func ComputeConcentrationAlertsWithThresholds(
+	etfs []ETFWithHoldings,
+	holdingsWithETF []HoldingWithETF,
+	holdingNames map[string]string,
+	overlapWarnPct float64,
+	concentrationWarnPct float64,
+) []Alert {
+	if overlapWarnPct <= 0 {
+		overlapWarnPct = OverlapWarningThreshold
+	}
+	if concentrationWarnPct <= 0 {
+		concentrationWarnPct = ConcentrationWarningThreshold
+	}
 	alerts := make([]Alert, 0)
 
 	// Check pairwise ETF overlap
 	for i := 0; i < len(etfs); i++ {
 		for j := i + 1; j < len(etfs); j++ {
 			overlap := ComputeOverlap(etfs[i].Holdings, etfs[j].Holdings)
-			if overlap >= OverlapWarningThreshold {
+			if overlap >= overlapWarnPct {
 				level := "warning"
-				if overlap >= 90 {
+				if overlap >= math.Max(90, overlapWarnPct) {
 					level = "critical"
 				}
 				alerts = append(alerts, Alert{
@@ -102,9 +126,9 @@ func ComputeConcentrationAlerts(
 	exposure := ComputeEffectiveExposure(holdingsWithETF)
 	for isin, pct := range exposure {
 		exposurePct := pct * 100 // convert from 0-1 to 0-100
-		if exposurePct >= ConcentrationWarningThreshold {
+		if exposurePct >= concentrationWarnPct {
 			level := "warning"
-			if exposurePct >= 10 {
+			if exposurePct >= math.Max(10, concentrationWarnPct*2) {
 				level = "critical"
 			}
 			name := isin
@@ -203,14 +227,22 @@ func CalculateRealizedPL(txns []TransactionForPL) RealizedPLResult {
 			if !ok || l.quantity <= 0 {
 				continue
 			}
+			sellQty := txn.Qty
+			if sellQty > l.quantity {
+				sellQty = l.quantity
+			}
 			avgCost := l.totalCost / l.quantity
-			costBasis := txn.Qty * avgCost
-			realizedPL := txn.Amt - costBasis
+			costBasis := sellQty * avgCost
+			proceeds := txn.Amt
+			if sellQty < txn.Qty && txn.Qty > 0 {
+				proceeds = txn.Amt * (sellQty / txn.Qty)
+			}
+			realizedPL := proceeds - costBasis
 			result.TotalRealizedPL += realizedPL
 			result.BySecurity[txn.ISIN] += realizedPL
-			l.quantity -= txn.Qty
+			l.quantity -= sellQty
 			l.totalCost -= costBasis
-			if l.quantity <= 0.001 {
+			if l.quantity <= 1e-9 {
 				delete(holdings, txn.ISIN)
 			}
 		case "transfer_out":
@@ -218,10 +250,14 @@ func CalculateRealizedPL(txns []TransactionForPL) RealizedPLResult {
 			if !ok || l.quantity <= 0 {
 				continue
 			}
+			outQty := txn.Qty
+			if outQty > l.quantity {
+				outQty = l.quantity
+			}
 			avgCost := l.totalCost / l.quantity
-			l.quantity -= txn.Qty
-			l.totalCost -= txn.Qty * avgCost
-			if l.quantity <= 0.001 {
+			l.quantity -= outQty
+			l.totalCost -= outQty * avgCost
+			if l.quantity <= 1e-9 {
 				delete(holdings, txn.ISIN)
 			}
 		}

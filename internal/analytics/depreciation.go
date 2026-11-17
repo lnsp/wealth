@@ -111,11 +111,15 @@ func (a DepreciatingAsset) ValueAt(t time.Time) float64 {
 	}
 	years := yearsBetween(anchorDate, t)
 	km := math.Max(0, a.OdometerAt(t)-a.OdometerAt(anchorDate))
-	return anchorValue * math.Pow(1-a.AnnualRate, years) * math.Pow(1-a.KmRate, km/10000)
+	annualRate := math.Min(math.Max(a.AnnualRate, 0), 0.9999)
+	kmRate := math.Min(math.Max(a.KmRate, 0), 0.9999)
+	return anchorValue * math.Pow(1-annualRate, years) * math.Pow(1-kmRate, km/10000)
 }
 
 // EffectiveAnnualRate is the combined yearly value loss at the expected
 // mileage, e.g. 11.9 % for the car defaults.
 func (a DepreciatingAsset) EffectiveAnnualRate() float64 {
-	return 1 - (1-a.AnnualRate)*math.Pow(1-a.KmRate, a.ExpectedKmPerYear/10000)
+	annualRate := math.Min(math.Max(a.AnnualRate, 0), 0.9999)
+	kmRate := math.Min(math.Max(a.KmRate, 0), 0.9999)
+	return 1 - (1-annualRate)*math.Pow(1-kmRate, math.Max(0, a.ExpectedKmPerYear)/10000)
 }

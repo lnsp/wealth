@@ -244,7 +244,7 @@ func buildAssetView(a assets.Asset, loans []assets.Loan, now time.Time) assetVie
 		v.YearBuilt = &y
 	}
 	if owned {
-		v.MonthlyChange = round2(a.ValueOn(today.AddDate(0, 1, 0)) - cur)
+		v.MonthlyChange = round2(a.ValueOn(addMonthsClamped(today, 1)) - cur)
 	}
 	if price > 0 {
 		v.ValueChangePct = round2(v.ValueChange / price * 100)
@@ -311,9 +311,13 @@ func buildAssetView(a assets.Asset, loans []assets.Loan, now time.Time) assetVie
 		}
 		return round2(total)
 	}
-	end := a.PurchaseDate.AddDate(years, 0, 0)
+	end := addMonthsClamped(a.PurchaseDate, years*12)
 	addedToday := false
-	for d := a.PurchaseDate; !d.After(end); d = d.AddDate(0, 1, 0) {
+	for step := 0; ; step++ {
+		d := addMonthsClamped(a.PurchaseDate, step)
+		if d.After(end) {
+			break
+		}
 		if !addedToday && d.After(today) && owned {
 			v.Curve = append(v.Curve, assetCurvePoint{today.Format("2006-01-02"), round2(cur), owedOn(today), false})
 			addedToday = true
@@ -424,9 +428,16 @@ type assetParams struct {
 }
 
 func numericOf(v float64, format string) pgtype.Numeric {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		v = 0
+	}
 	var n pgtype.Numeric
 	n.Scan(fmt.Sprintf(format, v))
 	return n
+}
+
+func isFinite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
 func parseOptionalDate(s, field string) (pgtype.Date, error) {
@@ -451,14 +462,14 @@ func (req assetRequest) validate() (assetParams, error) {
 	default:
 		return p, errors.New("kind must be car, apartment, house, land or other")
 	}
-	if req.Name == "" || req.PurchasePrice <= 0 || req.PurchaseDate == "" {
+	if req.Name == "" || !isFinite(req.PurchasePrice) || req.PurchasePrice <= 0 || req.PurchaseDate == "" {
 		return p, errors.New("name, purchase_price and purchase_date are required")
 	}
 	purchaseDate, err := time.Parse("2006-01-02", req.PurchaseDate)
 	if err != nil {
 		return p, errors.New("invalid purchase_date (expected YYYY-MM-DD)")
 	}
-	if req.PurchaseCosts < 0 || req.PurchaseOdometerKm < 0 {
+	if !isFinite(req.PurchaseCosts) || req.PurchaseCosts < 0 || req.PurchaseOdometerKm < 0 {
 		return p, errors.New("purchase_costs and purchase_odometer_km must be >= 0")
 	}
 	p.Kind, p.Name, p.Details = kind, req.Name, req.Details
@@ -472,8 +483,13 @@ func (req assetRequest) validate() (assetParams, error) {
 	if p.FirstRegistration, err = parseOptionalDate(req.FirstRegistration, "first_registration"); err != nil {
 		return p, err
 	}
-	if req.ListPrice != nil && *req.ListPrice > 0 {
-		p.ListPrice = numericOf(*req.ListPrice, "%.2f")
+	if req.ListPrice != nil {
+		if !isFinite(*req.ListPrice) || *req.ListPrice < 0 {
+			return p, errors.New("invalid list_price")
+		}
+		if *req.ListPrice > 0 {
+			p.ListPrice = numericOf(*req.ListPrice, "%.2f")
+		}
 	}
 
 	// Car depreciation (stored for every kind, used for cars only).
@@ -484,7 +500,7 @@ func (req assetRequest) validate() (assetParams, error) {
 	if req.KmDepreciation != nil {
 		perKm = *req.KmDepreciation
 	}
-	if annual < 0 || annual >= 1 || perKm < 0 || perKm >= 1 {
+	if !isFinite(annual) || annual < 0 || annual >= 1 || !isFinite(perKm) || perKm < 0 || perKm >= 1 {
 		return p, errors.New("depreciation rates must be fractions in [0, 1)")
 	}
 	p.AnnualDepreciation = numericOf(annual, "%.4f")
@@ -505,7 +521,7 @@ func (req assetRequest) validate() (assetParams, error) {
 	if req.PriceDrift != nil {
 		drift = *req.PriceDrift
 	}
-	if drift <= -0.5 || drift >= 0.5 {
+	if !isFinite(drift) || drift <= -0.5 || drift >= 0.5 {
 		return p, errors.New("price_drift must be a fraction between -0.5 and 0.5")
 	}
 	p.PriceDrift = numericOf(drift, "%.4f")
@@ -520,8 +536,13 @@ func (req assetRequest) validate() (assetParams, error) {
 	if req.SelfUsed != nil {
 		p.SelfUsed = *req.SelfUsed
 	}
-	if req.LivingAreaM2 != nil && *req.LivingAreaM2 > 0 {
-		p.LivingAreaM2 = numericOf(*req.LivingAreaM2, "%.2f")
+	if req.LivingAreaM2 != nil {
+		if !isFinite(*req.LivingAreaM2) || *req.LivingAreaM2 < 0 {
+			return p, errors.New("invalid living_area_m2")
+		}
+		if *req.LivingAreaM2 > 0 {
+			p.LivingAreaM2 = numericOf(*req.LivingAreaM2, "%.2f")
+		}
 	}
 	if req.PriceIndex != nil {
 		p.PriceIndex = *req.PriceIndex
@@ -540,7 +561,7 @@ func (req assetRequest) validate() (assetParams, error) {
 		if req.LandValue != nil {
 			land = *req.LandValue
 		}
-		if land < 0 || land > req.PurchasePrice {
+		if !isFinite(land) || land < 0 || land > req.PurchasePrice {
 			return p, errors.New("land_value must be between 0 and the purchase price")
 		}
 		p.LandValue = numericOf(land, "%.2f")
@@ -560,7 +581,7 @@ var errBadPurchaseTxn = errors.New("linked payments must be existing withdrawals
 
 // setPurchaseLinks replaces an asset's purchase payment links: removed ones
 // lose the asset_purchase category, new ones get it.
-func (h *AssetsHandler) setPurchaseLinks(ctx context.Context, asset assets.Asset, want []uuid.UUID, taken map[uuid.UUID]bool) error {
+func (h *AssetsHandler) setPurchaseLinks(ctx context.Context, q *db.Queries, asset assets.Asset, want []uuid.UUID, taken map[uuid.UUID]bool) error {
 	keep := make(map[uuid.UUID]bool, len(want))
 	for _, id := range want {
 		keep[id] = true
@@ -572,7 +593,7 @@ func (h *AssetsHandler) setPurchaseLinks(ctx context.Context, asset assets.Asset
 		}
 		current[l.TransactionID] = true
 		if !keep[l.TransactionID] {
-			if err := h.unlinkTransaction(ctx, l.TransactionID, assets.CategoryPurchase); err != nil {
+			if err := unlinkTransactionWithQueries(ctx, q, l.TransactionID, assets.CategoryPurchase); err != nil {
 				return err
 			}
 		}
@@ -584,17 +605,17 @@ func (h *AssetsHandler) setPurchaseLinks(ctx context.Context, asset assets.Asset
 		if taken[id] {
 			return errBadPurchaseTxn
 		}
-		txn, err := h.queries.GetTransaction(ctx, id)
+		txn, err := q.GetTransaction(ctx, id)
 		if errors.Is(err, pgx.ErrNoRows) || (err == nil && txn.Type != "withdrawal" && txn.Type != "transfer") {
 			return errBadPurchaseTxn
 		}
 		if err != nil {
 			return err
 		}
-		if err := h.queries.InsertAssetTransaction(ctx, db.InsertAssetTransactionParams{TransactionID: id, AssetID: asset.ID, Purpose: "purchase"}); err != nil {
+		if err := q.InsertAssetTransaction(ctx, db.InsertAssetTransactionParams{TransactionID: id, AssetID: asset.ID, Purpose: "purchase"}); err != nil {
 			return err
 		}
-		if err := h.queries.UpdateTransactionCategory(ctx, db.UpdateTransactionCategoryParams{
+		if err := q.UpdateTransactionCategory(ctx, db.UpdateTransactionCategoryParams{
 			ID: id, Category: pgtype.Text{String: assets.CategoryPurchase, Valid: true},
 		}); err != nil {
 			return err
@@ -603,21 +624,28 @@ func (h *AssetsHandler) setPurchaseLinks(ctx context.Context, asset assets.Asset
 	return nil
 }
 
-// unlinkTransaction removes an asset link and clears the category if this
-// feature set it.
+// unlinkTransaction removes an asset link and clears the category if this feature set it.
 func (h *AssetsHandler) unlinkTransaction(ctx context.Context, id uuid.UUID, category string) error {
-	if err := h.queries.DeleteAssetTransaction(ctx, id); err != nil {
+	return unlinkTransactionWithQueries(ctx, h.queries, id, category)
+}
+
+func unlinkTransactionWithQueries(ctx context.Context, q *db.Queries, id uuid.UUID, category string) error {
+	if err := q.DeleteAssetTransaction(ctx, id); err != nil {
 		return err
 	}
-	return h.clearCategory(ctx, id, category)
+	return clearCategoryWithQueries(ctx, q, id, category)
 }
 
 func (h *AssetsHandler) clearCategory(ctx context.Context, id uuid.UUID, category string) error {
-	txn, err := h.queries.GetTransaction(ctx, id)
+	return clearCategoryWithQueries(ctx, h.queries, id, category)
+}
+
+func clearCategoryWithQueries(ctx context.Context, q *db.Queries, id uuid.UUID, category string) error {
+	txn, err := q.GetTransaction(ctx, id)
 	if err != nil || txn.Category.String != category {
 		return nil
 	}
-	return h.queries.UpdateTransactionCategory(ctx, db.UpdateTransactionCategoryParams{ID: id})
+	return q.UpdateTransactionCategory(ctx, db.UpdateTransactionCategoryParams{ID: id})
 }
 
 func (h *AssetsHandler) refreshSnapshots() {
@@ -707,29 +735,39 @@ func (h *AssetsHandler) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "load assets: "+err.Error())
 		return
 	}
-	row, err := h.queries.CreateAsset(ctx, p.CreateAssetParams)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "create asset: "+err.Error())
-		return
-	}
-	if err := h.setPurchaseLinks(ctx, assets.Asset{Asset: row}, p.txnIDs, holdings.LinkedIDs()); err != nil {
-		_ = h.queries.DeleteAsset(ctx, row.ID)
-		h.writeLinkError(w, err)
+	var createdID uuid.UUID
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		row, err := qtx.CreateAsset(ctx, p.CreateAssetParams)
+		if err != nil {
+			return fmt.Errorf("create asset: %w", err)
+		}
+		createdID = row.ID
+		if err := h.setPurchaseLinks(ctx, qtx, assets.Asset{Asset: row}, p.txnIDs, holdings.LinkedIDs()); err != nil {
+			return err
+		}
+		if loanParams != nil {
+			loanParams.AssetID = row.ID
+			if _, err := qtx.CreateLoan(ctx, *loanParams); err != nil {
+				return fmt.Errorf("create loan: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, errBadPurchaseTxn) {
+			h.writeLinkError(w, err)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if loanParams != nil {
-		loanParams.AssetID = row.ID
-		if _, err := h.queries.CreateLoan(ctx, *loanParams); err != nil {
-			writeError(w, http.StatusInternalServerError, "create loan: "+err.Error())
-			return
-		}
 		if _, err := assets.MatchAllLoanPayments(ctx, h.queries); err != nil {
 			writeError(w, http.StatusInternalServerError, "match loan payments: "+err.Error())
 			return
 		}
 	}
 	h.refreshSnapshots()
-	h.writeAsset(w, ctx, http.StatusCreated, row.ID)
+	h.writeAsset(w, ctx, http.StatusCreated, createdID)
 }
 
 // HandleUpdate replaces an asset's fields and purchase payment links.
@@ -759,22 +797,32 @@ func (h *AssetsHandler) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	taken := holdings.LinkedIDs()
 	for _, l := range existing.Links {
-		delete(taken, l.TransactionID)
-	}
-	if err := h.setPurchaseLinks(ctx, existing, p.txnIDs, taken); err != nil {
-		h.writeLinkError(w, err)
-		return
+		if l.Purpose == "purchase" {
+			delete(taken, l.TransactionID)
+		}
 	}
 	c := p.CreateAssetParams
-	if _, err := h.queries.UpdateAsset(ctx, db.UpdateAssetParams{
-		ID: id, Name: c.Name, ListPrice: c.ListPrice, PurchasePrice: c.PurchasePrice, PurchaseDate: c.PurchaseDate,
-		FirstRegistration: c.FirstRegistration, PurchaseOdometerKm: c.PurchaseOdometerKm,
-		AnnualDepreciation: c.AnnualDepreciation, KmDepreciation: c.KmDepreciation, ExpectedKmPerYear: c.ExpectedKmPerYear,
-		PurchaseCosts: c.PurchaseCosts, NotarizedDate: c.NotarizedDate, LandValue: c.LandValue, YearBuilt: c.YearBuilt,
-		UsefulLifeYears: c.UsefulLifeYears, PriceDrift: c.PriceDrift, SelfUsed: c.SelfUsed,
-		LivingAreaM2: c.LivingAreaM2, Details: c.Details, PriceIndex: c.PriceIndex,
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		if err := h.setPurchaseLinks(ctx, qtx, existing, p.txnIDs, taken); err != nil {
+			return err
+		}
+		if _, err := qtx.UpdateAsset(ctx, db.UpdateAssetParams{
+			ID: id, Name: c.Name, ListPrice: c.ListPrice, PurchasePrice: c.PurchasePrice, PurchaseDate: c.PurchaseDate,
+			FirstRegistration: c.FirstRegistration, PurchaseOdometerKm: c.PurchaseOdometerKm,
+			AnnualDepreciation: c.AnnualDepreciation, KmDepreciation: c.KmDepreciation, ExpectedKmPerYear: c.ExpectedKmPerYear,
+			PurchaseCosts: c.PurchaseCosts, NotarizedDate: c.NotarizedDate, LandValue: c.LandValue, YearBuilt: c.YearBuilt,
+			UsefulLifeYears: c.UsefulLifeYears, PriceDrift: c.PriceDrift, SelfUsed: c.SelfUsed,
+			LivingAreaM2: c.LivingAreaM2, Details: c.Details, PriceIndex: c.PriceIndex,
+		}); err != nil {
+			return fmt.Errorf("update asset: %w", err)
+		}
+		return nil
 	}); err != nil {
-		writeError(w, http.StatusInternalServerError, "update asset: "+err.Error())
+		if errors.Is(err, errBadPurchaseTxn) {
+			h.writeLinkError(w, err)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	h.refreshSnapshots()
@@ -792,20 +840,23 @@ func (h *AssetsHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	for _, l := range existing.Links {
-		if err := h.clearCategory(ctx, l.TransactionID, assets.CategoryPurchase); err != nil {
-			writeError(w, http.StatusInternalServerError, "unlink payment: "+err.Error())
-			return
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		for _, l := range existing.Links {
+			if err := clearCategoryWithQueries(ctx, qtx, l.TransactionID, assets.CategoryPurchase); err != nil {
+				return fmt.Errorf("unlink payment: %w", err)
+			}
 		}
-	}
-	for _, loan := range holdings.LoansFor(id) {
-		if err := h.clearLoanCategories(ctx, loan); err != nil {
-			writeError(w, http.StatusInternalServerError, "unlink loan payments: "+err.Error())
-			return
+		for _, loan := range holdings.LoansFor(id) {
+			if err := clearLoanCategoriesWithQueries(ctx, qtx, loan); err != nil {
+				return fmt.Errorf("unlink loan payments: %w", err)
+			}
 		}
-	}
-	if err := h.queries.DeleteAsset(ctx, id); err != nil {
-		writeError(w, http.StatusInternalServerError, "delete asset: "+err.Error())
+		if err := qtx.DeleteAsset(ctx, id); err != nil {
+			return fmt.Errorf("delete asset: %w", err)
+		}
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	h.refreshSnapshots()
@@ -848,7 +899,7 @@ func (h *AssetsHandler) HandleUpsertObservation(w http.ResponseWriter, r *http.R
 		params.OdometerKm = pgtype.Int4{Int32: *req.OdometerKm, Valid: true}
 	}
 	if req.AppraisedValue != nil {
-		if *req.AppraisedValue <= 0 {
+		if !isFinite(*req.AppraisedValue) || *req.AppraisedValue <= 0 {
 			writeError(w, http.StatusBadRequest, "appraised_value must be > 0")
 			return
 		}
@@ -912,7 +963,7 @@ func (h *AssetsHandler) HandleCreateImprovement(w http.ResponseWriter, r *http.R
 		return
 	}
 	date, err := time.Parse("2006-01-02", req.Date)
-	if err != nil || req.Amount <= 0 {
+	if err != nil || !isFinite(req.Amount) || req.Amount <= 0 {
 		writeError(w, http.StatusBadRequest, "date (YYYY-MM-DD) and a positive amount are required")
 		return
 	}
@@ -925,34 +976,56 @@ func (h *AssetsHandler) HandleCreateImprovement(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusBadRequest, "an improvement must be after the purchase date")
 		return
 	}
+	var txnIDPtr *uuid.UUID
 	if req.TransactionID != "" {
 		txnID, err := uuid.Parse(req.TransactionID)
 		if err != nil || holdings.LinkedIDs()[txnID] {
 			writeError(w, http.StatusBadRequest, errBadPurchaseTxn.Error())
 			return
 		}
-		if err := h.queries.InsertAssetTransaction(ctx, db.InsertAssetTransactionParams{TransactionID: txnID, AssetID: id, Purpose: "improvement"}); err != nil {
+		txn, err := h.queries.GetTransaction(ctx, txnID)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && txn.Type != "withdrawal" && txn.Type != "transfer") {
 			writeError(w, http.StatusBadRequest, errBadPurchaseTxn.Error())
 			return
 		}
-		if err := h.queries.UpdateTransactionCategory(ctx, db.UpdateTransactionCategoryParams{
-			ID: txnID, Category: pgtype.Text{String: assets.CategoryPurchase, Valid: true},
-		}); err != nil {
-			writeError(w, http.StatusInternalServerError, "tag payment: "+err.Error())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "get transaction: "+err.Error())
 			return
 		}
+		txnIDPtr = &txnID
 	}
-	if _, err := h.queries.CreateAssetImprovement(ctx, db.CreateAssetImprovementParams{
-		AssetID: id, Date: date, Amount: numericOf(req.Amount, "%.2f"), Description: req.Description,
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		if txnIDPtr != nil {
+			if err := qtx.InsertAssetTransaction(ctx, db.InsertAssetTransactionParams{
+				TransactionID: *txnIDPtr, AssetID: id, Purpose: "improvement",
+			}); err != nil {
+				return errBadPurchaseTxn
+			}
+			if err := qtx.UpdateTransactionCategory(ctx, db.UpdateTransactionCategoryParams{
+				ID: *txnIDPtr, Category: pgtype.Text{String: assets.CategoryPurchase, Valid: true},
+			}); err != nil {
+				return fmt.Errorf("tag payment: %w", err)
+			}
+		}
+		if _, err := qtx.CreateAssetImprovement(ctx, db.CreateAssetImprovementParams{
+			AssetID: id, Date: date, Amount: numericOf(req.Amount, "%.2f"), Description: req.Description, TransactionID: txnIDPtr,
+		}); err != nil {
+			return fmt.Errorf("create improvement: %w", err)
+		}
+		return nil
 	}); err != nil {
-		writeError(w, http.StatusInternalServerError, "create improvement: "+err.Error())
+		if errors.Is(err, errBadPurchaseTxn) {
+			writeError(w, http.StatusBadRequest, errBadPurchaseTxn.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	h.refreshSnapshots()
 	h.writeAsset(w, ctx, http.StatusCreated, id)
 }
 
-// HandleDeleteImprovement removes an improvement.
+// HandleDeleteImprovement removes an improvement and unlinks any associated transaction.
 func (h *AssetsHandler) HandleDeleteImprovement(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseIDParam(w, r, "id", "asset")
 	if !ok {
@@ -962,12 +1035,28 @@ func (h *AssetsHandler) HandleDeleteImprovement(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	if err := h.queries.DeleteAssetImprovement(r.Context(), db.DeleteAssetImprovementParams{ID: imprID, AssetID: id}); err != nil {
+	ctx := r.Context()
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		txnID, err := qtx.DeleteAssetImprovement(ctx, db.DeleteAssetImprovementParams{ID: imprID, AssetID: id})
+		if err != nil {
+			return err
+		}
+		if txnID != nil {
+			if err := unlinkTransactionWithQueries(ctx, qtx, *txnID, assets.CategoryPurchase); err != nil {
+				return fmt.Errorf("unlink improvement payment: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "improvement not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "delete improvement: "+err.Error())
 		return
 	}
 	h.refreshSnapshots()
-	h.writeAsset(w, r.Context(), http.StatusOK, id)
+	h.writeAsset(w, ctx, http.StatusOK, id)
 }
 
 // isAssetPurchase reports whether a transaction paid for a tracked asset.

@@ -88,6 +88,7 @@ func main() {
 	// Initialize services
 	queries := generated.New(pool)
 	yahooClient := market.NewYahooClient()
+	yahooClient.SetConcurrency(cfg.PriceFetchConcurrency)
 	ecbClient := market.NewECBClient()
 
 	// Load seed ticker map into database
@@ -105,25 +106,56 @@ func main() {
 	defer sched.Stop()
 
 	// HTTP router
+	reqTimeout := cfg.RequestTimeoutSeconds
+	if reqTimeout <= 0 {
+		reqTimeout = 60
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.GetHead)
 	r.Use(middleware.Compress(5))
-	r.Use(middleware.Timeout(60 * time.Second))
+	r.Use(middleware.Timeout(time.Duration(reqTimeout) * time.Second))
 	r.Use(securityHeaders)
 
-	// Rate limiting (configurable via RATE_LIMIT_API, RATE_LIMIT_UPLOAD, RATE_LIMIT_REPORT)
+	// Rate limiting (configurable via RATE_LIMIT_API, RATE_LIMIT_UPLOAD, RATE_LIMIT_REPORT, TRUSTED_PROXIES)
+	trustedProxies := handler.ParseTrustedProxies(cfg.TrustedProxies)
 	apiLimiter := handler.NewRateLimiter(cfg.RateLimitAPI, time.Minute)
 	uploadLimiter := handler.NewRateLimiter(cfg.RateLimitUpload, time.Hour)
 	reportLimiter := handler.NewRateLimiter(cfg.RateLimitReport, time.Hour)
 
-	// Authentication
-	authInstance := auth.New(cfg.AdminPassword, cfg.SessionSecret)
+	// Parse BASE_URL early (used for cookie security & WebAuthn RP origin)
+	baseURL, err := url.Parse(cfg.BaseURL)
+	if err != nil {
+		log.Fatalf("invalid BASE_URL: %v", err)
+	}
+
+	// Authentication: enable when ADMIN_PASSWORD is set OR when users exist in the database.
+	authInstance, err := auth.NewChecked(cfg.AdminPassword, cfg.SessionSecret)
+	if err != nil {
+		log.Fatalf("initialize auth: %v", err)
+	}
 	if authInstance != nil {
 		log.Println("authentication enabled (ADMIN_PASSWORD is set)")
 	} else {
-		log.Println("WARNING: authentication disabled (ADMIN_PASSWORD not set)")
+		userCount, err := queries.CountUsers(ctx)
+		if err != nil {
+			log.Fatalf("count users for auth check: %v", err)
+		}
+		if userCount > 0 {
+			authInstance = auth.NewSessionOnly(cfg.SessionSecret)
+			log.Println("authentication enabled (existing users in database)")
+		} else {
+			log.Println("WARNING: authentication disabled (no users in database and ADMIN_PASSWORD not set)")
+		}
+	}
+	if authInstance != nil {
+		if cfg.SessionSecret == "" || cfg.SessionSecret == "change-me" {
+			log.Fatal("SESSION_SECRET must be changed from default 'change-me' when authentication is enabled.")
+		}
+		if strings.EqualFold(baseURL.Scheme, "https") {
+			authInstance.SetForceSecure(true)
+		}
 	}
 
 	// API routes
@@ -136,7 +168,9 @@ func main() {
 	txnH := handler.NewTransactionsHandler(queries)
 	cashflowH := handler.NewCashflowHandler(queries)
 	portfolioH := handler.NewPortfolioHandler(queries)
+	portfolioH.SetBenchmarkConfig(cfg.BenchmarkISIN, cfg.BenchmarkTicker)
 	analysisH := handler.NewAnalysisHandler(queries)
+	analysisH.SetConfig(cfg.BenchmarkISIN, cfg.BenchmarkTicker, cfg.OverlapWarningPct, cfg.ConcentrationWarningPct)
 	settingsH := handler.NewSettingsHandler(queries)
 	alertsH := handler.NewAlertsHandler(queries)
 	reportsH := handler.NewReportsHandler(queries)
@@ -144,10 +178,6 @@ func main() {
 	usersH := handler.NewUsersHandler(queries, authInstance, cfg.SessionSecret)
 
 	// WebAuthn (passkey) handler — derive RP ID and origin from BASE_URL
-	baseURL, err := url.Parse(cfg.BaseURL)
-	if err != nil {
-		log.Fatalf("invalid BASE_URL: %v", err)
-	}
 	webauthnH, webauthnErr := handler.NewWebAuthnHandler(queries, authInstance, baseURL.Hostname(), cfg.BaseURL)
 	if webauthnErr != nil {
 		slog.Warn("WebAuthn disabled", "error", webauthnErr)
@@ -166,9 +196,12 @@ func main() {
 	})
 
 	r.Route("/api", func(r chi.Router) {
+		r.Use(apiBodyLimit)
+
 		// Auth endpoints are always accessible (outside auth middleware)
 		if authInstance != nil {
 			authH := handler.NewAuthHandler(authInstance, queries, cfg.SessionSecret)
+			authH.SetTrustedProxies(trustedProxies)
 			r.Post("/auth/login", authH.HandleLogin)
 			r.Post("/auth/logout", authH.HandleLogout)
 			r.Get("/auth/status", authH.HandleStatus)
@@ -188,12 +221,12 @@ func main() {
 		// Protected API routes
 		r.Group(func(r chi.Router) {
 			if authInstance != nil {
-				r.Use(handler.AuthMiddleware(authInstance))
+				r.Use(handler.AuthMiddlewareWithQueries(authInstance, queries))
 			}
-			r.Use(handler.RateLimitMiddleware(apiLimiter))
+			r.Use(handler.RateLimitMiddlewareWithProxies(apiLimiter, trustedProxies))
 
 			// Import with stricter rate limit
-			r.With(handler.RateLimitMiddleware(uploadLimiter)).Post("/import", importH.HandleImport)
+			r.With(handler.RateLimitMiddlewareWithProxies(uploadLimiter, trustedProxies)).Post("/import", importH.HandleImport)
 
 			r.Get("/transactions", txnH.HandleList)
 			r.Patch("/transactions/{id}/category", cashflowH.HandleUpdateCategory)
@@ -303,7 +336,7 @@ func main() {
 
 			r.Get("/settings/reports", reportsH.HandleListReports)
 			r.Get("/settings/reports/{id}", reportsH.HandleGetReport)
-			r.With(handler.RateLimitMiddleware(reportLimiter)).Post("/settings/reports", reportsH.HandleGenerateReport)
+			r.With(handler.RateLimitMiddlewareWithProxies(reportLimiter, trustedProxies)).Post("/settings/reports", reportsH.HandleGenerateReport)
 			r.Get("/settings/reports/{id}/pdf", reportsH.HandleDownloadPDF)
 
 			r.Get("/settings/users", usersH.HandleListUsers)
@@ -346,7 +379,7 @@ func main() {
 				json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 			})
 			r.Post("/settings/refresh-etf-metadata", func(w http.ResponseWriter, req *http.Request) {
-				go sched.RunETFUpdate()
+				sched.RunETFUpdate()
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 			})
@@ -356,7 +389,7 @@ func main() {
 				json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 			})
 			r.Post("/settings/rebuild-networth", func(w http.ResponseWriter, req *http.Request) {
-				go sched.BackfillNetWorthSnapshots()
+				sched.RunRebuildNetWorth()
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 			})
@@ -388,7 +421,7 @@ func main() {
 	fileServer := http.FileServer(http.FS(spaFS))
 	r.Get("/*", func(w http.ResponseWriter, req *http.Request) {
 		// Try to serve static file; fall back to index.html for SPA routing
-		path := req.URL.Path[1:]
+		path := strings.Trim(req.URL.Path, "/")
 		if path == "" || path == "index.html" {
 			// Always serve index.html with no-cache
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -396,7 +429,7 @@ func main() {
 			w.Write(indexHTML)
 			return
 		}
-		if _, err := fs.Stat(spaFS, path); err != nil {
+		if info, err := fs.Stat(spaFS, path); err != nil || info.IsDir() {
 			// Serve index.html directly to preserve the URL for React Router
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
@@ -421,11 +454,15 @@ func main() {
 	})
 
 	// Start server
+	writeTimeout := time.Duration(reqTimeout+5) * time.Second
+	if writeTimeout < 60*time.Second {
+		writeTimeout = 60 * time.Second
+	}
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: writeTimeout,
 		IdleTimeout:  120 * time.Second,
 	}
 
@@ -478,6 +515,31 @@ func loadTickerMap(ctx context.Context, queries *generated.Queries) {
 	}
 }
 
+// apiBodyLimit caps request body size across API endpoints (10 MiB for CSV upload, 1 MiB otherwise).
+func apiBodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			limit := int64(1 << 20) // 1 MiB default
+			if strings.HasPrefix(r.URL.Path, "/api/import") {
+				limit = 10 << 20 // 10 MiB for multipart CSV uploads
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func sameOriginHost(rawURL, expectedHost string) bool {
+	if expectedHost == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, expectedHost)
+}
+
 // securityHeaders adds standard security headers to all responses.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -486,23 +548,23 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		// CSP: allow self, inline styles (Tailwind), ECharts canvas, and data: URIs for fonts
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'")
+		// CSP: allow self, hashed SW bootstrap script in prebuilt index.html, inline styles (Tailwind), and data: URIs
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'sha256-31fQF/g9KGmEnutu6M7cTHdK4cN5J5z5NRerO5mFMfQ='; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'")
 
-		// CSRF: verify Origin or Referer header on state-changing requests
+		// CSRF: verify exact Origin or Referer host on state-changing requests
 		if r.Method == "POST" || r.Method == "PUT" || r.Method == "DELETE" || r.Method == "PATCH" {
 			origin := r.Header.Get("Origin")
 			referer := r.Header.Get("Referer")
 			host := r.Host
 
 			if origin != "" {
-				if !strings.Contains(origin, host) {
+				if !sameOriginHost(origin, host) {
 					slog.Warn("CSRF: origin mismatch", "origin", origin, "host", host)
 					http.Error(w, `{"error":"origin mismatch"}`, http.StatusForbidden)
 					return
 				}
 			} else if referer != "" {
-				if !strings.Contains(referer, host) {
+				if !sameOriginHost(referer, host) {
 					slog.Warn("CSRF: referer mismatch", "referer", referer, "host", host)
 					http.Error(w, `{"error":"origin mismatch"}`, http.StatusForbidden)
 					return
@@ -519,8 +581,11 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// ensureDefaultUser creates admin user on first run and assigns orphaned data.
+// ensureDefaultUser creates admin user on first run when ADMIN_PASSWORD is provided.
 func ensureDefaultUser(ctx context.Context, q *generated.Queries, adminPassword string) {
+	if len([]byte(adminPassword)) > 72 {
+		log.Fatalf("ADMIN_PASSWORD exceeds bcrypt 72-byte limit (%d bytes).", len([]byte(adminPassword)))
+	}
 	count, err := q.CountUsers(ctx)
 	if err != nil {
 		log.Printf("WARNING: count users: %v", err)
@@ -530,15 +595,13 @@ func ensureDefaultUser(ctx context.Context, q *generated.Queries, adminPassword 
 		return // users already exist
 	}
 
-	// Create default admin user
-	password := adminPassword
-	if password == "" {
-		log.Fatal("ADMIN_PASSWORD must be set. Refusing to create admin user with default password.")
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		log.Printf("WARNING: hash admin password: %v", err)
+	if adminPassword == "" {
+		log.Println("WARNING: ADMIN_PASSWORD is not set and no users exist; skipping default admin creation (dev mode).")
 		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(adminPassword), bcrypt.DefaultCost)
+	if err != nil {
+		log.Fatalf("hash admin password: %v", err)
 	}
 
 	user, err := q.CreateUser(ctx, generated.CreateUserParams{
@@ -549,12 +612,6 @@ func ensureDefaultUser(ctx context.Context, q *generated.Queries, adminPassword 
 		return
 	}
 	log.Printf("created default admin user: %s", user.ID)
-
-	if err := q.AssignOrphanedDataToUser(ctx, user.ID); err != nil {
-		log.Printf("WARNING: assign orphaned data: %v", err)
-	} else {
-		log.Println("assigned existing data to admin user")
-	}
 }
 
 // slogWriter adapts slog.Logger to io.Writer for redirecting standard log output.

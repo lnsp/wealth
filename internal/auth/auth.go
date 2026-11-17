@@ -21,31 +21,66 @@ const (
 type Auth struct {
 	passwordHash []byte
 	sessionKey   []byte
+	forceSecure  bool
 }
 
-// New creates an Auth instance. If password is empty, auth is disabled.
-// Session secret must be at least 16 bytes for HMAC security.
-func New(password, sessionSecret string) *Auth {
-	if password == "" {
-		return nil
-	}
+func normalizeSessionKey(sessionSecret string) []byte {
 	if len(sessionSecret) < 16 {
 		// Pad short secrets with hash to ensure minimum HMAC key length
 		h := sha256.Sum256([]byte(sessionSecret))
 		sessionSecret = hex.EncodeToString(h[:])
 	}
+	return []byte(sessionSecret)
+}
+
+// NewChecked creates an Auth instance, returning an error if password hashing fails (e.g. >72 bytes).
+func NewChecked(password, sessionSecret string) (*Auth, error) {
+	if password == "" {
+		return nil, nil
+	}
+	if len([]byte(password)) > 72 {
+		return nil, fmt.Errorf("password exceeds bcrypt 72-byte limit (%d bytes)", len([]byte(password)))
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		panic(fmt.Sprintf("hash password: %v", err))
+		return nil, fmt.Errorf("hash password: %w", err)
 	}
 	return &Auth{
 		passwordHash: hash,
-		sessionKey:   []byte(sessionSecret),
+		sessionKey:   normalizeSessionKey(sessionSecret),
+	}, nil
+}
+
+// New creates an Auth instance. If password is empty, auth is disabled.
+// Session secret must be at least 16 bytes for HMAC security.
+func New(password, sessionSecret string) *Auth {
+	a, err := NewChecked(password, sessionSecret)
+	if err != nil {
+		return nil
+	}
+	return a
+}
+
+// NewSessionOnly creates an Auth instance for database-backed user sessions
+// when no legacy ADMIN_PASSWORD is set.
+func NewSessionOnly(sessionSecret string) *Auth {
+	return &Auth{
+		sessionKey: normalizeSessionKey(sessionSecret),
+	}
+}
+
+// SetForceSecure forces the Secure flag on session cookies regardless of request headers.
+func (a *Auth) SetForceSecure(force bool) {
+	if a != nil {
+		a.forceSecure = force
 	}
 }
 
 // CheckPassword verifies a password against the stored hash.
 func (a *Auth) CheckPassword(password string) bool {
+	if a == nil || len(a.passwordHash) == 0 || password == "" {
+		return false
+	}
 	return bcrypt.CompareHashAndPassword(a.passwordHash, []byte(password)) == nil
 }
 
@@ -65,13 +100,23 @@ func (a *Auth) SetSessionCookieForUser(w http.ResponseWriter, r *http.Request, u
 		Expires:  expiry,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   isHTTPS(r),
+		Secure:   a.isSecure(r),
 	})
+}
+
+func (a *Auth) isSecure(r *http.Request) bool {
+	if a != nil && a.forceSecure {
+		return true
+	}
+	return isHTTPS(r)
 }
 
 // isHTTPS detects if the request was made over HTTPS, checking TLS state
 // and the X-Forwarded-Proto header (set by reverse proxies like Caddy/nginx).
 func isHTTPS(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
 	if r.TLS != nil {
 		return true
 	}
@@ -87,6 +132,20 @@ func (a *Auth) ClearSessionCookie(w http.ResponseWriter) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   a != nil && a.forceSecure,
+	})
+}
+
+// ClearSessionCookieWithRequest removes the session cookie with matching Secure attribute.
+func (a *Auth) ClearSessionCookieWithRequest(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   a.isSecure(r),
 	})
 }
 

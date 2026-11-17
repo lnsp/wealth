@@ -13,10 +13,10 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=postgres://finance:finance@db:5432/finance?sslmode=disable
-      - PORT=8443
-      - TZ=Europe/Berlin
-      - BACKUP_PATH=/backups
+      - DATABASE_URL=${DATABASE_URL:-postgres://finance:finance@db:5432/finance?sslmode=disable}
+      - PORT=${PORT:-8443}
+      - TZ=${TZ:-Europe/Berlin}
+      - BACKUP_PATH=${BACKUP_PATH:-/backups}
     volumes:
       - backups:/backups
     depends_on:
@@ -44,13 +44,13 @@ services:
   db:
     image: docker.io/library/postgres:16-alpine
     environment:
-      - POSTGRES_USER=finance
-      - POSTGRES_PASSWORD=finance
-      - POSTGRES_DB=finance
+      - POSTGRES_USER=${POSTGRES_USER:-finance}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-finance}
+      - POSTGRES_DB=${POSTGRES_DB:-finance}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U finance"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-finance}"]
       interval: 5s
       timeout: 5s
       retries: 5

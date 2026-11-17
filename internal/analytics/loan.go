@@ -66,15 +66,36 @@ func (l Loan) rateOn(due time.Time) float64 {
 // Schedule returns the payments until the loan is repaid. Extra repayments
 // lower the balance on their date.
 func (l Loan) Schedule() []LoanPayment {
+	out, _ := l.scheduleWithPayoff()
+	return out
+}
+
+// PayoffDate returns the exact date on which the loan reaches zero balance
+// (either on a regular monthly due date or on an extra repayment date), or
+// zero time.Time if the loan does not amortize within maxLoanMonths.
+func (l Loan) PayoffDate() time.Time {
+	_, payoff := l.scheduleWithPayoff()
+	return payoff
+}
+
+func (l Loan) scheduleWithPayoff() ([]LoanPayment, time.Time) {
 	var out []LoanPayment
+	var payoff time.Time
 	balance := l.Principal
+	if balance <= 0.005 {
+		return nil, l.FirstPaymentDate
+	}
 	extraIdx := 0
 	extras := sortedExtras(l.Extras)
 	for n := 0; n < maxLoanMonths && balance > 0.005; n++ {
 		due := l.dueDate(n)
 		for extraIdx < len(extras) && !extras[extraIdx].Date.After(due) {
-			balance = math.Max(0, balance-extras[extraIdx].Amount)
+			ex := extras[extraIdx]
+			balance = math.Max(0, balance-ex.Amount)
 			extraIdx++
+			if balance <= 0.005 && payoff.IsZero() {
+				payoff = ex.Date
+			}
 		}
 		if balance <= 0.005 {
 			break
@@ -83,8 +104,11 @@ func (l Loan) Schedule() []LoanPayment {
 		principal := math.Min(balance, l.MonthlyPayment-interest)
 		balance = round2(balance - principal)
 		out = append(out, LoanPayment{Due: due, Interest: interest, Principal: principal, Balance: balance})
+		if balance <= 0.005 && payoff.IsZero() {
+			payoff = due
+		}
 	}
-	return out
+	return out, payoff
 }
 
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
@@ -163,7 +187,7 @@ func (l Loan) Scenario(from time.Time, extraPerYear, followupRate float64) LoanS
 			}
 		}
 	}
-	schedule := sim.Schedule()
+	schedule, payoffDate := sim.scheduleWithPayoff()
 	var out LoanScenario
 	for _, p := range schedule {
 		out.TotalInterest += p.Interest
@@ -171,9 +195,7 @@ func (l Loan) Scenario(from time.Time, extraPerYear, followupRate float64) LoanS
 			out.InterestAfterFixed += p.Interest
 		}
 	}
-	if len(schedule) > 0 {
-		out.PayoffDate = schedule[len(schedule)-1].Due
-	}
+	out.PayoffDate = payoffDate
 	if !l.FixedUntil.IsZero() {
 		out.RemainingAtFixedEnd = balanceAt(sim, schedule, l.FixedUntil)
 	}

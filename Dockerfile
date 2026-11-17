@@ -23,7 +23,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
 
 # --- Runtime stage ---
 FROM alpine:3.21
-RUN apk add --no-cache postgresql16-client tzdata ca-certificates su-exec
+RUN apk add --no-cache postgresql16-client tzdata ca-certificates su-exec age
 COPY --from=backend /finance-tracker /usr/local/bin/finance-tracker
 RUN adduser -D -H appuser && mkdir -p /backups
 

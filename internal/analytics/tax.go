@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 )
 
 const (
@@ -42,6 +43,71 @@ func TeilfreistellungRate(equityPct float64) float64 {
 	return TeilfreistellungBond
 }
 
+// SecurityTeilfreistellungRate resolves a security's Teilfreistellung rate from
+// its asset_class and optional equity_pct. Individual stocks, crypto, bonds,
+// derivatives, and commodities receive 0%. Funds/ETFs use equity_pct when known
+// (e.g. bond ETFs with equity_pct=0 -> 0%, mixed funds -> 15%, equity ETFs -> 30%),
+// defaulting to 30% for ETFs when equity_pct has not yet been populated.
+func SecurityTeilfreistellungRate(assetClass string, equityPct *float64) float64 {
+	if assetClass != "etf" && assetClass != "fund" {
+		return 0
+	}
+	if equityPct != nil {
+		return TeilfreistellungRate(*equityPct)
+	}
+	if assetClass == "etf" {
+		return TeilfreistellungEquity
+	}
+	return 0
+}
+
+// ResolveSecurityTFSRate resolves a security's InvStG Teilfreistellung rate (0.30 equity,
+// 0.15 mixed, 0.00 bond/money-market/stock/crypto). Accepts equityPct in either 0..1
+// fraction or >1 percentage form, and falls back to fund-name heuristics when nil.
+func ResolveSecurityTFSRate(assetClass, name string, equityPct *float64) float64 {
+	if assetClass != "etf" && assetClass != "fund" {
+		return 0
+	}
+	if equityPct != nil {
+		v := *equityPct
+		if v > 1.0 {
+			v /= 100.0
+		}
+		return SecurityTeilfreistellungRate(assetClass, &v)
+	}
+	lowerName := strings.ToLower(name)
+	for _, kw := range []string{
+		"money market", "overnight", "geldmarkt", "xeon",
+		"staatsanleihe", "treasury", "govt bond", "government bond",
+		"corporate bond", "aggregate bond", "eur bond", "usd bond",
+		"global bond", "anleihen", "pfandbrief", "ultrashort bond",
+		"short duration", "physical gold", "gold etc",
+	} {
+		if strings.Contains(lowerName, kw) {
+			return TeilfreistellungBond
+		}
+	}
+	for _, kw := range []string{"mischfonds", "lifestrategy 40", "multi-asset"} {
+		if strings.Contains(lowerName, kw) {
+			return TeilfreistellungMixed
+		}
+	}
+	return SecurityTeilfreistellungRate(assetClass, nil)
+}
+
+func txnTFSRate(txn TaxTransaction) float64 {
+	if txn.HasExplicitTFS {
+		return txn.TFS
+	}
+	if txn.TFS > 0 {
+		return txn.TFS
+	}
+	if txn.IsEquityFund {
+		return TeilfreistellungEquity
+	}
+	return 0
+}
+
 // Basiszins published by Deutsche Bundesbank (used for Vorabpauschale)
 var BasiszinsByYear = map[int]float64{
 	2022: -0.05, 2023: 2.55, 2024: 2.29, 2025: 2.53, 2026: 2.53,
@@ -59,57 +125,254 @@ type VorabpauschaleEntry struct {
 	TaxOnVP       float64 `json:"tax_on_vp"` // after Teilfreistellung + Abgeltungssteuer
 }
 
+// VorabpauschaleLotInput describes a mid-year fund purchase for 1/12 pro-rating (§ 18 Abs. 2 InvStG).
+type VorabpauschaleLotInput struct {
+	BuyMonth int     // 1..12
+	ValueJan float64 // initial purchase cost / base value for the partial year
+}
+
+// VorabpauschaleInput holds complete per-fund data for § 18 InvStG Vorabpauschale calculation.
+type VorabpauschaleInput struct {
+	ISIN          string
+	Name          string
+	Jan1Value     float64
+	YearEndValue  float64
+	Distributions float64                  // actual cash distributions paid during the year
+	MidYearBuys   []VorabpauschaleLotInput // acquisitions during `year` (pro-rated by (13 - month)/12)
+	TFSRate       float64                  // e.g. 0.30 equity, 0.15 mixed, 0.00 bond
+}
+
 // ComputeVorabpauschale calculates the Vorabpauschale for accumulating ETFs.
 // jan1Holdings: ISIN → value on Jan 1 of the year
 // yearEndHoldings: ISIN → value at year end (or current)
 // names: ISIN → fund name
 func ComputeVorabpauschale(year int, jan1Holdings, yearEndHoldings map[string]float64, names map[string]string) []VorabpauschaleEntry {
+	var inputs []VorabpauschaleInput
+	for isin, jan1Val := range jan1Holdings {
+		inputs = append(inputs, VorabpauschaleInput{
+			ISIN:         isin,
+			Name:         names[isin],
+			Jan1Value:    jan1Val,
+			YearEndValue: yearEndHoldings[isin],
+			TFSRate:      TeilfreistellungEquity,
+		})
+	}
+	return ComputeVorabpauschaleDetailed(year, inputs)
+}
+
+// VorabpauschaleTxn is a chronologically ordered security transaction used to
+// reconstruct Jan 1 and surviving mid-year FIFO positions for § 18 InvStG.
+type VorabpauschaleTxn struct {
+	AccountID string
+	ISIN      string
+	Year      int
+	Month     int // 1..12
+	Type      string
+	Quantity  float64
+	AmountEUR float64
+}
+
+// VorabpauschaleYearPosition holds reconstructed year-end surviving share
+// quantities, surviving pro-rated mid-year buy lots, and in-year distributions
+// for a single fund ISIN after FIFO-deducting sales/transfers per depot.
+type VorabpauschaleYearPosition struct {
+	ISIN          string
+	Jan1Qty       float64
+	Jan1CostEUR   float64
+	YearEndQty    float64
+	MidYearBuys   []VorabpauschaleLotInput
+	Distributions float64
+}
+
+// ReconstructVorabpauschaleYear replays chronologically ordered fund/ETF
+// transactions up to Dec 31 of `year`, FIFO-deducting pre-year and in-year
+// sells/transfer_outs per (AccountID, ISIN) so only shares still held at
+// year-end contribute to Jan 1 value or pro-rated mid-year buy lots (§ 18 Abs. 3 InvStG).
+func ReconstructVorabpauschaleYear(year int, txns []VorabpauschaleTxn) map[string]VorabpauschaleYearPosition {
+	type lotKey struct {
+		acct string
+		isin string
+	}
+	type preLot struct {
+		qty      float64
+		unitCost float64
+	}
+	type midLot struct {
+		buyMonth int
+		qty      float64
+		unitCost float64
+	}
+
+	preByKey := make(map[lotKey][]preLot)
+	midByKey := make(map[lotKey][]midLot)
+	var keyOrder []lotKey
+	seenKey := make(map[lotKey]bool)
+	distByISIN := make(map[string]float64)
+
+	for _, t := range txns {
+		if t.ISIN == "" || t.Year > year {
+			continue
+		}
+		k := lotKey{acct: t.AccountID, isin: t.ISIN}
+		if !seenKey[k] {
+			seenKey[k] = true
+			keyOrder = append(keyOrder, k)
+		}
+		switch t.Type {
+		case "buy", "savings_plan", "transfer":
+			if t.Quantity <= 0 {
+				continue
+			}
+			unitCost := 0.0
+			if t.AmountEUR > 0 {
+				unitCost = t.AmountEUR / t.Quantity
+			}
+			if t.Year < year {
+				preByKey[k] = append(preByKey[k], preLot{qty: t.Quantity, unitCost: unitCost})
+			} else {
+				preMonth := t.Month
+				if preMonth < 1 {
+					preMonth = 1
+				} else if preMonth > 12 {
+					preMonth = 12
+				}
+				midByKey[k] = append(midByKey[k], midLot{buyMonth: preMonth, qty: t.Quantity, unitCost: unitCost})
+			}
+		case "sell", "transfer_out":
+			if t.Quantity <= 0 {
+				continue
+			}
+			rem := t.Quantity
+			for rem > 1e-9 && len(preByKey[k]) > 0 {
+				l := &preByKey[k][0]
+				if l.qty <= rem+1e-9 {
+					rem -= l.qty
+					preByKey[k] = preByKey[k][1:]
+				} else {
+					l.qty -= rem
+					rem = 0
+				}
+			}
+			if t.Year == year {
+				for rem > 1e-9 && len(midByKey[k]) > 0 {
+					l := &midByKey[k][0]
+					if l.qty <= rem+1e-9 {
+						rem -= l.qty
+						midByKey[k] = midByKey[k][1:]
+					} else {
+						l.qty -= rem
+						rem = 0
+					}
+				}
+			}
+		case "dividend":
+			if t.Year == year && t.AmountEUR > 0 {
+				distByISIN[t.ISIN] += t.AmountEUR
+			}
+		}
+	}
+
+	out := make(map[string]VorabpauschaleYearPosition)
+	for _, k := range keyOrder {
+		pos := out[k.isin]
+		pos.ISIN = k.isin
+		for _, pl := range preByKey[k] {
+			if pl.qty > 1e-9 {
+				pos.Jan1Qty += pl.qty
+				pos.Jan1CostEUR += pl.qty * pl.unitCost
+				pos.YearEndQty += pl.qty
+			}
+		}
+		for _, ml := range midByKey[k] {
+			if ml.qty > 1e-9 {
+				pos.YearEndQty += ml.qty
+				if ml.unitCost > 0 {
+					pos.MidYearBuys = append(pos.MidYearBuys, VorabpauschaleLotInput{
+						BuyMonth: ml.buyMonth,
+						ValueJan: ml.qty * ml.unitCost,
+					})
+				}
+			}
+		}
+		out[k.isin] = pos
+	}
+
+	for isin, pos := range out {
+		if pos.YearEndQty <= 1e-9 {
+			delete(out, isin)
+			continue
+		}
+		pos.Distributions = distByISIN[isin]
+		out[isin] = pos
+	}
+	return out
+}
+
+// ComputeVorabpauschaleDetailed computes § 18 InvStG Vorabpauschale subtracting
+// actual distributions, pro-rating mid-year purchases by (13 - buyMonth)/12,
+// and applying each fund's actual Teilfreistellung rate.
+func ComputeVorabpauschaleDetailed(year int, inputs []VorabpauschaleInput) []VorabpauschaleEntry {
 	basiszins, ok := BasiszinsByYear[year]
 	if !ok || basiszins <= 0 {
 		return nil // negative Basiszins = no Vorabpauschale
 	}
 
 	var entries []VorabpauschaleEntry
-	for isin, jan1Val := range jan1Holdings {
-		if jan1Val <= 0 {
+	for _, in := range inputs {
+		baseCost := in.Jan1Value
+		weightedBase := in.Jan1Value
+		for _, b := range in.MidYearBuys {
+			if b.ValueJan <= 0 {
+				continue
+			}
+			m := b.BuyMonth
+			if m < 1 {
+				m = 1
+			}
+			if m > 12 {
+				m = 12
+			}
+			baseCost += b.ValueJan
+			weightedBase += b.ValueJan * float64(13-m) / 12.0
+		}
+		if weightedBase <= 0 || in.YearEndValue <= 0 {
 			continue
 		}
-		yearEndVal := yearEndHoldings[isin]
-		priceGain := yearEndVal - jan1Val
 
-		// Basisertrag = Jan1 value × Basiszins × 0.7
-		basisertrag := jan1Val * basiszins / 100 * 0.7
+		// Basisertrag = weighted base × Basiszins × 0.7 (§ 18 Abs. 1 Satz 2, Abs. 2 InvStG)
+		basisertrag := weightedBase * basiszins / 100 * 0.7
 		if basisertrag <= 0 {
 			continue
 		}
 
-		// Vorabpauschale = min(Basisertrag, actual price gain)
-		// If price dropped, Vorabpauschale = 0
-		vp := basisertrag
-		if priceGain < basisertrag {
-			vp = math.Max(priceGain, 0)
-		}
+		// Value appreciation + distributions cap: max(0, YearEnd - BaseCost) + Distributions
+		wertsteigerung := math.Max(0, in.YearEndValue-baseCost) + math.Max(0, in.Distributions)
+		capped := math.Min(basisertrag, wertsteigerung)
 
-		// Tax: apply Teilfreistellung (30% for equity) then Abgeltungssteuer
-		taxableVP := vp * (1 - TeilfreistellungEquity)
+		// Subtract actual distributions paid during the year (§ 18 Abs. 1 Satz 3 InvStG)
+		vp := math.Max(0, capped-math.Max(0, in.Distributions))
+
+		taxableVP := vp * (1 - in.TFSRate)
 		tax := taxableVP * EffectiveTaxRate
 
 		entries = append(entries, VorabpauschaleEntry{
-			ISIN:           isin,
-			Name:           names[isin],
-			Jan1Value:      math.Round(jan1Val*100) / 100,
-			YearEndValue:   math.Round(yearEndVal*100) / 100,
+			ISIN:           in.ISIN,
+			Name:           in.Name,
+			Jan1Value:      math.Round(baseCost*100) / 100,
+			YearEndValue:   math.Round(in.YearEndValue*100) / 100,
 			Basiszins:      basiszins,
 			Basisertrag:    math.Round(basisertrag*100) / 100,
 			Vorabpauschale: math.Round(vp*100) / 100,
 			TaxOnVP:        math.Round(tax*100) / 100,
 		})
 	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ISIN < entries[j].ISIN })
 	return entries
 }
 
 // TaxLot represents an open FIFO lot with tax implications.
 type TaxLot struct {
+	AccountID     string  `json:"account_id,omitempty"`
 	ISIN          string  `json:"isin"`
 	Name          string  `json:"name"`
 	BuyDate       string  `json:"buy_date"`
@@ -118,42 +381,62 @@ type TaxLot struct {
 	CurrentValue  float64 `json:"current_value"`
 	UnrealizedPL  float64 `json:"unrealized_pl"`
 	IsEquityFund  bool    `json:"is_equity_fund"`
+	TFSRate       float64 `json:"tfs_rate,omitempty"`
 	TaxIfSold     float64 `json:"tax_if_sold"`     // estimated tax after Teilfreistellung
-	NetProceeds   float64 `json:"net_proceeds"`     // current value minus tax
-	EffectiveRate float64 `json:"effective_rate"`    // tax / gain %
+	NetProceeds   float64 `json:"net_proceeds"`    // current value minus tax
+	EffectiveRate float64 `json:"effective_rate"`  // tax / gain %
 }
 
-// ComputeTaxLots reconstructs FIFO lots from transactions and computes tax impact.
+// ComputeTaxLots reconstructs per-depot FIFO lots from transactions and computes tax impact.
 func ComputeTaxLots(txns []TaxTransaction, prices map[string]float64, names map[string]string, equityMap map[string]bool) []TaxLot {
-	type lot struct {
-		buyDate  string
-		qty      float64
-		costPer  float64
+	type lotKey struct {
+		acct string
+		isin string
 	}
-	lots := make(map[string][]lot) // ISIN -> FIFO queue
+	type lot struct {
+		buyDate string
+		qty     float64
+		costPer float64
+		tfsRate float64
+		hasTFS  bool
+	}
+	lots := make(map[lotKey][]lot) // (AccountID, ISIN) -> FIFO queue
+	var keyOrder []lotKey
+	seenKey := make(map[lotKey]bool)
 
 	// Sort chronologically (assume already sorted)
 	for _, txn := range txns {
 		if txn.ISIN == "" {
 			continue
 		}
+		k := lotKey{acct: txn.AccountID, isin: txn.ISIN}
+		if !seenKey[k] {
+			seenKey[k] = true
+			keyOrder = append(keyOrder, k)
+		}
 		switch txn.Type {
 		case "buy", "savings_plan", "transfer":
 			if txn.Quantity > 0 {
 				costPer := txn.Amount / txn.Quantity
-				lots[txn.ISIN] = append(lots[txn.ISIN], lot{
-					buyDate: fmt.Sprintf("%d-%02d-%02d", txn.Year, 1, 1), // approximate
+				buyDate := txn.Date
+				if buyDate == "" {
+					buyDate = fmt.Sprintf("%d-%02d-%02d", txn.Year, 1, 1)
+				}
+				lots[k] = append(lots[k], lot{
+					buyDate: buyDate,
 					qty:     txn.Quantity,
 					costPer: costPer,
+					tfsRate: txn.TFS,
+					hasTFS:  txn.HasExplicitTFS || txn.TFS > 0,
 				})
 			}
 		case "sell", "transfer_out":
 			remaining := txn.Quantity
-			for remaining > 0 && len(lots[txn.ISIN]) > 0 {
-				l := &lots[txn.ISIN][0]
-				if l.qty <= remaining {
+			for remaining > 1e-9 && len(lots[k]) > 0 {
+				l := &lots[k][0]
+				if l.qty <= remaining+1e-9 {
 					remaining -= l.qty
-					lots[txn.ISIN] = lots[txn.ISIN][1:]
+					lots[k] = lots[k][1:]
 				} else {
 					l.qty -= remaining
 					remaining = 0
@@ -164,7 +447,9 @@ func ComputeTaxLots(txns []TaxTransaction, prices map[string]float64, names map[
 
 	// Build tax lot entries
 	var result []TaxLot
-	for isin, isinLots := range lots {
+	for _, k := range keyOrder {
+		isin := k.isin
+		isinLots := lots[k]
 		price := prices[isin]
 		isEquity := equityMap[isin]
 		name := names[isin]
@@ -173,7 +458,7 @@ func ComputeTaxLots(txns []TaxTransaction, prices map[string]float64, names map[
 		}
 
 		for _, l := range isinLots {
-			if l.qty <= 0.001 {
+			if l.qty <= 1e-9 {
 				continue
 			}
 			costBasis := l.qty * l.costPer
@@ -183,13 +468,17 @@ func ComputeTaxLots(txns []TaxTransaction, prices map[string]float64, names map[
 			}
 			unrealizedPL := currentValue - costBasis
 
+			tfs := 0.0
+			if l.hasTFS {
+				tfs = l.tfsRate
+			} else if isEquity {
+				tfs = TeilfreistellungEquity
+			}
+
 			// Tax computation
 			taxIfSold := 0.0
 			if unrealizedPL > 0 {
-				taxable := unrealizedPL
-				if isEquity {
-					taxable *= (1 - TeilfreistellungEquity)
-				}
+				taxable := unrealizedPL * (1 - tfs)
 				taxIfSold = taxable * EffectiveTaxRate
 			}
 
@@ -199,14 +488,16 @@ func ComputeTaxLots(txns []TaxTransaction, prices map[string]float64, names map[
 			}
 
 			result = append(result, TaxLot{
+				AccountID:     k.acct,
 				ISIN:          isin,
 				Name:          name,
 				BuyDate:       l.buyDate,
-				Quantity:      math.Round(l.qty*1000) / 1000,
+				Quantity:      math.Round(l.qty*1e8) / 1e8,
 				CostBasis:     math.Round(costBasis*100) / 100,
 				CurrentValue:  math.Round(currentValue*100) / 100,
 				UnrealizedPL:  math.Round(unrealizedPL*100) / 100,
-				IsEquityFund:  isEquity,
+				IsEquityFund:  isEquity || tfs >= TeilfreistellungEquity,
+				TFSRate:       tfs,
 				TaxIfSold:     math.Round(taxIfSold*100) / 100,
 				NetProceeds:   math.Round((currentValue-taxIfSold)*100) / 100,
 				EffectiveRate: math.Round(effectiveRate*10) / 10,
@@ -272,7 +563,7 @@ func SimulateSell(lots []TaxLot, requests []SellRequest, churchTaxRate float64) 
 	totalProceeds := 0.0
 
 	for _, req := range requests {
-		if req.AmountEUR <= 0 {
+		if req.AmountEUR <= 0 || math.IsNaN(req.AmountEUR) || math.IsInf(req.AmountEUR, 0) {
 			continue
 		}
 		isinLots := lotsByISIN[req.ISIN]
@@ -291,6 +582,9 @@ func SimulateSell(lots []TaxLot, requests []SellRequest, churchTaxRate float64) 
 			if remaining <= 0 {
 				break
 			}
+			if lot.CurrentValue <= 0 || math.IsNaN(lot.CurrentValue) || math.IsInf(lot.CurrentValue, 0) {
+				continue
+			}
 			// How much of this lot to sell (by value)
 			sellFromLot := math.Min(remaining, lot.CurrentValue)
 			fraction := sellFromLot / lot.CurrentValue
@@ -303,9 +597,13 @@ func SimulateSell(lots []TaxLot, requests []SellRequest, churchTaxRate float64) 
 		}
 
 		gain := totalSold - totalCost
+		tfsRate := isinLots[0].TFSRate
+		if tfsRate == 0 && isEquity {
+			tfsRate = TeilfreistellungEquity
+		}
 		tf := 0.0
-		if isEquity && gain > 0 {
-			tf = gain * TeilfreistellungEquity
+		if tfsRate > 0 && gain > 0 {
+			tf = gain * tfsRate
 		}
 		taxableGain := gain - tf
 		if taxableGain < 0 {
@@ -349,13 +647,18 @@ type LossPotYear struct {
 	CarryForwardGeneral float64 `json:"carry_forward_general"`
 }
 
-// ComputeLossPots calculates the German loss offset pots per year from transactions.
+// ComputeLossPots calculates the German loss offset pots per year from transactions
+// using per-depot FIFO cost basis tracking (§ 20 Abs. 4 Satz 7 EStG).
 func ComputeLossPots(txns []TaxTransaction) []LossPotYear {
+	type fifoKey struct {
+		acct string
+		isin string
+	}
 	type lot struct {
 		qty     float64
 		costPer float64
 	}
-	holdings := make(map[string]*struct{ qty, totalCost float64 })
+	lots := make(map[fifoKey][]lot)
 
 	yearEquityLosses := make(map[int]float64)
 	yearEquityGains := make(map[int]float64)
@@ -363,54 +666,62 @@ func ComputeLossPots(txns []TaxTransaction) []LossPotYear {
 	yearGeneralGains := make(map[int]float64)
 	years := make(map[int]bool)
 
+	consumeFIFO := func(k fifoKey, qty float64) (soldQty, costBasis float64) {
+		rem := qty
+		for rem > 1e-9 && len(lots[k]) > 0 {
+			l := &lots[k][0]
+			if l.qty <= rem+1e-9 {
+				soldQty += l.qty
+				costBasis += l.qty * l.costPer
+				rem -= l.qty
+				lots[k] = lots[k][1:]
+			} else {
+				soldQty += rem
+				costBasis += rem * l.costPer
+				l.qty -= rem
+				rem = 0
+			}
+		}
+		return soldQty, costBasis
+	}
+
 	for _, txn := range txns {
 		years[txn.Year] = true
+		k := fifoKey{acct: txn.AccountID, isin: txn.ISIN}
 		switch txn.Type {
-		case "buy", "savings_plan":
-			if txn.ISIN == "" { continue }
-			h, ok := holdings[txn.ISIN]
-			if !ok {
-				h = &struct{ qty, totalCost float64 }{}
-				holdings[txn.ISIN] = h
+		case "buy", "savings_plan", "transfer":
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
 			}
-			h.qty += txn.Quantity
-			h.totalCost += txn.Amount
-
-		case "transfer":
-			// Transfers update holdings for cost basis tracking but are NOT taxable events
-			if txn.ISIN == "" { continue }
-			h, ok := holdings[txn.ISIN]
-			if !ok {
-				h = &struct{ qty, totalCost float64 }{}
-				holdings[txn.ISIN] = h
-			}
-			h.qty += txn.Quantity
-			h.totalCost += txn.Amount
+			lots[k] = append(lots[k], lot{
+				qty:     txn.Quantity,
+				costPer: txn.Amount / txn.Quantity,
+			})
 
 		case "transfer_out":
-			// Transfer out: reduce holdings but NO realized gain/loss
-			if txn.ISIN == "" { continue }
-			h, ok := holdings[txn.ISIN]
-			if !ok || h.qty <= 0 { continue }
-			avgCost := h.totalCost / h.qty
-			h.qty -= txn.Quantity
-			h.totalCost -= txn.Quantity * avgCost
-			if h.qty <= 0.001 { delete(holdings, txn.ISIN) }
+			// Transfer out: reduce FIFO lots but NO realized gain/loss
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
+			}
+			consumeFIFO(k, txn.Quantity)
 
 		case "sell":
-			if txn.ISIN == "" { continue }
-			h, ok := holdings[txn.ISIN]
-			if !ok || h.qty <= 0 { continue }
-			avgCost := h.totalCost / h.qty
-			costBasis := txn.Quantity * avgCost
-			pl := txn.Amount - costBasis
-			h.qty -= txn.Quantity
-			h.totalCost -= costBasis
-			if h.qty <= 0.001 { delete(holdings, txn.ISIN) }
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
+			}
+			soldQty, costBasis := consumeFIFO(k, txn.Quantity)
+			if soldQty <= 1e-9 {
+				continue
+			}
+			proceeds := txn.Amount
+			if soldQty < txn.Quantity {
+				proceeds = txn.Amount * (soldQty / txn.Quantity)
+			}
+			pl := proceeds - costBasis
 
-			// Apply Teilfreistellung to equity gains/losses
-			if txn.IsEquityFund {
-				pl *= (1 - TeilfreistellungEquity) // only 70% is taxable
+			tfs := txnTFSRate(txn)
+			if tfs > 0 {
+				pl *= (1 - tfs)
 			}
 
 			if txn.IsEquityFund {
@@ -429,10 +740,7 @@ func ComputeLossPots(txns []TaxTransaction) []LossPotYear {
 
 		case "dividend":
 			// Dividends go to general gains (can be offset by general losses)
-			amt := txn.Amount
-			if txn.IsEquityFund {
-				amt *= (1 - TeilfreistellungEquity)
-			}
+			amt := txn.Amount * (1 - txnTFSRate(txn))
 			yearGeneralGains[txn.Year] += amt
 
 		case "interest":
@@ -526,73 +834,88 @@ type TaxLossHint struct {
 
 // TaxTransaction represents a transaction relevant for tax computation.
 type TaxTransaction struct {
-	Year         int
-	Type         string  // "buy", "sell", "dividend", "savings_plan", "transfer"
-	ISIN         string
-	Name         string
-	Quantity     float64
-	Amount       float64
-	IsEquityFund bool
+	AccountID      string  // optional: scopes FIFO lots per depot
+	Date           string  // optional: YYYY-MM-DD purchase/trade date
+	Year           int
+	Type           string  // "buy", "sell", "dividend", "savings_plan", "transfer", "transfer_out", "interest"
+	ISIN           string
+	Name           string
+	Quantity       float64
+	Amount         float64
+	IsEquityFund   bool
+	TFS            float64 // optional explicit Teilfreistellung rate (0.30, 0.15, 0.00)
+	HasExplicitTFS bool    // true when TFS was explicitly resolved from EquityPct
 }
 
 // ComputeTaxSummary calculates the German tax summary for a given year.
-// It takes all transactions (for cost basis tracking) and filters results to the target year.
+// It takes all transactions (for per-depot FIFO cost basis tracking) and filters results to the target year.
 func ComputeTaxSummary(allTxns []TaxTransaction, year int, unrealizedPositions []TaxLossHint) *TaxSummary {
-	type lot struct {
-		quantity  float64
-		totalCost float64
+	type fifoKey struct {
+		acct string
+		isin string
 	}
-	holdings := make(map[string]*lot)
+	type lot struct {
+		qty     float64
+		costPer float64
+	}
+	lots := make(map[fifoKey][]lot)
 
-	var gains, losses, dividends, equityDividends float64
+	consumeFIFO := func(k fifoKey, qty float64) (soldQty, costBasis float64) {
+		rem := qty
+		for rem > 1e-9 && len(lots[k]) > 0 {
+			l := &lots[k][0]
+			if l.qty <= rem+1e-9 {
+				soldQty += l.qty
+				costBasis += l.qty * l.costPer
+				rem -= l.qty
+				lots[k] = lots[k][1:]
+			} else {
+				soldQty += rem
+				costBasis += rem * l.costPer
+				l.qty -= rem
+				rem = 0
+			}
+		}
+		return soldQty, costBasis
+	}
+
+	var gains, losses, dividends, dividendTFS float64
 	var bySec []TaxBySecurity
-	secNames := make(map[string]string)
-	secEquity := make(map[string]bool)
+	var bySecTFS []float64
 
 	for _, txn := range allTxns {
-		secNames[txn.ISIN] = txn.Name
-		secEquity[txn.ISIN] = txn.IsEquityFund
+		k := fifoKey{acct: txn.AccountID, isin: txn.ISIN}
 
 		switch txn.Type {
 		case "buy", "savings_plan", "transfer":
-			if txn.ISIN == "" {
+			if txn.ISIN == "" || txn.Quantity <= 0 {
 				continue
 			}
-			l, ok := holdings[txn.ISIN]
-			if !ok {
-				l = &lot{}
-				holdings[txn.ISIN] = l
-			}
-			l.quantity += txn.Quantity
-			l.totalCost += txn.Amount
+			lots[k] = append(lots[k], lot{
+				qty:     txn.Quantity,
+				costPer: txn.Amount / txn.Quantity,
+			})
 
 		case "transfer_out":
-			// Transfer out: reduce holdings but NO realized gain/loss
-			if txn.ISIN == "" { continue }
-			l, ok := holdings[txn.ISIN]
-			if !ok || l.quantity <= 0 { continue }
-			avgCost := l.totalCost / l.quantity
-			l.quantity -= txn.Quantity
-			l.totalCost -= txn.Quantity * avgCost
-			if l.quantity <= 0.001 { delete(holdings, txn.ISIN) }
+			// Transfer out: reduce FIFO lots but NO realized gain/loss
+			if txn.ISIN == "" || txn.Quantity <= 0 {
+				continue
+			}
+			consumeFIFO(k, txn.Quantity)
 
 		case "sell":
-			if txn.ISIN == "" {
+			if txn.ISIN == "" || txn.Quantity <= 0 {
 				continue
 			}
-			l, ok := holdings[txn.ISIN]
-			if !ok || l.quantity <= 0 {
+			soldQty, costBasis := consumeFIFO(k, txn.Quantity)
+			if soldQty <= 1e-9 {
 				continue
 			}
-			avgCost := l.totalCost / l.quantity
-			costBasis := txn.Quantity * avgCost
-			realizedPL := txn.Amount - costBasis
-
-			l.quantity -= txn.Quantity
-			l.totalCost -= costBasis
-			if l.quantity <= 0.001 {
-				delete(holdings, txn.ISIN)
+			proceeds := txn.Amount
+			if soldQty < txn.Quantity {
+				proceeds = txn.Amount * (soldQty / txn.Quantity)
 			}
+			realizedPL := proceeds - costBasis
 
 			// Only count gains/losses for the target year
 			if txn.Year == year {
@@ -601,31 +924,32 @@ func ComputeTaxSummary(allTxns []TaxTransaction, year int, unrealizedPositions [
 				} else {
 					losses += realizedPL
 				}
+				tfsRate := txnTFSRate(txn)
 				bySec = append(bySec, TaxBySecurity{
 					ISIN:         txn.ISIN,
 					Name:         txn.Name,
 					RealizedPL:   math.Round(realizedPL*100) / 100,
-					IsEquityFund: txn.IsEquityFund,
+					IsEquityFund: txn.IsEquityFund || tfsRate >= TeilfreistellungEquity,
 				})
+				bySecTFS = append(bySecTFS, tfsRate)
 			}
 
 		case "dividend":
 			if txn.Year == year {
 				dividends += txn.Amount
-				if txn.IsEquityFund {
-					equityDividends += txn.Amount
-				}
+				dividendTFS += txn.Amount * txnTFSRate(txn)
 			}
 		}
 	}
 
 	netGain := gains + losses // losses are negative
 
-	// Apply Teilfreistellung per security
+	// Apply Teilfreistellung per security (gains only; losses preserved at full magnitude)
 	teilfreistellungTotal := 0.0
 	for i, s := range bySec {
-		if s.IsEquityFund && s.RealizedPL > 0 {
-			tf := s.RealizedPL * TeilfreistellungEquity
+		tfsRate := bySecTFS[i]
+		if tfsRate > 0 && s.RealizedPL > 0 {
+			tf := s.RealizedPL * tfsRate
 			bySec[i].Teilfreistellung = math.Round(tf*100) / 100
 			bySec[i].TaxablePL = math.Round((s.RealizedPL-tf)*100) / 100
 			teilfreistellungTotal += tf
@@ -634,10 +958,8 @@ func ComputeTaxSummary(allTxns []TaxTransaction, year int, unrealizedPositions [
 		}
 	}
 
-	// Apply Teilfreistellung only to dividends from equity funds (30%), not bonds (0%)
-	dividendTeilfreistellung := equityDividends * TeilfreistellungEquity
-	taxableDividends := dividends - dividendTeilfreistellung
-	teilfreistellungTotal += dividendTeilfreistellung
+	taxableDividends := dividends - dividendTFS
+	teilfreistellungTotal += dividendTFS
 
 	taxableGain := netGain - teilfreistellungTotal + taxableDividends
 	if taxableGain < 0 {

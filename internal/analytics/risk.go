@@ -68,19 +68,20 @@ func ComputeRiskMetrics(snapshots []DailyValuation, riskFreeRate float64, curren
 		return &RiskMetrics{}
 	}
 
-	vol := annualizedVolatility(returns)
+	periodsPerYear := inferPeriodsPerYear(smoothed)
+	vol := annualizedVolatilityWithPeriods(returns, periodsPerYear)
 
 	// Derive annualized return from mean daily returns.
 	// Using last/first net worth would include deposits, grossly inflating Sharpe.
 	meanDailyReturn := mean(returns)
-	annualReturn := meanDailyReturn * float64(tradingDaysPerYear)
+	annualReturn := meanDailyReturn * periodsPerYear
 
 	sharpe := 0.0
 	if vol > 0 {
 		sharpe = (annualReturn - riskFreeRate) / vol
 	}
 
-	sortino := sortinoRatio(returns, riskFreeRate, annualReturn)
+	sortino := sortinoRatioWithPeriods(returns, riskFreeRate, annualReturn, periodsPerYear)
 	ddStart, ddEnd, maxDD := maxDrawdown(smoothed)
 
 	ddDays := 0
@@ -101,9 +102,22 @@ func ComputeRiskMetrics(snapshots []DailyValuation, riskFreeRate float64, curren
 			athDate = s.Date
 		}
 	}
+	refCurrent := currentValue
+	if refCurrent <= 0 && len(smoothed) > 0 {
+		refCurrent = smoothed[len(smoothed)-1].Value
+	}
+	if refCurrent > ath {
+		ath = refCurrent
+		if len(smoothed) > 0 {
+			athDate = smoothed[len(smoothed)-1].Date
+		}
+	}
 	curDD := 0.0
 	if ath > 0 {
-		curDD = ((ath - currentValue) / ath) * 100
+		curDD = ((ath - refCurrent) / ath) * 100
+		if curDD < 0 {
+			curDD = 0
+		}
 	}
 
 	drawdownSeries := computeDrawdownSeries(smoothed)
@@ -131,9 +145,11 @@ func formatDate(t time.Time) string {
 	return t.Format("2006-01-02")
 }
 
-// smoothOutliers replaces data quality outliers with the previous day's value.
-// A point is an outlier if its value deviates more than ±50% from the previous
-// non-outlier value (backfill artifacts like missing prices).
+// smoothOutliers replaces transient data-quality outliers (1–3 day backfill spikes
+// or missing-price drops that revert back near `prev`) with `prev`. Legitimate
+// permanent step-changes (e.g. deposits, RSU vests, major withdrawals where the
+// new level persists) are preserved and update `prev` so subsequent history is
+// never flatlined.
 func smoothOutliers(snapshots []DailyValuation) []DailyValuation {
 	if len(snapshots) < 2 {
 		return snapshots
@@ -146,13 +162,110 @@ func smoothOutliers(snapshots []DailyValuation) []DailyValuation {
 		if prev > 0 {
 			change := (snapshots[i].Value - prev) / prev
 			if change > outlierThreshold || change < -outlierThreshold {
-				result[i].Value = prev
-				continue
+				reverts := snapshots[i].Value <= 0
+				for j := i + 1; j < len(snapshots) && j <= i+3; j++ {
+					laterChange := (snapshots[j].Value - prev) / prev
+					if laterChange <= outlierThreshold && laterChange >= -outlierThreshold {
+						reverts = true
+						break
+					}
+				}
+				if reverts {
+					result[i].Value = prev
+					continue
+				}
 			}
 		}
 		prev = snapshots[i].Value
 	}
 	return result
+}
+
+// BuildCashflowAdjustedSeries converts a raw net-worth valuation series plus
+// external cashflows (+deposit, -withdrawal) into a cashflow-neutral TWR index
+// series scaled to end at the latest portfolio value, preventing deposits and
+// withdrawals from distorting volatility, Sharpe, Sortino, and MaxDrawdown.
+func BuildCashflowAdjustedSeries(snapshots []DailyValuation, cashflows []CashFlow) []DailyValuation {
+	if len(snapshots) < 2 || len(cashflows) == 0 {
+		return snapshots
+	}
+	normDate := func(t time.Time) time.Time {
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	}
+	// Find first positive valuation
+	firstPos := -1
+	for i, s := range snapshots {
+		if s.Value > 0 {
+			firstPos = i
+			break
+		}
+	}
+	if firstPos < 0 || firstPos >= len(snapshots)-1 {
+		return snapshots
+	}
+
+	idx := make([]float64, len(snapshots))
+	idx[firstPos] = 1.0
+	prevDate := normDate(snapshots[firstPos].Date)
+	prevVal := snapshots[firstPos].Value
+
+	for i := firstPos + 1; i < len(snapshots); i++ {
+		curDate := normDate(snapshots[i].Date)
+		curVal := snapshots[i].Value
+		spanDays := curDate.Sub(prevDate).Hours() / 24.0
+		var netFlow, weightedFlow, posFlow float64
+		for _, cf := range cashflows {
+			cfDate := normDate(cf.Date)
+			if cfDate.After(prevDate) && !cfDate.After(curDate) {
+				netFlow += cf.Amount
+				if cf.Amount > 0 {
+					posFlow += cf.Amount
+				}
+				w := 0.0
+				if spanDays <= 4 {
+					if cf.Amount > 0 {
+						w = 1.0
+					}
+				} else if spanDays > 0 {
+					w = curDate.Sub(cfDate).Hours() / (spanDays * 24.0)
+				}
+				weightedFlow += cf.Amount * w
+			}
+		}
+		factor := 1.0
+		if prevVal > 0 && curVal > 0 {
+			gain := curVal - prevVal - netFlow
+			denom := prevVal + weightedFlow
+			if denom > 0 && denom+gain > 0 {
+				factor = 1.0 + gain/denom
+			} else if prevVal+posFlow > 0 {
+				factor = 1.0 + gain/(prevVal+posFlow)
+			}
+			if factor <= 0 || math.IsNaN(factor) || math.IsInf(factor, 0) {
+				factor = 1.0
+			}
+		}
+		idx[i] = idx[i-1] * factor
+		prevDate = curDate
+		if curVal > 0 {
+			prevVal = curVal
+		}
+	}
+
+	endIdx := idx[len(snapshots)-1]
+	endVal := snapshots[len(snapshots)-1].Value
+	if endIdx <= 0 || endVal <= 0 {
+		return snapshots
+	}
+	scale := endVal / endIdx
+	out := make([]DailyValuation, 0, len(snapshots)-firstPos)
+	for i := firstPos; i < len(snapshots); i++ {
+		out = append(out, DailyValuation{
+			Date:  snapshots[i].Date,
+			Value: idx[i] * scale,
+		})
+	}
+	return out
 }
 
 // dailyReturns computes simple daily returns from a sorted slice of valuations.
@@ -190,14 +303,35 @@ func stddev(values []float64, avg float64) float64 {
 	return math.Sqrt(sumSq / float64(len(values)-1))
 }
 
+func inferPeriodsPerYear(snapshots []DailyValuation) float64 {
+	if len(snapshots) >= 10 {
+		spanDays := snapshots[len(snapshots)-1].Date.Sub(snapshots[0].Date).Hours() / 24.0
+		if spanDays >= 14 {
+			obsPerYear := float64(len(snapshots)-1) / (spanDays / 365.25)
+			if obsPerYear > 300 {
+				return 365.25
+			}
+		}
+	}
+	return float64(tradingDaysPerYear)
+}
+
 func annualizedVolatility(returns []float64) float64 {
+	return annualizedVolatilityWithPeriods(returns, float64(tradingDaysPerYear))
+}
+
+func annualizedVolatilityWithPeriods(returns []float64, periodsPerYear float64) float64 {
 	avg := mean(returns)
 	daily := stddev(returns, avg)
-	return daily * math.Sqrt(tradingDaysPerYear)
+	return daily * math.Sqrt(periodsPerYear)
 }
 
 func sortinoRatio(returns []float64, riskFreeRate, annualReturn float64) float64 {
-	dailyRfr := riskFreeRate / float64(tradingDaysPerYear)
+	return sortinoRatioWithPeriods(returns, riskFreeRate, annualReturn, float64(tradingDaysPerYear))
+}
+
+func sortinoRatioWithPeriods(returns []float64, riskFreeRate, annualReturn, periodsPerYear float64) float64 {
+	dailyRfr := riskFreeRate / periodsPerYear
 	var downsideSq float64
 	n := 0
 	for _, r := range returns {
@@ -210,7 +344,7 @@ func sortinoRatio(returns []float64, riskFreeRate, annualReturn float64) float64
 	if n == 0 {
 		return 0
 	}
-	downsideDev := math.Sqrt(downsideSq/float64(len(returns))) * math.Sqrt(tradingDaysPerYear)
+	downsideDev := math.Sqrt(downsideSq/float64(len(returns))) * math.Sqrt(periodsPerYear)
 	if downsideDev <= 0 {
 		return 0
 	}
@@ -314,8 +448,13 @@ func ComputeRollingMetrics(snapshots []DailyValuation, riskFreeRate float64) map
 		return nil
 	}
 
+	periodsPerYear := inferPeriodsPerYear(smoothed)
+	yearWindow := int(math.Round(periodsPerYear))
+	if yearWindow < 252 {
+		yearWindow = 252
+	}
 	result := make(map[string][]RollingMetric)
-	windows := map[string]int{"30d": 30, "90d": 90, "365d": 252}
+	windows := map[string]int{"30d": 30, "90d": 90, "365d": yearWindow}
 
 	for label, window := range windows {
 		if len(returns) < window {
@@ -327,19 +466,17 @@ func ComputeRollingMetrics(snapshots []DailyValuation, riskFreeRate float64) map
 			step = 1
 		}
 
-		dailyRfr := riskFreeRate / float64(tradingDaysPerYear)
 		for i := window; i <= len(returns); i += step {
 			slice := returns[i-window : i]
 			avg := mean(slice)
 			std := stddev(slice, avg)
-			vol := std * math.Sqrt(float64(tradingDaysPerYear)) * 100 // annualized %
+			vol := std * math.Sqrt(periodsPerYear) * 100 // annualized %
 
-			annReturn := avg * float64(tradingDaysPerYear)
+			annReturn := avg * periodsPerYear
 			sharpe := 0.0
 			if std > 0 {
-				sharpe = (annReturn - riskFreeRate) / (std * math.Sqrt(float64(tradingDaysPerYear)))
+				sharpe = (annReturn - riskFreeRate) / (std * math.Sqrt(periodsPerYear))
 			}
-			_ = dailyRfr
 
 			// Map return index back to date
 			dateIdx := i // returns[i] corresponds to snapshots[i+1]

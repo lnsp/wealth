@@ -49,7 +49,12 @@ type HistoricalFXRate struct {
 // ECB convention: rate is units-per-EUR (e.g. USD rate of 1.0834 means
 // 1 EUR = 1.0834 USD; amountEUR = amountUSD / rate).
 func LookupRateForDate(rates []HistoricalFXRate, currency string, target time.Time) float64 {
-	target = target.UTC()
+	target = time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, time.UTC)
+	scale := 1.0
+	if currency == "GBp" || currency == "GBX" {
+		currency = "GBP"
+		scale = 100.0
+	}
 	var bestDate time.Time
 	var bestRate float64
 	found := false
@@ -57,11 +62,12 @@ func LookupRateForDate(rates []HistoricalFXRate, currency string, target time.Ti
 		if r.Currency != currency {
 			continue
 		}
-		if r.Date.After(target) {
+		rDate := time.Date(r.Date.Year(), r.Date.Month(), r.Date.Day(), 0, 0, 0, 0, time.UTC)
+		if rDate.After(target) {
 			continue
 		}
-		if !found || r.Date.After(bestDate) {
-			bestDate = r.Date
+		if !found || rDate.After(bestDate) {
+			bestDate = rDate
 			bestRate = r.Rate
 			found = true
 		}
@@ -69,7 +75,7 @@ func LookupRateForDate(rates []HistoricalFXRate, currency string, target time.Ti
 	if !found {
 		return 0
 	}
-	return bestRate
+	return bestRate * scale
 }
 
 // FetchHistoricalRates fetches full FX rate history from ECB (since 1999).

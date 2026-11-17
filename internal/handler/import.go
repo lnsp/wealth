@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -32,7 +33,8 @@ func NewImportHandler(q *db.Queries, snapshot SnapshotTrigger, tickerMap map[str
 }
 
 func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB max
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB max multipart request body
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
 		return
 	}
@@ -68,14 +70,19 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	// Validate file size (max 5MB for CSV)
-	if fileHeader != nil && fileHeader.Size > 5<<20 {
+	const maxCSVBytes = 5 << 20
+	if fileHeader != nil && fileHeader.Size > maxCSVBytes {
 		writeError(w, http.StatusBadRequest, "file too large (max 5MB)")
 		return
 	}
 
-	data, err := io.ReadAll(file)
+	data, err := io.ReadAll(io.LimitReader(file, maxCSVBytes+1))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "read file: "+err.Error())
+		return
+	}
+	if len(data) > maxCSVBytes {
+		writeError(w, http.StatusBadRequest, "file too large (max 5MB)")
 		return
 	}
 
@@ -85,8 +92,10 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate CSV account type matches target account
-	if result.AccountType != "" && result.AccountType != account.Type {
+	// Validate CSV account type matches target account (securities-based CSVs
+	// with AccountType == "brokerage", e.g. Delta/PP/TR/IBKR, may also target
+	// crypto, pension, or precious_metals accounts).
+	if result.AccountType != "" && !compatibleImportAccountType(result.AccountType, account.Type) {
 		writeError(w, http.StatusBadRequest,
 			fmt.Sprintf("CSV contains %s transactions but target account %q is type %q. Select the correct account.",
 				result.AccountType, account.Name, account.Type))
@@ -128,39 +137,48 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	imported, skipped, adopted, newSecurities, err := h.insertTransactions(r.Context(), txns)
-	if err != nil {
+	var imported, skipped, adopted, vestCount int
+	var newSecurities []string
+
+	if err := withTx(r.Context(), h.queries, func(qtx *db.Queries) error {
+		var txErr error
+		imported, skipped, adopted, newSecurities, txErr = h.insertTransactions(r.Context(), qtx, txns)
+		if txErr != nil {
+			return txErr
+		}
+		if len(vests) > 0 {
+			vestCount, txErr = h.insertRSUVests(r.Context(), qtx, vests, account.ImportSecurityISIN)
+			if txErr != nil {
+				return txErr
+			}
+		}
+		secNames := newSecurities
+		if secNames == nil {
+			secNames = []string{}
+		}
+		if logErr := qtx.InsertImportHistory(r.Context(), db.InsertImportHistoryParams{
+			AccountID: accountID, Institution: result.Institution, Filename: filename,
+			TotalRows: int32(len(txns)), Imported: int32(imported), Skipped: int32(skipped),
+			NewSecurities: secNames,
+		}); logErr != nil {
+			return fmt.Errorf("insert import history: %w", logErr)
+		}
+		return nil
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "insert transactions: "+err.Error())
 		return
 	}
+
 	result.Imported = imported
 	result.Skipped = skipped
 	result.NewSecurities = newSecurities
+	result.RSUVests = vestCount
 	if adopted > 0 {
 		result.Warnings = append(result.Warnings,
 			fmt.Sprintf("%d transactions matched existing rows imported by an older version (same date, type, quantity and amount) and were deduplicated instead of inserted.", adopted))
 	}
 
-	// Insert RSU vests (if any)
-	if len(vests) > 0 {
-		vestCount := h.insertRSUVests(r.Context(), vests, account.ImportSecurityISIN)
-		result.RSUVests = vestCount
-	}
-
-	// Log import history
-	secNames := newSecurities
-	if secNames == nil {
-		secNames = []string{}
-	}
-	if logErr := h.queries.InsertImportHistory(r.Context(), db.InsertImportHistoryParams{
-		AccountID: accountID, Institution: result.Institution, Filename: filename,
-		TotalRows: int32(len(txns)), Imported: int32(imported), Skipped: int32(skipped),
-		NewSecurities: secNames,
-	}); logErr != nil {
-		log.Printf("WARNING: insert import history: %v", logErr)
-	}
-
-	// Refresh materialized view
+	// Refresh materialized view (CONCURRENTLY must run outside transaction)
 	if err := h.queries.RefreshCurrentHoldings(r.Context()); err != nil {
 		log.Printf("WARNING: refresh materialized view: %v", err)
 	}
@@ -172,16 +190,18 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 		log.Printf("import: matched %d loan payments", n)
 	}
 
-	// Backfill historical net worth snapshots and create today's snapshot
+	// Backfill historical net worth snapshots and create today's snapshot sequentially
 	if h.snapshot != nil {
-		go h.snapshot.BackfillNetWorthSnapshots()
-		h.snapshot.RunNetWorthSnapshot()
+		go func() {
+			h.snapshot.BackfillNetWorthSnapshots()
+			h.snapshot.RunNetWorthSnapshot()
+		}()
 	}
 
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Transaction) (imported, skipped, adopted int, newSecurities []string, err error) {
+func (h *ImportHandler) insertTransactions(ctx context.Context, q *db.Queries, txns []parser.Transaction) (imported, skipped, adopted int, newSecurities []string, err error) {
 	seenSecurities := make(map[string]bool)
 
 	// Hashes of the whole batch: an existing row whose hash appears here is
@@ -197,14 +217,14 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Tr
 		// Auto-create securities for new ISINs
 		if txn.SecurityISIN != "" && !seenSecurities[txn.SecurityISIN] {
 			seenSecurities[txn.SecurityISIN] = true
-			_, secErr := h.queries.GetSecurity(ctx, txn.SecurityISIN)
+			_, secErr := q.GetSecurity(ctx, txn.SecurityISIN)
 			if secErr != nil {
 				// Security doesn't exist, create it
 				name := txn.Counterparty
 				if name == "" {
 					name = txn.SecurityISIN
 				}
-				if err := h.queries.UpsertSecurity(ctx, db.UpsertSecurityParams{
+				if err := q.UpsertSecurity(ctx, db.UpsertSecurityParams{
 					ISIN: txn.SecurityISIN, WKN: pgtype.Text{}, Symbol: pgtype.Text{},
 					Name: name, AssetClass: parser.ClassifyAsset(txn.SecurityISIN, name), Currency: txn.Currency,
 				}); err != nil {
@@ -215,7 +235,9 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Tr
 				// Apply ticker mapping from seed file if available
 				if symbol, ok := h.tickerMap[txn.SecurityISIN]; ok {
 					sym := pgtype.Text{String: symbol, Valid: true}
-					h.queries.UpdateSecuritySymbol(ctx, db.UpdateSecuritySymbolParams{ISIN: txn.SecurityISIN, Symbol: sym})
+					if err := q.UpdateSecuritySymbol(ctx, db.UpdateSecuritySymbolParams{ISIN: txn.SecurityISIN, Symbol: sym}); err != nil {
+						return imported, skipped, adopted, newSecurities, fmt.Errorf("update symbol %s: %w", txn.SecurityISIN, err)
+					}
 				}
 			}
 		}
@@ -255,9 +277,9 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Tr
 
 		// Exact hash already present: re-run the upsert so type reclassification
 		// still applies, but count the row as skipped.
-		if _, hashErr := h.queries.GetTransactionIDByHash(ctx, txn.ImportHash); hashErr == nil {
-			if err := h.queries.InsertTransaction(ctx, insertParams); err != nil {
-				log.Printf("upsert transaction: %v", err)
+		if _, hashErr := q.GetTransactionIDByHash(ctx, txn.ImportHash); hashErr == nil {
+			if err := q.InsertTransaction(ctx, insertParams); err != nil {
+				return imported, skipped, adopted, newSecurities, fmt.Errorf("upsert transaction: %w", err)
 			}
 			skipped++
 			continue
@@ -267,31 +289,28 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Tr
 		// an older importer version. Adopt the first economically identical row
 		// not accounted for by this batch, upgrading its hash to the current
 		// scheme so future imports dedup directly.
-		similar, simErr := h.queries.ListSimilarTransactions(ctx, db.ListSimilarTransactionsParams{
+		similar, simErr := q.ListSimilarTransactions(ctx, db.ListSimilarTransactionsParams{
 			AccountID: txn.AccountID, Date: txn.Date, Type: txn.Type,
 			SecurityISIN: secISIN, Quantity: quantity, Amount: amount,
 			Fee: fee, Tax: tax, Currency: txn.Currency,
 		})
 		if simErr != nil {
-			log.Printf("WARNING: list similar transactions: %v", simErr)
+			return imported, skipped, adopted, newSecurities, fmt.Errorf("list similar transactions: %w", simErr)
 		}
 		if id, ok := pickAdoptable(similar, batchHashes, claimed); ok {
-			if updErr := h.queries.UpdateTransactionImportHash(ctx, db.UpdateTransactionImportHashParams{
+			if updErr := q.UpdateTransactionImportHash(ctx, db.UpdateTransactionImportHashParams{
 				ID: id, ImportHash: txn.ImportHash,
 			}); updErr != nil {
-				log.Printf("WARNING: adopt legacy transaction %s: %v", id, updErr)
-			} else {
-				claimed[id] = true
-				adopted++
-				skipped++
-				continue
+				return imported, skipped, adopted, newSecurities, fmt.Errorf("adopt legacy transaction %s: %w", id, updErr)
 			}
-		}
-
-		if err := h.queries.InsertTransaction(ctx, insertParams); err != nil {
-			log.Printf("insert transaction: %v", err)
+			claimed[id] = true
+			adopted++
 			skipped++
 			continue
+		}
+
+		if err := q.InsertTransaction(ctx, insertParams); err != nil {
+			return imported, skipped, adopted, newSecurities, fmt.Errorf("insert transaction: %w", err)
 		}
 		imported++
 	}
@@ -300,12 +319,7 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, txns []parser.Tr
 }
 
 // pickAdoptable returns the first similar existing row that this batch does
-// not otherwise account for: rows whose import_hash matches any incoming row
-// belong to that row (they will dedup by hash), and rows already claimed by an
-// earlier incoming transaction of identical content stay claimed. This keeps
-// the multiset semantics right when a file legitimately contains several
-// identical transactions (e.g. two grants vesting the same quantity on the
-// same day).
+// not otherwise account for.
 func pickAdoptable(candidates []db.ListSimilarTransactionsRow, batchHashes map[string]bool, claimed map[uuid.UUID]bool) (uuid.UUID, bool) {
 	for _, c := range candidates {
 		if batchHashes[c.ImportHash] || claimed[c.ID] {
@@ -317,9 +331,10 @@ func pickAdoptable(candidates []db.ListSimilarTransactionsRow, batchHashes map[s
 }
 
 func numericFromFloat(f float64) pgtype.Numeric {
-	// Format with 8 fractional digits to match the DB columns' NUMERIC(18,8)
-	// scale. The previous "%f" default rounded to 6 places, which silently
-	// dropped precision on crypto quantities (e.g. 0.67420698 → 0.674207).
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		f = 0
+	}
+	// Format with 8 fractional digits to match the DB columns' NUMERIC(18,8) scale.
 	var n pgtype.Numeric
 	n.Scan(fmt.Sprintf("%.8f", f))
 	return n
@@ -328,8 +343,7 @@ func numericFromFloat(f float64) pgtype.Numeric {
 // insertRSUVests persists RSU vest rows, linking vested rows to their sibling
 // transaction via import_hash lookup. For unvested imports it first deletes
 // stale unvested rows for the account so the schedule is always fresh.
-func (h *ImportHandler) insertRSUVests(ctx context.Context, vests []parser.RSUVest, isin pgtype.Text) int {
-	// If any unvested rows, clear stale ones first
+func (h *ImportHandler) insertRSUVests(ctx context.Context, q *db.Queries, vests []parser.RSUVest, isin pgtype.Text) (int, error) {
 	hasUnvested := false
 	for _, v := range vests {
 		if !v.Vested {
@@ -338,8 +352,8 @@ func (h *ImportHandler) insertRSUVests(ctx context.Context, vests []parser.RSUVe
 		}
 	}
 	if hasUnvested && len(vests) > 0 {
-		if err := h.queries.DeleteUnvestedRSUVestsForAccount(ctx, vests[0].AccountID); err != nil {
-			log.Printf("WARNING: delete stale unvested vests: %v", err)
+		if err := q.DeleteUnvestedRSUVestsForAccount(ctx, vests[0].AccountID); err != nil {
+			return 0, fmt.Errorf("delete stale unvested vests: %w", err)
 		}
 	}
 
@@ -360,12 +374,12 @@ func (h *ImportHandler) insertRSUVests(ctx context.Context, vests []parser.RSUVe
 		// Resolve transaction_id from the linked import_hash
 		var txnID *uuid.UUID
 		if v.LinkTransactionHash != "" {
-			if id, err := h.queries.GetTransactionIDByHash(ctx, v.LinkTransactionHash); err == nil {
+			if id, err := q.GetTransactionIDByHash(ctx, v.LinkTransactionHash); err == nil {
 				txnID = &id
 			}
 		}
 
-		err := h.queries.InsertRSUVest(ctx, db.InsertRSUVestParams{
+		if err := q.InsertRSUVest(ctx, db.InsertRSUVestParams{
 			AccountID:     v.AccountID,
 			SecurityISIN:  secISIN,
 			VestDate:      v.VestDate,
@@ -377,12 +391,24 @@ func (h *ImportHandler) insertRSUVests(ctx context.Context, vests []parser.RSUVe
 			Vested:        v.Vested,
 			TransactionID: txnID,
 			ImportHash:    v.ImportHash,
-		})
-		if err != nil {
-			log.Printf("WARNING: insert rsu vest: %v", err)
-			continue
+		}); err != nil {
+			return inserted, fmt.Errorf("insert rsu vest: %w", err)
 		}
 		inserted++
 	}
-	return inserted
+	return inserted, nil
+}
+
+// compatibleImportAccountType returns true when a parsed CSV's declared account
+// type may be imported into targetType. Securities parsers (Delta, Portfolio
+// Performance, Trade Republic, IBKR, etc.) tag exports as "brokerage", which
+// are also valid on crypto, pension, and precious_metals accounts.
+func compatibleImportAccountType(csvType, targetType string) bool {
+	if csvType == "" || csvType == targetType {
+		return true
+	}
+	if csvType == "brokerage" && isSecuritiesOnlyAccountType(targetType) {
+		return true
+	}
+	return false
 }

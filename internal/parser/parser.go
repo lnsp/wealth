@@ -86,17 +86,20 @@ type AccountTypeDetector interface {
 	DetectedAccountType() string
 }
 
-// registeredParsers are tried in order during auto-detection.
-var registeredParsers = []Parser{
-	&MorganStanleyParser{},
-	&SparkasseParser{},
-	&N26Parser{},
-	&ScalableCapitalParser{},
-	&RevolutParser{},
-	&INGParser{},
-	&DeltaParser{},
-	&WealthExportParser{},
-	&HoldingsTemplateParser{},
+// newRegisteredParsers returns fresh parser instances tried in order during auto-detection.
+// Creating fresh instances per ParseCSV call avoids data races on stateful parsers (e.g. warnings, detectedAccountType).
+func newRegisteredParsers() []Parser {
+	return []Parser{
+		&MorganStanleyParser{},
+		&SparkasseParser{},
+		&N26Parser{},
+		&ScalableCapitalParser{},
+		&RevolutParser{},
+		&INGParser{},
+		&DeltaParser{},
+		&WealthExportParser{},
+		&HoldingsTemplateParser{},
+	}
 }
 
 // ParseCSV reads raw bytes, detects the institution, and returns normalized transactions and optional RSU vests.
@@ -125,10 +128,11 @@ func ParseCSV(data []byte, accountID uuid.UUID) ([]Transaction, []RSUVest, *Impo
 	// Auto-detect institution. Try the first row as header; if no match,
 	// try subsequent rows (some formats — e.g. ING Ordermanager and
 	// Depotübersicht — prefix the real header with several title/blank rows).
+	parsers := newRegisteredParsers()
 	headerIdx := 0
 	var matchedParser Parser
 	for hi := 0; hi < len(records) && hi < 10; hi++ {
-		for _, p := range registeredParsers {
+		for _, p := range parsers {
 			if p.Detect(records[hi]) {
 				headerIdx = hi
 				matchedParser = p
@@ -148,10 +152,20 @@ func ParseCSV(data []byte, accountID uuid.UUID) ([]Transaction, []RSUVest, *Impo
 			return nil, nil, nil, fmt.Errorf("parse %s CSV: %w", p.Institution(), err)
 		}
 
-		// Compute import hashes for transactions that don't already have one
+		// Compute import hashes for transactions that don't already have one,
+		// and disambiguate genuinely repeated identical rows within the same file
+		// deterministically (#2, #3, ...) so re-imports stay idempotent while
+		// same-day duplicate purchases are not silently dropped.
+		seenHashes := make(map[string]int, len(txns))
 		for i := range txns {
 			if txns[i].ImportHash == "" {
 				txns[i].ImportHash = computeHash(txns[i])
+			}
+			baseHash := txns[i].ImportHash
+			seenHashes[baseHash]++
+			if seenHashes[baseHash] > 1 {
+				sum := sha256.Sum256([]byte(fmt.Sprintf("%s#%d", baseHash, seenHashes[baseHash])))
+				txns[i].ImportHash = fmt.Sprintf("%x", sum)
 			}
 		}
 
@@ -241,7 +255,8 @@ func detectDelimiter(text string) rune {
 }
 
 // computeHash generates a SHA-256 deduplication hash from key transaction fields.
-// Includes AccountID so the same deposit to two different accounts is allowed.
+// Includes AccountID, and when present Type, SecurityISIN, Quantity, and Currency
+// so same-day charges + refunds or different security trades never collide.
 func computeHash(t Transaction) string {
 	data := fmt.Sprintf("%s|%s|%.4f|%s|%s",
 		t.AccountID.String(),
@@ -250,6 +265,9 @@ func computeHash(t Transaction) string {
 		t.Reference,
 		t.Counterparty,
 	)
+	if t.Type != "" || t.SecurityISIN != "" || t.Quantity != 0 || (t.Currency != "" && t.Currency != "EUR") {
+		data = fmt.Sprintf("%s|%s|%s|%.8f|%s", data, t.Type, t.SecurityISIN, t.Quantity, t.Currency)
+	}
 	hash := sha256.Sum256([]byte(data))
 	return fmt.Sprintf("%x", hash)
 }

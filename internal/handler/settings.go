@@ -2,8 +2,13 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -21,6 +26,18 @@ type SettingsHandler struct {
 
 func NewSettingsHandler(q *db.Queries) *SettingsHandler {
 	return &SettingsHandler{queries: q}
+}
+
+func isValidCurrencyCode(c string) bool {
+	if len(c) != 3 {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if c[i] < 'A' || c[i] > 'Z' {
+			return false
+		}
+	}
+	return true
 }
 
 type CreateAccountRequest struct {
@@ -41,6 +58,8 @@ func (h *SettingsHandler) HandleCreateAccount(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	req.Name = strings.TrimSpace(req.Name)
+	req.Institution = strings.TrimSpace(req.Institution)
 	if req.Name == "" || req.Institution == "" || req.Type == "" {
 		writeError(w, http.StatusBadRequest, "name, institution, and type are required")
 		return
@@ -48,7 +67,7 @@ func (h *SettingsHandler) HandleCreateAccount(w http.ResponseWriter, r *http.Req
 
 	// Validate account type enum
 	validTypes := map[string]bool{
-		"checking": true, "savings": true, "brokerage": true, "credit": true,
+		"checking": true, "savings": true, "brokerage": true, "crypto": true, "credit": true,
 		"real_estate": true, "pension": true, "precious_metals": true, "liability": true,
 	}
 	if !validTypes[req.Type] {
@@ -59,9 +78,8 @@ func (h *SettingsHandler) HandleCreateAccount(w http.ResponseWriter, r *http.Req
 	if req.Currency == "" {
 		req.Currency = "EUR"
 	}
-
-	// Validate currency code (3 uppercase letters)
-	if len(req.Currency) != 3 {
+	req.Currency = strings.ToUpper(strings.TrimSpace(req.Currency))
+	if !isValidCurrencyCode(req.Currency) {
 		writeError(w, http.StatusBadRequest, "invalid currency code: must be 3 letters (e.g., EUR, USD)")
 		return
 	}
@@ -83,6 +101,10 @@ func (h *SettingsHandler) HandleCreateAccount(w http.ResponseWriter, r *http.Req
 
 	var employerMatch pgtype.Numeric
 	if req.EmployerMatchPct != nil {
+		if math.IsNaN(*req.EmployerMatchPct) || math.IsInf(*req.EmployerMatchPct, 0) || *req.EmployerMatchPct < 0 {
+			writeError(w, http.StatusBadRequest, "invalid employer_match_pct")
+			return
+		}
 		employerMatch.Scan(fmt.Sprintf("%f", *req.EmployerMatchPct))
 	}
 
@@ -109,13 +131,16 @@ func (h *SettingsHandler) HandleListAllAccounts(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusInternalServerError, "list accounts: "+err.Error())
 		return
 	}
-	// Filter by user's accounts if auth is enabled
 	if allowedIDs := userAccountIDs(r.Context(), h.queries.DB()); allowedIDs != nil {
 		allowed := make(map[uuid.UUID]bool, len(allowedIDs))
-		for _, id := range allowedIDs { allowed[id] = true }
+		for _, id := range allowedIDs {
+			allowed[id] = true
+		}
 		filtered := accounts[:0]
 		for _, a := range accounts {
-			if allowed[a.ID] { filtered = append(filtered, a) }
+			if allowed[a.ID] {
+				filtered = append(filtered, a)
+			}
 		}
 		accounts = filtered
 	}
@@ -149,7 +174,6 @@ func (h *SettingsHandler) HandleUpdateAccount(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Get existing account
 	acc, err := h.queries.GetAccount(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "account not found")
@@ -157,8 +181,8 @@ func (h *SettingsHandler) HandleUpdateAccount(w http.ResponseWriter, r *http.Req
 	}
 
 	name := acc.Name
-	if req.Name != "" {
-		name = req.Name
+	if strings.TrimSpace(req.Name) != "" {
+		name = strings.TrimSpace(req.Name)
 	}
 	iban := acc.IBAN
 	if req.IBAN != "" {
@@ -179,6 +203,10 @@ func (h *SettingsHandler) HandleUpdateAccount(w http.ResponseWriter, r *http.Req
 	}
 	employerMatch := acc.EmployerMatchPct
 	if req.EmployerMatchPct != nil {
+		if math.IsNaN(*req.EmployerMatchPct) || math.IsInf(*req.EmployerMatchPct, 0) || *req.EmployerMatchPct < 0 {
+			writeError(w, http.StatusBadRequest, "invalid employer_match_pct")
+			return
+		}
 		employerMatch = pgtype.Numeric{}
 		employerMatch.Scan(fmt.Sprintf("%f", *req.EmployerMatchPct))
 	}
@@ -192,11 +220,12 @@ func (h *SettingsHandler) HandleUpdateAccount(w http.ResponseWriter, r *http.Req
 	}
 	currency := acc.Currency
 	if req.Currency != "" {
-		if len(req.Currency) != 3 {
+		upper := strings.ToUpper(strings.TrimSpace(req.Currency))
+		if !isValidCurrencyCode(upper) {
 			writeError(w, http.StatusBadRequest, "invalid currency code: must be 3 letters (e.g., EUR, USD)")
 			return
 		}
-		currency = strings.ToUpper(req.Currency)
+		currency = upper
 	}
 
 	if err := h.queries.UpdateAccount(r.Context(), db.UpdateAccountParams{
@@ -204,6 +233,12 @@ func (h *SettingsHandler) HandleUpdateAccount(w http.ResponseWriter, r *http.Req
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "update account: "+err.Error())
 		return
+	}
+
+	if isActive != acc.IsActive {
+		if err := h.queries.RefreshCurrentHoldings(r.Context()); err != nil {
+			log.Printf("WARNING: refresh holdings on account toggle: %v", err)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
@@ -217,31 +252,30 @@ func (h *SettingsHandler) HandleDeleteAccount(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Delete all related data for this account. rsu_vests must go first:
-	// it has FK references to both accounts and transactions, and the
-	// transaction FK has no ON DELETE CASCADE — so deleting transactions
-	// first would fail with a constraint violation.
-	if err := h.queries.DeleteAccountRSUVests(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, "delete rsu vests: "+err.Error())
-		return
-	}
-	if err := h.queries.DeleteAccountTransactions(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, "delete transactions: "+err.Error())
-		return
-	}
-	if err := h.queries.DeleteAccountImportHistory(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, "delete import history: "+err.Error())
-		return
-	}
-
-	// Delete the account itself
-	if err := h.queries.DeleteAccount(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, "delete account: "+err.Error())
+	// Delete all related data for this account inside a single transaction.
+	if err := withTx(r.Context(), h.queries, func(qtx *db.Queries) error {
+		if err := qtx.DeleteAccountRSUVests(r.Context(), id); err != nil {
+			return fmt.Errorf("delete rsu vests: %w", err)
+		}
+		if err := qtx.DeleteAccountTransactions(r.Context(), id); err != nil {
+			return fmt.Errorf("delete transactions: %w", err)
+		}
+		if err := qtx.DeleteAccountImportHistory(r.Context(), id); err != nil {
+			return fmt.Errorf("delete import history: %w", err)
+		}
+		if err := qtx.DeleteAccount(r.Context(), id); err != nil {
+			return fmt.Errorf("delete account: %w", err)
+		}
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Refresh materialized view
-	h.queries.RefreshCurrentHoldings(r.Context())
+	// Refresh materialized view outside transaction
+	if err := h.queries.RefreshCurrentHoldings(r.Context()); err != nil {
+		log.Printf("WARNING: refresh holdings after account delete: %v", err)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -292,13 +326,13 @@ func (h *SettingsHandler) HandleHoldingsTemplate(w http.ResponseWriter, r *http.
 }
 
 func (h *SettingsHandler) HandleExportTransactions(w http.ResponseWriter, r *http.Request) {
-	txns, err := h.queries.ListTransactions(r.Context(), db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	txns, err := h.queries.ListAllTransactionsForExport(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 
-	filename := fmt.Sprintf("transactions-%s.csv", time.Now().Format("2006-01-02"))
+	filename := fmt.Sprintf("transactions-%s.csv", time.Now().UTC().Format("2006-01-02"))
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 
@@ -340,6 +374,9 @@ func numericToFloat(n pgtype.Numeric) float64 {
 		return 0
 	}
 	f, _ := n.Float64Value()
+	if math.IsNaN(f.Float64) || math.IsInf(f.Float64, 0) {
+		return 0
+	}
 	return f.Float64
 }
 
@@ -392,8 +429,13 @@ func (h *SettingsHandler) HandleCreateGoal(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if req.Name == "" || req.TargetAmount <= 0 || req.TargetDate == "" {
+	if req.Name == "" || req.TargetAmount <= 0 || math.IsNaN(req.TargetAmount) || math.IsInf(req.TargetAmount, 0) || req.TargetDate == "" {
 		writeError(w, http.StatusBadRequest, "name, target_amount, and target_date are required")
+		return
+	}
+	if math.IsNaN(req.MonthlyContribution) || math.IsInf(req.MonthlyContribution, 0) || req.MonthlyContribution < 0 ||
+		math.IsNaN(req.AssumedReturnPct) || math.IsInf(req.AssumedReturnPct, 0) {
+		writeError(w, http.StatusBadRequest, "invalid contribution or return rate")
 		return
 	}
 	targetDate, err := time.Parse("2006-01-02", req.TargetDate)
@@ -413,9 +455,11 @@ func (h *SettingsHandler) HandleCreateGoal(w http.ResponseWriter, r *http.Reques
 	var fundingID *uuid.UUID
 	if req.FundingAccountID != "" {
 		parsed, err := uuid.Parse(req.FundingAccountID)
-		if err == nil {
-			fundingID = &parsed
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid funding_account_id")
+			return
 		}
+		fundingID = &parsed
 	}
 	priority := int32(req.Priority)
 	if priority == 0 {
@@ -455,13 +499,117 @@ func (h *SettingsHandler) HandleDeleteGoal(w http.ResponseWriter, r *http.Reques
 
 // Notification Channels
 
+var secretChannelKeys = map[string]bool{
+	"password":   true,
+	"api_token":  true,
+	"token":      true,
+	"secret":     true,
+	"auth_token": true,
+}
+
+func maskChannelConfig(raw []byte) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage("{}")
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return json.RawMessage("{}")
+	}
+	for k, v := range cfg {
+		if secretChannelKeys[strings.ToLower(k)] {
+			if s, ok := v.(string); ok && s != "" {
+				cfg[k] = "••••••••"
+			}
+		}
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		return json.RawMessage("{}")
+	}
+	return out
+}
+
+func redactChannel(ch db.NotificationChannel) db.NotificationChannel {
+	ch.Config = maskChannelConfig(ch.Config)
+	return ch
+}
+
+func isDisallowedOutboundIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// Block "this network" 0.0.0.0/8 and RFC 6598 CGNAT 100.64.0.0/10
+		if ip4[0] == 0 || (ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateOutboundEndpointURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("url must be a valid http:// or https:// URL")
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return errors.New("url host must not target localhost or internal addresses")
+	}
+	if ip := net.ParseIP(host); ip != nil && isDisallowedOutboundIP(ip) {
+		return errors.New("url host must not target private or loopback IP addresses")
+	}
+	return nil
+}
+
+func validateChannelConfig(chType string, cfg map[string]string) error {
+	switch chType {
+	case "webhook":
+		if err := validateOutboundEndpointURL(cfg["url"]); err != nil {
+			return err
+		}
+	case "ntfy":
+		if err := validateOutboundEndpointURL(cfg["url"]); err != nil {
+			return err
+		}
+		topic := strings.TrimSpace(cfg["topic"])
+		if topic == "" || strings.ContainsAny(topic, "/\\\r\n") || strings.Contains(topic, "..") {
+			return errors.New("ntfy topic is required and must not contain path separators")
+		}
+	case "email":
+		host := strings.TrimSpace(cfg["smtp_host"])
+		from := strings.TrimSpace(cfg["from"])
+		to := strings.TrimSpace(cfg["to"])
+		if host == "" || from == "" || to == "" {
+			return errors.New("email channel requires smtp_host, from, and to")
+		}
+		for _, field := range []string{host, cfg["smtp_port"], from, to, cfg["username"]} {
+			if strings.ContainsAny(field, "\r\n") {
+				return errors.New("email fields must not contain newline characters")
+			}
+		}
+	case "pushover":
+		if strings.TrimSpace(cfg["user_key"]) == "" || strings.TrimSpace(cfg["api_token"]) == "" {
+			return errors.New("pushover channel requires user_key and api_token")
+		}
+	}
+	return nil
+}
+
 func (h *SettingsHandler) HandleListChannels(w http.ResponseWriter, r *http.Request) {
 	channels, err := h.queries.ListNotificationChannels(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list channels")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"channels": channels})
+	redacted := make([]db.NotificationChannel, len(channels))
+	for i, ch := range channels {
+		redacted[i] = redactChannel(ch)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"channels": redacted})
 }
 
 func (h *SettingsHandler) HandleCreateChannel(w http.ResponseWriter, r *http.Request) {
@@ -482,7 +630,7 @@ func (h *SettingsHandler) HandleCreateChannel(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "invalid channel type")
 		return
 	}
-	if req.Name == "" {
+	if strings.TrimSpace(req.Name) == "" {
 		req.Name = req.Type
 	}
 	if req.ChannelFor == "" {
@@ -500,12 +648,16 @@ func (h *SettingsHandler) HandleCreateChannel(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "config too large (max 4KB)")
 		return
 	}
-	// Ensure config is a JSON object
-	var configCheck map[string]any
-	if json.Unmarshal(req.Config, &configCheck) != nil {
-		writeError(w, http.StatusBadRequest, "config must be a JSON object")
+	var configCheck map[string]string
+	if err := json.Unmarshal(req.Config, &configCheck); err != nil {
+		writeError(w, http.StatusBadRequest, "config must be a JSON object of string values")
 		return
 	}
+	if err := validateChannelConfig(req.Type, configCheck); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	digestFreq := req.DigestFrequency
 	if digestFreq == "" {
 		digestFreq = "monthly"
@@ -523,7 +675,7 @@ func (h *SettingsHandler) HandleCreateChannel(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "create channel")
 		return
 	}
-	writeJSON(w, http.StatusCreated, ch)
+	writeJSON(w, http.StatusCreated, redactChannel(ch))
 }
 
 func (h *SettingsHandler) HandleDeleteChannel(w http.ResponseWriter, r *http.Request) {

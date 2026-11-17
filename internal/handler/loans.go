@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/lnsp/wealth/internal/analytics"
@@ -36,7 +37,7 @@ type loanRequest struct {
 
 func (req loanRequest) validate() (db.CreateLoanParams, error) {
 	var p db.CreateLoanParams
-	if req.Principal <= 0 || req.PayoutDate == "" {
+	if !isFinite(req.Principal) || req.Principal <= 0 || req.PayoutDate == "" {
 		return p, errors.New("principal and payout_date are required")
 	}
 	payout, err := time.Parse("2006-01-02", req.PayoutDate)
@@ -52,31 +53,31 @@ func (req loanRequest) validate() (db.CreateLoanParams, error) {
 	if !first.After(payout) {
 		return p, errors.New("first_payment_date must be after payout_date")
 	}
-	if req.NominalRate < 0 || req.NominalRate >= 1 {
+	if !isFinite(req.NominalRate) || req.NominalRate < 0 || req.NominalRate >= 1 {
 		return p, errors.New("nominal_rate must be a fraction in [0, 1)")
 	}
 	payment := 0.0
 	switch {
-	case req.MonthlyPayment != nil && *req.MonthlyPayment > 0:
+	case req.MonthlyPayment != nil && isFinite(*req.MonthlyPayment) && *req.MonthlyPayment > 0:
 		payment = *req.MonthlyPayment
-	case req.InitialRepayment != nil && *req.InitialRepayment > 0:
+	case req.InitialRepayment != nil && isFinite(*req.InitialRepayment) && *req.InitialRepayment > 0:
 		payment = analytics.MonthlyPaymentFor(req.Principal, req.NominalRate, *req.InitialRepayment)
 	default:
 		return p, errors.New("monthly_payment or initial_repayment is required")
 	}
-	if payment <= req.Principal*req.NominalRate/12 {
+	if !isFinite(payment) || payment <= req.Principal*req.NominalRate/12 {
 		return p, errors.New("the monthly payment doesn't cover the interest")
 	}
 	if p.FixedUntil, err = parseOptionalDate(req.FixedUntil, "fixed_until"); err != nil {
 		return p, err
 	}
 	if req.FollowupRate != nil {
-		if *req.FollowupRate < 0 || *req.FollowupRate >= 1 {
+		if !isFinite(*req.FollowupRate) || *req.FollowupRate < 0 || *req.FollowupRate >= 1 {
 			return p, errors.New("followup_rate must be a fraction in [0, 1)")
 		}
 		p.FollowupRate = numericOf(*req.FollowupRate, "%.6f")
 	}
-	if req.ExtraAllowance < 0 || req.ExtraAllowance > 1 {
+	if !isFinite(req.ExtraAllowance) || req.ExtraAllowance < 0 || req.ExtraAllowance > 1 {
 		return p, errors.New("extra_allowance_pct must be a fraction in [0, 1]")
 	}
 	if req.PaymentAccountID != "" {
@@ -206,14 +207,14 @@ func buildLoanSummary(l assets.Loan, assetName string, now time.Time) loanView {
 	}
 	v.InterestPaid = round2(v.InterestPaid)
 	v.InterestFixedPeriod = round2(v.InterestFixedPeriod)
-	if len(l.Schedule) > 0 {
-		v.PayoffDate = l.Schedule[len(l.Schedule)-1].Due.Format("2006-01-02")
+	if pd := l.Model.PayoffDate(); !pd.IsZero() {
+		v.PayoffDate = pd.Format("2006-01-02")
 	}
 	if !l.Model.FixedUntil.IsZero() {
 		rem := round2(l.Model.BalanceAt(l.Model.FixedUntil))
 		v.RemainingAtFixedEnd = &rem
 		months := 0
-		for d := today; d.Before(l.Model.FixedUntil); d = d.AddDate(0, 1, 0) {
+		for m := 0; addMonthsClamped(today, m).Before(l.Model.FixedUntil); m++ {
 			months++
 		}
 		v.MonthsLeftFixed = &months
@@ -303,17 +304,43 @@ func (h *AssetsHandler) writeLoan(w http.ResponseWriter, ctx context.Context, st
 
 // clearLoanCategories untags a loan's matched payments and extra repayments.
 func (h *AssetsHandler) clearLoanCategories(ctx context.Context, l assets.Loan) error {
+	return clearLoanCategoriesWithQueries(ctx, h.queries, l)
+}
+
+func clearLoanCategoriesWithQueries(ctx context.Context, q *db.Queries, l assets.Loan) error {
 	for _, p := range l.Links {
-		if err := h.clearCategory(ctx, p.TransactionID, assets.CategoryLoanPayment); err != nil {
+		if err := clearCategoryWithQueries(ctx, q, p.TransactionID, assets.CategoryLoanPayment); err != nil {
 			return err
 		}
 	}
 	for _, e := range l.Extras {
 		if e.TransactionID != nil {
-			if err := h.clearCategory(ctx, *e.TransactionID, assets.CategoryLoanPayment); err != nil {
+			if err := clearCategoryWithQueries(ctx, q, *e.TransactionID, assets.CategoryLoanPayment); err != nil {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// rematchLoanPayments clears existing instalment links for loanID and re-runs payment matching.
+func (h *AssetsHandler) rematchLoanPayments(ctx context.Context, loanID uuid.UUID) error {
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		unlinked, err := qtx.DeleteLoanPaymentLinksForLoan(ctx, loanID)
+		if err != nil {
+			return fmt.Errorf("reset payment links: %w", err)
+		}
+		for _, txnID := range unlinked {
+			if err := clearCategoryWithQueries(ctx, qtx, txnID, assets.CategoryLoanPayment); err != nil {
+				return fmt.Errorf("untag payment: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if _, err := assets.MatchAllLoanPayments(ctx, h.queries); err != nil {
+		return fmt.Errorf("match loan payments: %w", err)
 	}
 	return nil
 }
@@ -382,24 +409,27 @@ func (h *AssetsHandler) HandleUpdateLoan(w http.ResponseWriter, r *http.Request)
 	if _, _, ok := h.findLoan(w, ctx, id); !ok {
 		return
 	}
-	unlinked, err := h.queries.DeleteLoanPaymentLinksForLoan(ctx, id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "reset payment links: "+err.Error())
-		return
-	}
-	for _, txnID := range unlinked {
-		if err := h.clearCategory(ctx, txnID, assets.CategoryLoanPayment); err != nil {
-			writeError(w, http.StatusInternalServerError, "untag payment: "+err.Error())
-			return
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		unlinked, err := qtx.DeleteLoanPaymentLinksForLoan(ctx, id)
+		if err != nil {
+			return fmt.Errorf("reset payment links: %w", err)
 		}
-	}
-	if _, err := h.queries.UpdateLoan(ctx, db.UpdateLoanParams{
-		ID: id, Name: p.Name, Lender: p.Lender, Principal: p.Principal, PayoutDate: p.PayoutDate,
-		FirstPaymentDate: p.FirstPaymentDate, NominalRate: p.NominalRate, MonthlyPayment: p.MonthlyPayment,
-		FixedUntil: p.FixedUntil, FollowupRate: p.FollowupRate, ExtraAllowancePct: p.ExtraAllowancePct,
-		PaymentAccountID: p.PaymentAccountID,
+		for _, txnID := range unlinked {
+			if err := clearCategoryWithQueries(ctx, qtx, txnID, assets.CategoryLoanPayment); err != nil {
+				return fmt.Errorf("untag payment: %w", err)
+			}
+		}
+		if _, err := qtx.UpdateLoan(ctx, db.UpdateLoanParams{
+			ID: id, Name: p.Name, Lender: p.Lender, Principal: p.Principal, PayoutDate: p.PayoutDate,
+			FirstPaymentDate: p.FirstPaymentDate, NominalRate: p.NominalRate, MonthlyPayment: p.MonthlyPayment,
+			FixedUntil: p.FixedUntil, FollowupRate: p.FollowupRate, ExtraAllowancePct: p.ExtraAllowancePct,
+			PaymentAccountID: p.PaymentAccountID,
+		}); err != nil {
+			return fmt.Errorf("update loan: %w", err)
+		}
+		return nil
 	}); err != nil {
-		writeError(w, http.StatusInternalServerError, "update loan: "+err.Error())
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if _, err := assets.MatchAllLoanPayments(ctx, h.queries); err != nil {
@@ -421,12 +451,16 @@ func (h *AssetsHandler) HandleDeleteLoan(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	if err := h.clearLoanCategories(ctx, l); err != nil {
-		writeError(w, http.StatusInternalServerError, "untag payments: "+err.Error())
-		return
-	}
-	if err := h.queries.DeleteLoan(ctx, id); err != nil {
-		writeError(w, http.StatusInternalServerError, "delete loan: "+err.Error())
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		if err := clearLoanCategoriesWithQueries(ctx, qtx, l); err != nil {
+			return fmt.Errorf("untag payments: %w", err)
+		}
+		if err := qtx.DeleteLoan(ctx, id); err != nil {
+			return fmt.Errorf("delete loan: %w", err)
+		}
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	h.refreshSnapshots()
@@ -434,7 +468,7 @@ func (h *AssetsHandler) HandleDeleteLoan(w http.ResponseWriter, r *http.Request)
 }
 
 // HandleCreateExtraRepayment records a Sondertilgung, optionally linked to the
-// transaction that paid it.
+// transaction that paid it, and re-matches loan payments against the updated schedule.
 func (h *AssetsHandler) HandleCreateExtraRepayment(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseIDParam(w, r, "id", "loan")
 	if !ok {
@@ -450,7 +484,7 @@ func (h *AssetsHandler) HandleCreateExtraRepayment(w http.ResponseWriter, r *htt
 		return
 	}
 	date, err := time.Parse("2006-01-02", req.Date)
-	if err != nil || req.Amount <= 0 {
+	if err != nil || !isFinite(req.Amount) || req.Amount <= 0 {
 		writeError(w, http.StatusBadRequest, "date (YYYY-MM-DD) and a positive amount are required")
 		return
 	}
@@ -470,27 +504,44 @@ func (h *AssetsHandler) HandleCreateExtraRepayment(w http.ResponseWriter, r *htt
 			writeError(w, http.StatusBadRequest, errBadPurchaseTxn.Error())
 			return
 		}
-		txnID = &tid
-	}
-	if _, err := h.queries.CreateLoanExtraRepayment(ctx, db.CreateLoanExtraRepaymentParams{
-		LoanID: id, Date: date, Amount: numericOf(req.Amount, "%.2f"), TransactionID: txnID,
-	}); err != nil {
-		writeError(w, http.StatusBadRequest, "record extra repayment: "+err.Error())
-		return
-	}
-	if txnID != nil {
-		if err := h.queries.UpdateTransactionCategory(ctx, db.UpdateTransactionCategoryParams{
-			ID: *txnID, Category: pgtype.Text{String: assets.CategoryLoanPayment, Valid: true},
-		}); err != nil {
-			writeError(w, http.StatusInternalServerError, "tag payment: "+err.Error())
+		txn, err := h.queries.GetTransaction(ctx, tid)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && txn.Type != "withdrawal" && txn.Type != "transfer") {
+			writeError(w, http.StatusBadRequest, errBadPurchaseTxn.Error())
 			return
 		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "get transaction: "+err.Error())
+			return
+		}
+		txnID = &tid
+	}
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		if _, err := qtx.CreateLoanExtraRepayment(ctx, db.CreateLoanExtraRepaymentParams{
+			LoanID: id, Date: date, Amount: numericOf(req.Amount, "%.2f"), TransactionID: txnID,
+		}); err != nil {
+			return fmt.Errorf("record extra repayment: %w", err)
+		}
+		if txnID != nil {
+			if err := qtx.UpdateTransactionCategory(ctx, db.UpdateTransactionCategoryParams{
+				ID: *txnID, Category: pgtype.Text{String: assets.CategoryLoanPayment, Valid: true},
+			}); err != nil {
+				return fmt.Errorf("tag payment: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.rematchLoanPayments(ctx, id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	h.refreshSnapshots()
 	h.writeLoan(w, ctx, http.StatusCreated, id)
 }
 
-// HandleDeleteExtraRepayment removes a Sondertilgung.
+// HandleDeleteExtraRepayment removes a Sondertilgung and re-matches loan payments.
 func (h *AssetsHandler) HandleDeleteExtraRepayment(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseIDParam(w, r, "id", "loan")
 	if !ok {
@@ -501,16 +552,28 @@ func (h *AssetsHandler) HandleDeleteExtraRepayment(w http.ResponseWriter, r *htt
 		return
 	}
 	ctx := r.Context()
-	txnID, err := h.queries.DeleteLoanExtraRepayment(ctx, db.DeleteLoanExtraRepaymentParams{ID: extraID, LoanID: id})
-	if err != nil {
-		writeError(w, http.StatusNotFound, "extra repayment not found")
-		return
-	}
-	if txnID != nil {
-		if err := h.clearCategory(ctx, *txnID, assets.CategoryLoanPayment); err != nil {
-			writeError(w, http.StatusInternalServerError, "untag payment: "+err.Error())
+	if err := withTx(ctx, h.queries, func(qtx *db.Queries) error {
+		txnID, err := qtx.DeleteLoanExtraRepayment(ctx, db.DeleteLoanExtraRepaymentParams{ID: extraID, LoanID: id})
+		if err != nil {
+			return err
+		}
+		if txnID != nil {
+			if err := clearCategoryWithQueries(ctx, qtx, *txnID, assets.CategoryLoanPayment); err != nil {
+				return fmt.Errorf("untag payment: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "extra repayment not found")
 			return
 		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := h.rematchLoanPayments(ctx, id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	h.refreshSnapshots()
 	h.writeLoan(w, ctx, http.StatusOK, id)
@@ -525,7 +588,7 @@ func (h *AssetsHandler) HandleLoanScenario(w http.ResponseWriter, r *http.Reques
 	}
 	extra, followup := 0.0, -1.0
 	if s := r.URL.Query().Get("extra_per_year"); s != "" {
-		v, err := strconv.ParseFloat(s, 64)
+		v, err := parseFiniteFloat(s)
 		if err != nil || v < 0 {
 			writeError(w, http.StatusBadRequest, "invalid extra_per_year")
 			return
@@ -533,7 +596,7 @@ func (h *AssetsHandler) HandleLoanScenario(w http.ResponseWriter, r *http.Reques
 		extra = v
 	}
 	if s := r.URL.Query().Get("followup_rate"); s != "" {
-		v, err := strconv.ParseFloat(s, 64)
+		v, err := parseFiniteFloat(s)
 		if err != nil || v < 0 || v >= 1 {
 			writeError(w, http.StatusBadRequest, "invalid followup_rate")
 			return
@@ -555,9 +618,13 @@ func (h *AssetsHandler) HandleLoanScenario(w http.ResponseWriter, r *http.Reques
 }
 
 func scenarioJSON(s analytics.LoanScenario) map[string]any {
+	payoff := ""
+	if !s.PayoffDate.IsZero() {
+		payoff = s.PayoffDate.Format("2006-01-02")
+	}
 	return map[string]any{
 		"remaining_at_fixed_end": round2(s.RemainingAtFixedEnd),
-		"payoff_date":            s.PayoffDate.Format("2006-01-02"),
+		"payoff_date":            payoff,
 		"total_interest":         s.TotalInterest,
 		"interest_after_fixed":   s.InterestAfterFixed,
 	}

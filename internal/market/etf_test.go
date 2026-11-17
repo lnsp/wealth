@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
@@ -101,5 +102,83 @@ func TestFetchHoldings_EmptyPage(t *testing.T) {
 	}
 	if len(holdings) != 0 {
 		t.Errorf("expected 0 holdings, got %d", len(holdings))
+	}
+}
+
+func TestJustETFClient_SingleFetchCacheAndBotBlockGuards(t *testing.T) {
+	const fullProfileHTML = `<html><body>
+<div data-testid="tl_etf-basics_value_ter">0.20% p.a.</div>
+<div data-testid="etf-holdings_sectors_row">
+  <span data-testid="tl_etf-holdings_sectors_value_name">Technology</span>
+  <span data-testid="tl_etf-holdings_sectors_value_percentage">28,5%</span>
+</div>
+<div data-testid="etf-holdings_countries_row">
+  <span data-testid="tl_etf-holdings_countries_value_name">United States</span>
+  <span data-testid="tl_etf-holdings_countries_value_percentage">65.0%</span>
+</div>
+<div data-testid="etf-holdings_top-holdings_row">
+  <span data-testid="tl_etf-holdings_top-holdings_link_name"><a href="/en/etf-profile.html?isin=US0378331005">Apple Inc.</a></span>
+  <span data-testid="tl_etf-holdings_top-holdings_value_percentage">4.50%</span>
+</div>
+</body></html>`
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		switch r.URL.Path {
+		case "/ok":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(fullProfileHTML))
+		case "/challenge":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("<html><body>Please enable JS</body></html>"))
+		case "/ratelimit":
+			w.WriteHeader(http.StatusTooManyRequests)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewJustETFClient()
+	client.httpClient = srv.Client()
+	client.SetMinInterval(0)
+
+	// 1. FetchMetadata + FetchHoldings for the same URL must issue only 1 HTTP GET.
+	meta, err := fetchMetadataFromURL(client, context.Background(), srv.URL+"/ok", "IE00B4L5Y983")
+	if err != nil {
+		t.Fatalf("fetchMetadataFromURL(/ok): %v", err)
+	}
+	if meta.TER != 0.20 || meta.SectorWeights["Technology"] != 28.5 || meta.CountryWeights["United States"] != 65.0 {
+		t.Fatalf("unexpected parsed metadata: %+v", meta)
+	}
+	holdings, err := fetchHoldingsFromURL(client, context.Background(), srv.URL+"/ok", "IE00B4L5Y983")
+	if err != nil || len(holdings) != 1 {
+		t.Fatalf("fetchHoldingsFromURL(/ok): holdings=%v err=%v", holdings, err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected 1 HTTP GET across FetchMetadata+FetchHoldings, got %d", got)
+	}
+
+	// 2. HTTP 200 bot-challenge page with zero TER/sectors/countries must error and negative-cache.
+	if _, err := fetchMetadataFromURL(client, context.Background(), srv.URL+"/challenge", "IE00CHALL001"); err == nil {
+		t.Fatalf("expected error on empty HTTP 200 challenge page")
+	}
+	hitsAfterChallenge := hits.Load()
+	if _, err := fetchMetadataFromURL(client, context.Background(), srv.URL+"/challenge", "IE00CHALL001"); err == nil {
+		t.Fatalf("expected cached error on second call to challenge URL")
+	}
+	if got := hits.Load(); got != hitsAfterChallenge {
+		t.Fatalf("expected negative cache to suppress second HTTP request, hits %d -> %d", hitsAfterChallenge, got)
+	}
+
+	// 3. HTTP 429 must negative-cache and suppress immediate retry.
+	if _, err := fetchMetadataFromURL(client, context.Background(), srv.URL+"/ratelimit", "IE00RATE0001"); err == nil {
+		t.Fatalf("expected error on 429")
+	}
+	hitsAfter429 := hits.Load()
+	if _, err := fetchHoldingsFromURL(client, context.Background(), srv.URL+"/ratelimit", "IE00RATE0001"); err == nil {
+		t.Fatalf("expected cached error after 429")
+	}
+	if got := hits.Load(); got != hitsAfter429 {
+		t.Fatalf("expected 429 negative cache to suppress retry, hits %d -> %d", hitsAfter429, got)
 	}
 }

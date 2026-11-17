@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -79,8 +80,12 @@ func (h *AlertsHandler) HandleCreateAlert(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid alert_type")
 		return
 	}
-	if req.Threshold <= 0 {
+	if math.IsNaN(req.Threshold) || math.IsInf(req.Threshold, 0) || req.Threshold <= 0 {
 		writeError(w, http.StatusBadRequest, "threshold must be positive")
+		return
+	}
+	if req.AlertType != "portfolio_milestone" && req.SecurityISIN == "" {
+		writeError(w, http.StatusBadRequest, "security_isin is required for security alerts")
 		return
 	}
 

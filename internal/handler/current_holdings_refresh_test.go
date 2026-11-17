@@ -30,6 +30,7 @@ const (
 	settingsGoPath = "settings.go"
 	queriesSQL     = "../database/queries.sql"
 	migration002   = "../../migrations/002_add_transfer_out.sql"
+	migration029   = "../../migrations/029_audit_fixes.sql"
 )
 
 func readFile(t *testing.T, path string) string {
@@ -109,9 +110,16 @@ func TestRefreshCurrentHoldings_UniqueIndexExistsForConcurrentRefresh(t *testing
 	if !strings.Contains(mig, "CREATE UNIQUE INDEX ON current_holdings (account_id, security_isin)") {
 		t.Error("migration 002: missing UNIQUE INDEX required by CONCURRENTLY refresh")
 	}
+	mig029 := readFile(t, migration029)
+	if !strings.Contains(mig029, "CREATE UNIQUE INDEX ON current_holdings (account_id, security_isin)") {
+		t.Error("migration 029: missing UNIQUE INDEX required by CONCURRENTLY refresh")
+	}
+	if !strings.Contains(mig029, "a.is_active = true") {
+		t.Error("migration 029: current_holdings must filter active accounts (a.is_active = true)")
+	}
 }
 
-// ---- MV aggregation math (mirror of migration 002 SQL) ----
+// ---- MV aggregation math (mirror of migration 029 moving-average SQL) ----
 
 type txn struct {
 	AccountID string
@@ -140,12 +148,12 @@ func isSubtractiveQty(typ string) bool {
 	return typ == "sell" || typ == "transfer_out"
 }
 
-// aggregateHoldings replicates the SQL in migrations/002:
+// aggregateHoldings replicates the moving-average SQL in migrations/029:
 //   - groups by (account_id, isin) where isin is non-empty
-//   - quantity = Σadditive.qty − Σsubtractive.qty
-//   - avg_cost = (Σadditive.(amount+fee) − Σsubtractive.(amount−fee)) / quantity
+//   - additive txns add qty and (amount + fee) to total cost
+//   - subtractive txns reduce qty and proportionally reduce total cost by (cost/qty) * sold_qty
 //   - dividends = Σ(amount where type=dividend)
-//   - HAVING: only rows with quantity > 0 are returned
+//   - HAVING: only rows with quantity > 1e-9 are returned
 func aggregateHoldings(txns []txn) []holdingRow {
 	type bucket struct {
 		qty, cost, div float64
@@ -170,8 +178,19 @@ func aggregateHoldings(txns []txn) []holdingRow {
 			b.qty += t.Quantity
 			b.cost += t.Amount + t.Fee
 		case isSubtractiveQty(t.Type):
-			b.qty -= t.Quantity
-			b.cost -= (t.Amount - t.Fee)
+			if b.qty > 0 {
+				sellQty := t.Quantity
+				if sellQty > b.qty {
+					sellQty = b.qty
+				}
+				avgCost := b.cost / b.qty
+				b.qty -= sellQty
+				b.cost -= avgCost * sellQty
+				if b.qty <= 1e-9 {
+					b.qty = 0
+					b.cost = 0
+				}
+			}
 		case t.Type == "dividend":
 			b.div += t.Amount
 		}
@@ -179,7 +198,7 @@ func aggregateHoldings(txns []txn) []holdingRow {
 	var out []holdingRow
 	for acct, m := range groups {
 		for isin, b := range m {
-			if b.qty <= 0 {
+			if b.qty <= 1e-9 {
 				continue // HAVING clause
 			}
 			out = append(out, holdingRow{
@@ -217,9 +236,8 @@ func TestCurrentHoldings_BuyAggregatesWithFeesIntoCostBasis(t *testing.T) {
 }
 
 func TestCurrentHoldings_PartialSellWeightsCostBasis(t *testing.T) {
-	// Buy 10 @ €100 (+€5 fee → cost basis 100.5), then sell 4 @ €110 (−€2 fee).
-	// SQL: cost = (1000 + 5) − (440 − 2) = 1005 − 438 = 567; qty = 10 − 4 = 6.
-	// avg = 567/6 = 94.5
+	// Buy 10 @ €100 (+€5 fee → moving-average cost basis 100.5), then sell 4 @ €110 (−€2 fee).
+	// Moving-average cost basis per remaining share stays 100.5; qty = 10 − 4 = 6.
 	rows := aggregateHoldings([]txn{
 		{AccountID: "A", ISIN: "X", Type: "buy", Quantity: 10, Amount: 1000, Fee: 5},
 		{AccountID: "A", ISIN: "X", Type: "sell", Quantity: 4, Amount: 440, Fee: 2},
@@ -231,8 +249,23 @@ func TestCurrentHoldings_PartialSellWeightsCostBasis(t *testing.T) {
 	if r.Quantity != 6 {
 		t.Errorf("qty = %v, want 6", r.Quantity)
 	}
-	if r.AvgCostBasis != 94.5 {
-		t.Errorf("avg cost = %v, want 94.5 ((1005 − 438)/6)", r.AvgCostBasis)
+	if r.AvgCostBasis != 100.5 {
+		t.Errorf("avg cost = %v, want 100.5 (moving-average cost basis preserved on partial sell)", r.AvgCostBasis)
+	}
+}
+
+func TestCurrentHoldings_PartialSellAfterDoublingStaysPositive(t *testing.T) {
+	// Regression for H4: Buy 10 @ €100 (€1,000), sell 5 @ €250 (€1,250 proceeds > €1,000 cost).
+	// AvgCostBasis must stay €100 (never go negative to -€50!).
+	rows := aggregateHoldings([]txn{
+		{AccountID: "A", ISIN: "WINNER", Type: "buy", Quantity: 10, Amount: 1000},
+		{AccountID: "A", ISIN: "WINNER", Type: "sell", Quantity: 5, Amount: 1250},
+	})
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0].Quantity != 5 || rows[0].AvgCostBasis != 100 {
+		t.Errorf("got qty=%v avgCost=%v, want qty=5 avgCost=100", rows[0].Quantity, rows[0].AvgCostBasis)
 	}
 }
 

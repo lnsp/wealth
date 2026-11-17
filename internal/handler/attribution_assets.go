@@ -10,6 +10,7 @@ import (
 
 	"github.com/lnsp/wealth/internal/assets"
 	db "github.com/lnsp/wealth/internal/database/generated"
+	"github.com/lnsp/wealth/internal/market"
 )
 
 // physicalAttribution separates physical assets and their loans from market
@@ -53,15 +54,19 @@ func (t *physicalTotals) add(e physicalEvent) {
 	t.interest += e.interest
 }
 
-func (h *PortfolioHandler) loadPhysicalAttribution(ctx context.Context, txns []db.ListTransactionsRow) physicalAttribution {
+func (h *PortfolioHandler) loadPhysicalAttribution(ctx context.Context, txns []db.ListTransactionsRow, histFX []market.HistoricalFXRate, fxRates map[string]float64) physicalAttribution {
 	holdings, err := assets.Load(ctx, h.queries)
 	if err != nil {
 		log.Printf("WARNING: load assets for attribution: %v", err)
 	}
-	return buildPhysicalAttribution(holdings, txns, assets.CivilDate(time.Now()))
+	return buildPhysicalAttributionWithFX(holdings, txns, assets.CivilDate(time.Now()), histFX, fxRates)
 }
 
 func buildPhysicalAttribution(holdings assets.Holdings, txns []db.ListTransactionsRow, today time.Time) physicalAttribution {
+	return buildPhysicalAttributionWithFX(holdings, txns, today, nil, nil)
+}
+
+func buildPhysicalAttributionWithFX(holdings assets.Holdings, txns []db.ListTransactionsRow, today time.Time, histFX []market.HistoricalFXRate, fxRates map[string]float64) physicalAttribution {
 	pa := physicalAttribution{holdings: holdings, linked: holdings.LinkedIDs()}
 	txnByID := make(map[uuid.UUID]db.ListTransactionsRow, len(txns))
 	for _, t := range txns {
@@ -81,7 +86,8 @@ func buildPhysicalAttribution(holdings assets.Holdings, txns []db.ListTransactio
 		}
 		for _, l := range a.Links {
 			if t, ok := txnByID[l.TransactionID]; ok {
-				add(physicalEvent{date: t.Date, contrib: -math.Abs(assets.Numeric(t.Amount))})
+				amtEUR := convertAmountToEURAtDate(math.Abs(assets.Numeric(t.Amount)), t.Currency, t.Date, histFX, fxRates)
+				add(physicalEvent{date: t.Date, contrib: -amtEUR})
 			}
 		}
 	}

@@ -17,7 +17,9 @@ type DailyValuation struct {
 	Value float64
 }
 
-// CalculateTWR computes the Time-Weighted Return.
+// CalculateTWR computes the Time-Weighted Return using Modified Dietz sub-period
+// weighting (with start-of-day weighting on daily/weekend snapshot steps where
+// deposits execute intraday prior to evening snapshot valuation).
 func CalculateTWR(valuations []DailyValuation, cashflows []CashFlow) float64 {
 	if len(valuations) < 2 {
 		return 0
@@ -26,19 +28,32 @@ func CalculateTWR(valuations []DailyValuation, cashflows []CashFlow) float64 {
 	periods := splitByCashflows(valuations, cashflows)
 	twr := 1.0
 	for _, p := range periods {
-		if p.StartValue == 0 {
+		if p.StartValue <= 0 {
 			continue
 		}
-		r := (p.EndValue - p.StartValue - p.NetFlow) / p.StartValue
-		twr *= (1 + r)
+		gain := p.EndValue - p.StartValue - p.NetFlow
+		denom := p.StartValue + p.WeightedFlow
+		var r float64
+		if denom > 0 && denom+gain > 0 {
+			r = gain / denom
+		} else if p.StartValue+p.PositiveFlow > 0 {
+			r = gain / (p.StartValue + p.PositiveFlow)
+		} else {
+			continue
+		}
+		if 1+r > 0 {
+			twr *= (1 + r)
+		}
 	}
 	return twr - 1.0
 }
 
 type period struct {
-	StartValue float64
-	EndValue   float64
-	NetFlow    float64
+	StartValue   float64
+	EndValue     float64
+	NetFlow      float64
+	WeightedFlow float64
+	PositiveFlow float64
 }
 
 func splitByCashflows(valuations []DailyValuation, cashflows []CashFlow) []period {
@@ -46,27 +61,48 @@ func splitByCashflows(valuations []DailyValuation, cashflows []CashFlow) []perio
 		return nil
 	}
 
-	// Build a map of cashflows by date
-	cfByDate := make(map[string]float64)
-	for _, cf := range cashflows {
-		cfByDate[cf.Date.Format("2006-01-02")] += cf.Amount
+	normDate := func(t time.Time) time.Time {
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 	}
 
 	var periods []period
 	startVal := valuations[0].Value
+	prevDate := normDate(valuations[0].Date)
 
 	for i := 1; i < len(valuations); i++ {
-		dateKey := valuations[i].Date.Format("2006-01-02")
-		netFlow := cfByDate[dateKey]
+		curDate := normDate(valuations[i].Date)
+		spanDays := curDate.Sub(prevDate).Hours() / 24.0
+		var netFlow, weightedFlow, posFlow float64
+		for _, cf := range cashflows {
+			cfDate := normDate(cf.Date)
+			if cfDate.After(prevDate) && !cfDate.After(curDate) {
+				netFlow += cf.Amount
+				if cf.Amount > 0 {
+					posFlow += cf.Amount
+				}
+				w := 0.0
+				if spanDays <= 4 {
+					if cf.Amount > 0 {
+						w = 1.0
+					}
+				} else if spanDays > 0 {
+					w = curDate.Sub(cfDate).Hours() / (spanDays * 24.0)
+				}
+				weightedFlow += cf.Amount * w
+			}
+		}
 
 		if netFlow != 0 || i == len(valuations)-1 {
 			periods = append(periods, period{
-				StartValue: startVal,
-				EndValue:   valuations[i].Value,
-				NetFlow:    netFlow,
+				StartValue:   startVal,
+				EndValue:     valuations[i].Value,
+				NetFlow:      netFlow,
+				WeightedFlow: weightedFlow,
+				PositiveFlow: posFlow,
 			})
 			startVal = valuations[i].Value
 		}
+		prevDate = curDate
 	}
 
 	return periods

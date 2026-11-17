@@ -2,11 +2,15 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/google/uuid"
@@ -15,13 +19,26 @@ import (
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
 
+const (
+	webauthnCeremonyCookie = "webauthn_ceremony"
+	webauthnCeremonyTTL    = 5 * time.Minute
+	maxWebAuthnSessions    = 1024
+)
+
+type webauthnSessionEntry struct {
+	data      *webauthn.SessionData
+	userID    string // empty for discoverable login ceremonies
+	expiresAt time.Time
+}
+
 // WebAuthnHandler manages passkey registration and authentication.
 type WebAuthnHandler struct {
 	queries *db.Queries
 	wan     *webauthn.WebAuthn
 	auth    *auth.Auth
-	// In-memory session storage (simple approach for single-instance deployment)
-	sessions sync.Map // userID -> *webauthn.SessionData
+
+	mu       sync.Mutex
+	sessions map[string]webauthnSessionEntry
 }
 
 // webauthnUser adapts our user model to the webauthn.User interface.
@@ -47,7 +64,85 @@ func NewWebAuthnHandler(q *db.Queries, a *auth.Auth, rpID, rpOrigin string) (*We
 	if err != nil {
 		return nil, err
 	}
-	return &WebAuthnHandler{queries: q, wan: wan, auth: a}, nil
+	return &WebAuthnHandler{
+		queries:  q,
+		wan:      wan,
+		auth:     a,
+		sessions: make(map[string]webauthnSessionEntry),
+	}, nil
+}
+
+func (h *WebAuthnHandler) putSession(key, userID string, data *webauthn.SessionData) {
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for k, entry := range h.sessions {
+		if now.After(entry.expiresAt) {
+			delete(h.sessions, k)
+		}
+	}
+	if len(h.sessions) >= maxWebAuthnSessions {
+		var oldestKey string
+		var oldestExp time.Time
+		for k, entry := range h.sessions {
+			if oldestKey == "" || entry.expiresAt.Before(oldestExp) {
+				oldestKey = k
+				oldestExp = entry.expiresAt
+			}
+		}
+		if oldestKey != "" {
+			delete(h.sessions, oldestKey)
+		}
+	}
+
+	h.sessions[key] = webauthnSessionEntry{
+		data:      data,
+		userID:    userID,
+		expiresAt: now.Add(webauthnCeremonyTTL),
+	}
+}
+
+func (h *WebAuthnHandler) takeSession(key string) (webauthnSessionEntry, bool) {
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	entry, ok := h.sessions[key]
+	if !ok {
+		return webauthnSessionEntry{}, false
+	}
+	delete(h.sessions, key)
+	if now.After(entry.expiresAt) || entry.data == nil {
+		return webauthnSessionEntry{}, false
+	}
+	return entry, true
+}
+
+func setCeremonyCookie(w http.ResponseWriter, r *http.Request, ceremonyID string) {
+	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	http.SetCookie(w, &http.Cookie{
+		Name:     webauthnCeremonyCookie,
+		Value:    ceremonyID,
+		Path:     "/api/auth/webauthn",
+		MaxAge:   int(webauthnCeremonyTTL.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+	})
+}
+
+func clearCeremonyCookie(w http.ResponseWriter, r *http.Request) {
+	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	http.SetCookie(w, &http.Cookie{
+		Name:     webauthnCeremonyCookie,
+		Value:    "",
+		Path:     "/api/auth/webauthn",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+	})
 }
 
 // HandleBeginRegistration starts the passkey registration ceremony.
@@ -64,13 +159,12 @@ func (h *WebAuthnHandler) HandleBeginRegistration(w http.ResponseWriter, r *http
 	}
 
 	dbUser, err := h.queries.GetUserByID(r.Context(), uid)
-	if err != nil {
+	if err != nil || !dbUser.IsActive {
 		writeError(w, http.StatusNotFound, "user not found")
 		return
 	}
 
 	user := &webauthnUser{id: uid, name: dbUser.Username}
-	// Load existing credentials to exclude them
 	creds := h.loadCredentials(r, uid)
 	user.credentials = creds
 
@@ -82,7 +176,7 @@ func (h *WebAuthnHandler) HandleBeginRegistration(w http.ResponseWriter, r *http
 		return
 	}
 
-	h.sessions.Store(userID, session)
+	h.putSession("reg:"+userID, userID, session)
 	writeJSON(w, http.StatusOK, options)
 }
 
@@ -93,29 +187,34 @@ func (h *WebAuthnHandler) HandleFinishRegistration(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	uid, _ := uuid.Parse(userID)
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid user ID")
+		return
+	}
 
-	sessionData, ok := h.sessions.LoadAndDelete(userID)
+	entry, ok := h.takeSession("reg:" + userID)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "no registration session — call begin first")
 		return
 	}
 
-	dbUser, _ := h.queries.GetUserByID(r.Context(), uid)
-	user := &webauthnUser{id: uid, name: dbUser.Username}
+	dbUser, err := h.queries.GetUserByID(r.Context(), uid)
+	if err != nil || !dbUser.IsActive {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	user := &webauthnUser{id: uid, name: dbUser.Username, credentials: h.loadCredentials(r, uid)}
 
-	credential, err := h.wan.FinishRegistration(user, *sessionData.(*webauthn.SessionData), r)
+	credential, err := h.wan.FinishRegistration(user, *entry.data, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "finish registration: "+err.Error())
 		return
 	}
 
-	// Store credential in database
-	var name string
-	if n := r.URL.Query().Get("name"); n != "" {
+	name := "Passkey"
+	if n := strings.TrimSpace(r.URL.Query().Get("name")); n != "" {
 		name = n
-	} else {
-		name = "Passkey"
 	}
 
 	_, err = h.queries.DB().Exec(r.Context(),
@@ -138,29 +237,36 @@ func (h *WebAuthnHandler) HandleBeginLogin(w http.ResponseWriter, r *http.Reques
 	var body struct {
 		Username string `json:"username"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+	}
 
-	if body.Username == "" {
+	ceremonyID := uuid.NewString()
+	username := strings.TrimSpace(body.Username)
+	if username == "" {
 		// Discoverable credential flow (usernameless)
 		options, session, err := h.wan.BeginDiscoverableLogin()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "begin login: "+err.Error())
 			return
 		}
-		h.sessions.Store("discoverable", session)
+		h.putSession("login:"+ceremonyID, "", session)
+		setCeremonyCookie(w, r, ceremonyID)
 		writeJSON(w, http.StatusOK, options)
 		return
 	}
 
-	dbUser, err := h.queries.GetUserByUsername(r.Context(), body.Username)
-	if err != nil {
+	dbUser, err := h.queries.GetUserByUsername(r.Context(), username)
+	if err != nil || !dbUser.IsActive {
 		writeError(w, http.StatusNotFound, "user not found")
 		return
 	}
 
 	user := &webauthnUser{id: dbUser.ID, name: dbUser.Username}
 	user.credentials = h.loadCredentials(r, dbUser.ID)
-
 	if len(user.credentials) == 0 {
 		writeError(w, http.StatusBadRequest, "no passkeys registered for this user")
 		return
@@ -172,15 +278,29 @@ func (h *WebAuthnHandler) HandleBeginLogin(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	h.sessions.Store(dbUser.ID.String(), session)
+	h.putSession("login:"+ceremonyID, dbUser.ID.String(), session)
+	setCeremonyCookie(w, r, ceremonyID)
 	writeJSON(w, http.StatusOK, options)
 }
 
 // HandleFinishLogin completes the passkey authentication ceremony and issues a session.
 func (h *WebAuthnHandler) HandleFinishLogin(w http.ResponseWriter, r *http.Request) {
-	// Try discoverable flow first
-	sessionData, ok := h.sessions.LoadAndDelete("discoverable")
-	if ok {
+	cookie, err := r.Cookie(webauthnCeremonyCookie)
+	clearCeremonyCookie(w, r)
+	if err != nil || cookie.Value == "" {
+		writeError(w, http.StatusBadRequest, "no passkey login session — call begin first")
+		return
+	}
+
+	entry, ok := h.takeSession("login:" + cookie.Value)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "passkey login session expired — try again")
+		return
+	}
+
+	if entry.userID == "" {
+		// Discoverable flow
+		var verifiedUID uuid.UUID
 		credential, err := h.wan.FinishDiscoverableLogin(
 			func(rawID, userHandle []byte) (webauthn.User, error) {
 				uid, err := uuid.FromBytes(userHandle)
@@ -191,11 +311,15 @@ func (h *WebAuthnHandler) HandleFinishLogin(w http.ResponseWriter, r *http.Reque
 				if err != nil {
 					return nil, err
 				}
+				if !dbUser.IsActive {
+					return nil, errors.New("user account is inactive")
+				}
+				verifiedUID = uid
 				user := &webauthnUser{id: uid, name: dbUser.Username}
 				user.credentials = h.loadCredentials(r, uid)
 				return user, nil
 			},
-			*sessionData.(*webauthn.SessionData),
+			*entry.data,
 			r,
 		)
 		if err != nil {
@@ -203,10 +327,24 @@ func (h *WebAuthnHandler) HandleFinishLogin(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusUnauthorized, "passkey verification failed")
 			return
 		}
-		// Find user by credential
+		if credential.Authenticator.CloneWarning {
+			log.Printf("SECURITY WARNING: webauthn clone warning for user %s", verifiedUID)
+			writeError(w, http.StatusUnauthorized, "passkey clone warning detected")
+			return
+		}
 		userID := h.findUserByCredential(r, credential.ID)
-		if userID == "" {
+		if userID == "" || (verifiedUID != uuid.Nil && userID != verifiedUID.String()) {
 			writeError(w, http.StatusUnauthorized, "unknown credential")
+			return
+		}
+		uid, err := uuid.Parse(userID)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unknown credential")
+			return
+		}
+		dbUser, err := h.queries.GetUserByID(r.Context(), uid)
+		if err != nil || !dbUser.IsActive {
+			writeError(w, http.StatusUnauthorized, "user account is inactive")
 			return
 		}
 		h.updateSignCount(r, credential.ID, credential.Authenticator.SignCount)
@@ -215,40 +353,34 @@ func (h *WebAuthnHandler) HandleFinishLogin(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Named user flow — try all stored user sessions
-	// The login/begin stored session under the user's ID
-	var matchedUserID string
-	h.sessions.Range(func(key, value any) bool {
-		keyStr, ok := key.(string)
-		if !ok || keyStr == "discoverable" {
-			return true
-		}
-		uid, err := uuid.Parse(keyStr)
-		if err != nil {
-			return true
-		}
-		dbUser, err := h.queries.GetUserByID(r.Context(), uid)
-		if err != nil {
-			return true
-		}
-		user := &webauthnUser{id: uid, name: dbUser.Username}
-		user.credentials = h.loadCredentials(r, uid)
-
-		_, err = h.wan.FinishLogin(user, *value.(*webauthn.SessionData), r)
-		if err == nil {
-			matchedUserID = keyStr
-			h.sessions.Delete(keyStr)
-			return false // found match
-		}
-		return true
-	})
-
-	if matchedUserID == "" {
+	// Named user flow
+	uid, err := uuid.Parse(entry.userID)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "passkey verification failed")
 		return
 	}
+	dbUser, err := h.queries.GetUserByID(r.Context(), uid)
+	if err != nil || !dbUser.IsActive {
+		writeError(w, http.StatusUnauthorized, "passkey verification failed")
+		return
+	}
+	user := &webauthnUser{id: uid, name: dbUser.Username}
+	user.credentials = h.loadCredentials(r, uid)
 
-	h.auth.SetSessionCookieForUser(w, r, matchedUserID)
+	credential, err := h.wan.FinishLogin(user, *entry.data, r)
+	if err != nil {
+		log.Printf("WARNING: webauthn named login: %v", err)
+		writeError(w, http.StatusUnauthorized, "passkey verification failed")
+		return
+	}
+	if credential.Authenticator.CloneWarning {
+		log.Printf("SECURITY WARNING: webauthn clone warning for user %s", uid)
+		writeError(w, http.StatusUnauthorized, "passkey clone warning detected")
+		return
+	}
+
+	h.updateSignCount(r, credential.ID, credential.Authenticator.SignCount)
+	h.auth.SetSessionCookieForUser(w, r, entry.userID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -259,14 +391,18 @@ func (h *WebAuthnHandler) HandleListPasskeys(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	uid, _ := uuid.Parse(userID)
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid user ID")
+		return
+	}
 
 	rows, err := h.queries.DB().Query(r.Context(),
 		`SELECT id, name, created_at FROM webauthn_credentials WHERE user_id = $1 ORDER BY created_at`,
 		uid,
 	)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"passkeys": []any{}})
+		writeError(w, http.StatusInternalServerError, "list passkeys: "+err.Error())
 		return
 	}
 	defer rows.Close()
@@ -288,6 +424,10 @@ func (h *WebAuthnHandler) HandleListPasskeys(w http.ResponseWriter, r *http.Requ
 		p.CreatedAt = createdAt.Format(time.RFC3339)
 		passkeys = append(passkeys, p)
 	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, "list passkeys: "+err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"passkeys": passkeys})
 }
 
@@ -298,9 +438,16 @@ func (h *WebAuthnHandler) HandleDeletePasskey(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	uid, _ := uuid.Parse(userID)
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid user ID")
+		return
+	}
 
-	passkeyID := r.PathValue("id")
+	passkeyID := chi.URLParam(r, "id")
+	if passkeyID == "" {
+		passkeyID = r.PathValue("id")
+	}
 	pid, err := uuid.Parse(passkeyID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid passkey ID")
@@ -333,10 +480,12 @@ func (h *WebAuthnHandler) findUserByCredential(r *http.Request, credentialID []b
 
 // updateSignCount updates the sign count for a credential after successful login.
 func (h *WebAuthnHandler) updateSignCount(r *http.Request, credentialID []byte, signCount uint32) {
-	h.queries.DB().Exec(r.Context(),
+	if _, err := h.queries.DB().Exec(r.Context(),
 		`UPDATE webauthn_credentials SET sign_count = $1 WHERE credential_id = $2`,
 		signCount, credentialID,
-	)
+	); err != nil {
+		log.Printf("WARNING: update webauthn sign count: %v", err)
+	}
 }
 
 // loadCredentials fetches stored WebAuthn credentials for a user.
@@ -346,6 +495,7 @@ func (h *WebAuthnHandler) loadCredentials(r *http.Request, userID uuid.UUID) []w
 		userID,
 	)
 	if err != nil {
+		log.Printf("WARNING: query webauthn credentials: %v", err)
 		return nil
 	}
 	defer rows.Close()
@@ -373,6 +523,9 @@ func (h *WebAuthnHandler) loadCredentials(r *http.Request, userID uuid.UUID) []w
 			},
 		})
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("WARNING: iterate webauthn credentials: %v", err)
+	}
 	return creds
 }
 
@@ -380,8 +533,8 @@ func credentialDescriptors(creds []webauthn.Credential) []protocol.CredentialDes
 	var descs []protocol.CredentialDescriptor
 	for _, c := range creds {
 		descs = append(descs, protocol.CredentialDescriptor{
-			Type:            protocol.PublicKeyCredentialType,
-			CredentialID:    c.ID,
+			Type:         protocol.PublicKeyCredentialType,
+			CredentialID: c.ID,
 		})
 	}
 	return descs

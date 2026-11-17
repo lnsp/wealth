@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -52,7 +54,7 @@ func (c *EurostatClient) FetchHousePriceIndex(ctx context.Context, geo, purchase
 		return nil, fmt.Errorf("eurostat prc_hpi_q: HTTP %d", resp.StatusCode)
 	}
 	var body jsonStat
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 5<<20)).Decode(&body); err != nil {
 		return nil, fmt.Errorf("eurostat prc_hpi_q: decode: %w", err)
 	}
 	return body.timeSeries()
@@ -62,6 +64,8 @@ func (c *EurostatClient) FetchHousePriceIndex(ctx context.Context, geo, purchase
 // series: every dimension except time is fixed by the query, so the flat
 // value index equals the time index.
 type jsonStat struct {
+	ID        []string           `json:"id"`
+	Size      []int              `json:"size"`
 	Value     map[string]float64 `json:"value"`
 	Dimension struct {
 		Time struct {
@@ -73,11 +77,18 @@ type jsonStat struct {
 }
 
 func (d jsonStat) timeSeries() ([]IndexPoint, error) {
+	if len(d.ID) > 0 && len(d.ID) == len(d.Size) {
+		for i, dim := range d.ID {
+			if dim != "time" && d.Size[i] > 1 {
+				return nil, fmt.Errorf("eurostat unexpected multi-valued dimension %q (size=%d)", dim, d.Size[i])
+			}
+		}
+	}
 	var out []IndexPoint
 	for label, idx := range d.Dimension.Time.Category.Index {
 		v, ok := d.Value[strconv.Itoa(idx)]
-		if !ok {
-			continue // not published (yet)
+		if !ok || math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+			continue // not published (yet) or invalid
 		}
 		period, err := parseQuarter(label)
 		if err != nil {

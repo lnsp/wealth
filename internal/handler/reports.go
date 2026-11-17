@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -130,12 +132,12 @@ func (h *ReportsHandler) HandleGenerateReport(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusBadRequest, "month must be 1-12")
 			return
 		}
-		periodStart = time.Date(req.Year, time.Month(req.Month), 1, 0, 0, 0, 0, time.Local)
-		periodEnd = periodStart.AddDate(0, 1, -1)
+		periodStart = time.Date(req.Year, time.Month(req.Month), 1, 0, 0, 0, 0, time.UTC)
+		periodEnd = time.Date(req.Year, time.Month(req.Month)+1, 0, 0, 0, 0, 0, time.UTC)
 		periodLabel = periodStart.Format("2006-01")
 	} else {
-		periodStart = time.Date(req.Year, 1, 1, 0, 0, 0, 0, time.Local)
-		periodEnd = time.Date(req.Year, 12, 31, 0, 0, 0, 0, time.Local)
+		periodStart = time.Date(req.Year, 1, 1, 0, 0, 0, 0, time.UTC)
+		periodEnd = time.Date(req.Year, 12, 31, 0, 0, 0, 0, time.UTC)
 		periodLabel = periodStart.Format("2006")
 	}
 
@@ -184,8 +186,52 @@ func (h *ReportsHandler) computeReport(ctx context.Context, start, end time.Time
 		changePct = (change / nwStart) * 100
 	}
 
-	// Count transactions and dividends in period
-	txns, _ := h.queries.ListTransactions(ctx, db.ListTransactionsParams{Limit: 10000, Offset: 0})
+	// Load all transactions for period stats and historical holdings replay as of period end
+	txns, _ := h.queries.ListAllTransactions(ctx)
+	fxRates, _ := h.queries.ListAllExchangeRates(ctx)
+	type fxPt struct {
+		date time.Time
+		rate float64
+	}
+	fxByCur := make(map[string][]fxPt)
+	for _, r := range fxRates {
+		if r.Rate.Valid {
+			f, _ := r.Rate.Float64Value()
+			if f.Float64 > 0 {
+				norm, _ := normalizeCurrencyAndScale(r.Currency)
+				fxByCur[norm] = append(fxByCur[norm], fxPt{date: r.Date, rate: f.Float64})
+			}
+		}
+	}
+	toEURAt := func(amount float64, cur string, dt time.Time) float64 {
+		if amount == 0 {
+			return 0
+		}
+		norm, scale := normalizeCurrencyAndScale(cur)
+		scaled := amount * scale
+		if norm == "EUR" {
+			return scaled
+		}
+		pts := fxByCur[norm]
+		if len(pts) == 0 {
+			return scaled
+		}
+		lo, hi, res := 0, len(pts)-1, -1
+		for lo <= hi {
+			mid := (lo + hi) / 2
+			if !pts[mid].date.After(dt) {
+				res = mid
+				lo = mid + 1
+			} else {
+				hi = mid - 1
+			}
+		}
+		if res >= 0 {
+			return scaled / pts[res].rate
+		}
+		return scaled / pts[0].rate
+	}
+
 	newTxns := 0
 	dividends := 0.0
 	for _, txn := range txns {
@@ -195,56 +241,98 @@ func (h *ReportsHandler) computeReport(ctx context.Context, start, end time.Time
 		newTxns++
 		if txn.Type == "dividend" && txn.Amount.Valid {
 			f, _ := txn.Amount.Float64Value()
-			dividends += f.Float64
+			dividends += toEURAt(f.Float64, txn.Currency, txn.Date)
 		}
 	}
 
-	// Current holdings snapshot
-	holdings, _ := h.queries.ListCurrentHoldings(ctx)
-	prices, _ := h.queries.ListLatestPrices(ctx)
-	pm := make(map[string]float64)
-	for _, p := range prices {
-		if p.Close.Valid {
-			f, _ := p.Close.Float64Value()
-			pm[p.SecurityISIN] = f.Float64
+	// Replay holdings chronologically up to period end (`end`) so historical
+	// reports reflect the portfolio at the end of that period rather than today.
+	type replayHold struct {
+		qty  float64
+		cost float64
+	}
+	replayed := make(map[string]*replayHold)
+	for i := len(txns) - 1; i >= 0; i-- {
+		txn := txns[i]
+		if txn.Date.After(end) || !txn.SecurityISIN.Valid || txn.SecurityISIN.String == "" {
+			continue
 		}
+		isin := txn.SecurityISIN.String
+		qty := numericToFloat(txn.Quantity)
+		amtEUR := toEURAt(numericToFloat(txn.Amount), txn.Currency, txn.Date)
+		feeEUR := toEURAt(numericToFloat(txn.Fee), txn.Currency, txn.Date)
+
+		switch txn.Type {
+		case "buy", "savings_plan":
+			if qty > 0 {
+				rh := replayed[isin]
+				if rh == nil {
+					rh = &replayHold{}
+					replayed[isin] = rh
+				}
+				rh.qty += qty
+				rh.cost += amtEUR + feeEUR
+			}
+		case "transfer":
+			if qty > 0 {
+				rh := replayed[isin]
+				if rh == nil {
+					rh = &replayHold{}
+					replayed[isin] = rh
+				}
+				rh.qty += qty
+				if amtEUR > 0 {
+					rh.cost += amtEUR
+				}
+			}
+		case "sell", "transfer_out":
+			if rh := replayed[isin]; rh != nil && rh.qty > 0 && qty > 0 {
+				sellQty := math.Min(qty, rh.qty)
+				avg := rh.cost / rh.qty
+				rh.qty -= sellQty
+				rh.cost -= avg * sellQty
+				if rh.qty <= 1e-9 {
+					delete(replayed, isin)
+				}
+			}
+		}
+	}
+
+	secs, _ := h.queries.ListSecurities(ctx)
+	secNames := make(map[string]string, len(secs))
+	for _, sec := range secs {
+		secNames[sec.ISIN] = sec.Name
 	}
 
 	totalValue := 0.0
 	type holdAgg struct {
-		isin, name string
+		isin, name  string
 		value, cost float64
 	}
 	agg := make(map[string]*holdAgg)
-	for _, hold := range holdings {
-		qty, cost := 0.0, 0.0
-		if hold.Quantity.Valid {
-			f, _ := hold.Quantity.Float64Value()
-			qty = f.Float64
+	for isin, rh := range replayed {
+		if rh.qty <= 1e-9 {
+			continue
 		}
-		if hold.AvgCostBasis.Valid {
-			f, _ := hold.AvgCostBasis.Float64Value()
-			cost = f.Float64
-		}
-		price := pm[hold.SecurityISIN]
-		value := qty * price
-		if price == 0 {
-			value = qty * cost
-		}
-		if a, ok := agg[hold.SecurityISIN]; ok {
-			a.value += value
-			a.cost += qty * cost
-		} else {
-			name := hold.SecurityISIN
-			if sec, err := h.queries.GetSecurity(ctx, hold.SecurityISIN); err == nil {
-				name = sec.Name
+		value := rh.cost
+		if priceRow, err := h.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{
+			SecurityISIN: isin,
+			Date:         end,
+		}); err == nil && priceRow.Close.Valid {
+			f, _ := priceRow.Close.Float64Value()
+			if f.Float64 > 0 {
+				value = toEURAt(rh.qty*f.Float64, priceRow.Currency, end)
 			}
-			agg[hold.SecurityISIN] = &holdAgg{isin: hold.SecurityISIN, name: name, value: value, cost: qty * cost}
 		}
+		name := secNames[isin]
+		if name == "" {
+			name = isin
+		}
+		agg[isin] = &holdAgg{isin: isin, name: name, value: value, cost: rh.cost}
 		totalValue += value
 	}
 
-	var reportHoldings []ReportHolding
+	reportHoldings := make([]ReportHolding, 0, len(agg))
 	var topGainer, topLoser *ReportHolding
 	for _, a := range agg {
 		weight := 0.0
@@ -256,7 +344,7 @@ func (h *ReportsHandler) computeReport(ctx context.Context, start, end time.Time
 			retPct = ((a.value - a.cost) / a.cost) * 100
 		}
 		rh := ReportHolding{
-			ISIN: a.isin, Name: a.name, Value: a.value,
+			ISIN: a.isin, Name: a.name, Value: math.Round(a.value*100) / 100,
 			Weight: math.Round(weight*10) / 10, ReturnPct: math.Round(retPct*10) / 10,
 		}
 		reportHoldings = append(reportHoldings, rh)
@@ -269,6 +357,12 @@ func (h *ReportsHandler) computeReport(ctx context.Context, start, end time.Time
 			topLoser = &l
 		}
 	}
+	sort.Slice(reportHoldings, func(i, j int) bool {
+		if reportHoldings[i].Value != reportHoldings[j].Value {
+			return reportHoldings[i].Value > reportHoldings[j].Value
+		}
+		return reportHoldings[i].ISIN < reportHoldings[j].ISIN
+	})
 
 	return ReportData{
 		NetWorthStart:     math.Round(nwStart*100) / 100,
@@ -298,69 +392,70 @@ func (h *ReportsHandler) HandleDownloadPDF(w http.ResponseWriter, r *http.Reques
 	}
 
 	var data ReportData
-	json.Unmarshal(rpt.Data, &data)
+	if err := json.Unmarshal(rpt.Data, &data); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode report data: "+err.Error())
+		return
+	}
 
 	pdf := fpdf.New("P", "mm", "A4", "")
+	tr := pdf.UnicodeTranslatorFromDescriptor("")
 	pdf.SetAutoPageBreak(true, 20)
 	pdf.AddPage()
 
 	// Title
 	pdf.SetFont("Helvetica", "B", 20)
-	pdf.CellFormat(0, 12, "Wealth Report", "", 1, "C", false, 0, "")
+	pdf.CellFormat(0, 12, tr("Wealth Report"), "", 1, "C", false, 0, "")
 	pdf.SetFont("Helvetica", "", 12)
-	pdf.CellFormat(0, 8, rpt.PeriodLabel+" ("+rpt.ReportType+")", "", 1, "C", false, 0, "")
+	pdf.CellFormat(0, 8, tr(rpt.PeriodLabel+" ("+rpt.ReportType+")"), "", 1, "C", false, 0, "")
 	pdf.Ln(8)
 
 	// Summary KPIs
 	pdf.SetFont("Helvetica", "B", 14)
-	pdf.CellFormat(0, 8, "Summary", "", 1, "", false, 0, "")
+	pdf.CellFormat(0, 8, tr("Summary"), "", 1, "", false, 0, "")
 	pdf.SetFont("Helvetica", "", 11)
-	pdf.CellFormat(95, 7, "Net Worth Start:", "", 0, "", false, 0, "")
-	pdf.CellFormat(95, 7, fmtEUR(data.NetWorthStart), "", 1, "R", false, 0, "")
-	pdf.CellFormat(95, 7, "Net Worth End:", "", 0, "", false, 0, "")
-	pdf.CellFormat(95, 7, fmtEUR(data.NetWorthEnd), "", 1, "R", false, 0, "")
-	pdf.CellFormat(95, 7, "Change:", "", 0, "", false, 0, "")
+	pdf.CellFormat(95, 7, tr("Net Worth Start:"), "", 0, "", false, 0, "")
+	pdf.CellFormat(95, 7, tr(fmtEUR(data.NetWorthStart)+" EUR"), "", 1, "R", false, 0, "")
+	pdf.CellFormat(95, 7, tr("Net Worth End:"), "", 0, "", false, 0, "")
+	pdf.CellFormat(95, 7, tr(fmtEUR(data.NetWorthEnd)+" EUR"), "", 1, "R", false, 0, "")
+	pdf.CellFormat(95, 7, tr("Change:"), "", 0, "", false, 0, "")
 	changePct := ""
 	if data.NetWorthChangePct != 0 {
 		changePct = fmt.Sprintf(" (%.1f%%)", data.NetWorthChangePct)
 	}
-	pdf.CellFormat(95, 7, fmtEUR(data.NetWorthChange)+changePct, "", 1, "R", false, 0, "")
-	pdf.CellFormat(95, 7, "Dividends Received:", "", 0, "", false, 0, "")
-	pdf.CellFormat(95, 7, fmtEUR(data.TotalDividends), "", 1, "R", false, 0, "")
-	pdf.CellFormat(95, 7, "Transactions:", "", 0, "", false, 0, "")
+	pdf.CellFormat(95, 7, tr(fmtEUR(data.NetWorthChange)+" EUR"+changePct), "", 1, "R", false, 0, "")
+	pdf.CellFormat(95, 7, tr("Dividends Received:"), "", 0, "", false, 0, "")
+	pdf.CellFormat(95, 7, tr(fmtEUR(data.TotalDividends)+" EUR"), "", 1, "R", false, 0, "")
+	pdf.CellFormat(95, 7, tr("Transactions:"), "", 0, "", false, 0, "")
 	pdf.CellFormat(95, 7, fmt.Sprintf("%d", data.NewTransactions), "", 1, "R", false, 0, "")
 	pdf.Ln(4)
 
 	// Top performers
 	if data.TopGainer != nil {
-		pdf.CellFormat(95, 7, "Top Gainer:", "", 0, "", false, 0, "")
-		pdf.CellFormat(95, 7, fmt.Sprintf("%s (+%.1f%%)", data.TopGainer.Name, data.TopGainer.ReturnPct), "", 1, "R", false, 0, "")
+		pdf.CellFormat(95, 7, tr("Top Gainer:"), "", 0, "", false, 0, "")
+		pdf.CellFormat(95, 7, tr(fmt.Sprintf("%s (+%.1f%%)", truncateRunes(data.TopGainer.Name, 35), data.TopGainer.ReturnPct)), "", 1, "R", false, 0, "")
 	}
 	if data.TopLoser != nil {
-		pdf.CellFormat(95, 7, "Top Loser:", "", 0, "", false, 0, "")
-		pdf.CellFormat(95, 7, fmt.Sprintf("%s (%.1f%%)", data.TopLoser.Name, data.TopLoser.ReturnPct), "", 1, "R", false, 0, "")
+		pdf.CellFormat(95, 7, tr("Top Loser:"), "", 0, "", false, 0, "")
+		pdf.CellFormat(95, 7, tr(fmt.Sprintf("%s (%.1f%%)", truncateRunes(data.TopLoser.Name, 35), data.TopLoser.ReturnPct)), "", 1, "R", false, 0, "")
 	}
 	pdf.Ln(6)
 
 	// Holdings table
 	if len(data.Holdings) > 0 {
 		pdf.SetFont("Helvetica", "B", 14)
-		pdf.CellFormat(0, 8, "Holdings", "", 1, "", false, 0, "")
+		pdf.CellFormat(0, 8, tr("Holdings"), "", 1, "", false, 0, "")
 
 		pdf.SetFont("Helvetica", "B", 9)
-		pdf.CellFormat(70, 6, "Name", "B", 0, "", false, 0, "")
-		pdf.CellFormat(30, 6, "Value", "B", 0, "R", false, 0, "")
-		pdf.CellFormat(25, 6, "Weight", "B", 0, "R", false, 0, "")
-		pdf.CellFormat(25, 6, "Return", "B", 1, "R", false, 0, "")
+		pdf.CellFormat(70, 6, tr("Name"), "B", 0, "", false, 0, "")
+		pdf.CellFormat(30, 6, tr("Value"), "B", 0, "R", false, 0, "")
+		pdf.CellFormat(25, 6, tr("Weight"), "B", 0, "R", false, 0, "")
+		pdf.CellFormat(25, 6, tr("Return"), "B", 1, "R", false, 0, "")
 
 		pdf.SetFont("Helvetica", "", 9)
 		for _, h := range data.Holdings {
-			name := h.Name
-			if len(name) > 35 {
-				name = name[:32] + "..."
-			}
-			pdf.CellFormat(70, 6, name, "", 0, "", false, 0, "")
-			pdf.CellFormat(30, 6, fmtEUR(h.Value), "", 0, "R", false, 0, "")
+			name := truncateRunes(h.Name, 35)
+			pdf.CellFormat(70, 6, tr(name), "", 0, "", false, 0, "")
+			pdf.CellFormat(30, 6, tr(fmtEUR(h.Value)), "", 0, "R", false, 0, "")
 			pdf.CellFormat(25, 6, fmt.Sprintf("%.1f%%", h.Weight), "", 0, "R", false, 0, "")
 			pdf.CellFormat(25, 6, fmt.Sprintf("%.1f%%", h.ReturnPct), "", 1, "R", false, 0, "")
 		}
@@ -369,10 +464,29 @@ func (h *ReportsHandler) HandleDownloadPDF(w http.ResponseWriter, r *http.Reques
 	// Footer
 	pdf.Ln(10)
 	pdf.SetFont("Helvetica", "I", 8)
-	pdf.CellFormat(0, 5, fmt.Sprintf("Generated %s by Wealth Tracker", rpt.GeneratedAt.Format("2006-01-02 15:04")), "", 0, "C", false, 0, "")
+	pdf.CellFormat(0, 5, tr(fmt.Sprintf("Generated %s by Wealth Tracker", rpt.GeneratedAt.Format("2006-01-02 15:04"))), "", 0, "C", false, 0, "")
+
+	if err := pdf.Error(); err != nil {
+		writeError(w, http.StatusInternalServerError, "generate pdf: "+err.Error())
+		return
+	}
+
+	var buf bytes.Buffer
+	if err := pdf.Output(&buf); err != nil {
+		writeError(w, http.StatusInternalServerError, "render pdf: "+err.Error())
+		return
+	}
 
 	filename := fmt.Sprintf("wealth-report-%s.pdf", rpt.PeriodLabel)
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
-	pdf.Output(w)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func truncateRunes(s string, max int) string {
+	runes := []rune(s)
+	if max <= 3 || len(runes) <= max {
+		return s
+	}
+	return string(runes[:max-3]) + "..."
 }

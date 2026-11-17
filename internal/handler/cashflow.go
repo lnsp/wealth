@@ -30,7 +30,7 @@ type monthlyBucket struct {
 	Month    string  `json:"month"` // YYYY-MM
 	Category string  `json:"category"`
 	Bucket   string  `json:"bucket"`
-	Amount   float64 `json:"amount"` // signed: income positive, spend negative
+	Amount   float64 `json:"amount"` // positive magnitude for income/fixed/variable; signed for transfer
 	Count    int     `json:"count"`
 }
 
@@ -129,14 +129,22 @@ func (h *CashflowHandler) HandleCashflow(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	fxRates := loadFXRatesMap(r.Context(), h.queries)
+	histFX := loadHistoricalFXRates(r.Context(), h.queries)
+
 	for _, row := range rows {
-		amount := numericToFloat(row.Amount)
+		rawAmt := convertAmountToEURAtDate(numericToFloat(row.Amount), row.Currency, row.Date, histFX, fxRates)
+		rawFee := convertAmountToEURAtDate(numericToFloat(row.Fee), row.Currency, row.Date, histFX, fxRates)
+		amount := txnSignedCashDelta(row.Type, false, rawAmt, rawFee, 0)
+		if amount == 0 {
+			continue
+		}
 		if interest, _, kind, ok := holdings.PaymentSplit(row.ID); ok {
 			interestCat := cashflow.CatHousing
 			if kind == assets.KindCar {
 				interestCat = cashflow.CatTransport
 			}
-			interestPart := math.Copysign(interest, amount)
+			interestPart := math.Copysign(math.Min(interest, math.Abs(amount)), amount)
 			add(row.Date, interestCat, interestPart)
 			add(row.Date, cashflow.CatLoanPrincipal, amount-interestPart)
 			continue
@@ -153,7 +161,17 @@ func (h *CashflowHandler) HandleCashflow(w http.ResponseWriter, r *http.Request)
 		if row.Category.Valid {
 			override = row.Category.String
 		}
-		add(row.Date, cashflow.ResolveCategory(override, row.Type, cp, ref), amount)
+		cat := cashflow.ResolveCategory(override, row.Type, cp, ref)
+		// Positive bank inflows (deposits/refunds) without an explicit user override
+		// that did not match salary/interest/internal should roll up as income/refund
+		// rather than negative spending.
+		if amount > 0 && override == "" {
+			b := cashflow.BucketOf(cat)
+			if b == cashflow.BucketFixed || b == cashflow.BucketVariable {
+				cat = cashflow.CatRefund
+			}
+		}
+		add(row.Date, cat, amount)
 	}
 
 	// Build month list, newest first, including months with zero activity.
@@ -162,21 +180,30 @@ func (h *CashflowHandler) HandleCashflow(w http.ResponseWriter, r *http.Request)
 	for i := 0; i < months; i++ {
 		mkey := cursor.Format("2006-01")
 		if t, ok := totals[mkey]; ok {
+			if t.Fixed < 0 {
+				t.Fixed = 0
+			}
+			if t.Variable < 0 {
+				t.Variable = 0
+			}
 			t.Net = t.Income - t.Fixed - t.Variable
 			monthsList = append(monthsList, *t)
 		} else {
 			monthsList = append(monthsList, monthlyTotals{Month: mkey})
 		}
-		cursor = cursor.AddDate(0, -1, 0)
+		cursor = addMonthsFirstOfMonth(cursor, -1)
 	}
 
 	// Flatten bucket map to slice, newest first, then by category.
 	buckets := make([]monthlyBucket, 0, len(agg))
 	for _, b := range agg {
-		// Buckets store the signed amount; convert spend buckets to absolute
-		// for the frontend's donut math (it wants magnitudes).
+		// Buckets store the signed amount; convert spend buckets to positive
+		// magnitudes for the frontend's donut math (it requires b.amount > 0).
 		if b.Bucket == string(cashflow.BucketFixed) || b.Bucket == string(cashflow.BucketVariable) {
 			b.Amount = -b.Amount
+			if b.Amount < 0 {
+				b.Amount = 0
+			}
 		}
 		buckets = append(buckets, *b)
 	}
@@ -195,8 +222,12 @@ func (h *CashflowHandler) HandleCashflow(w http.ResponseWriter, r *http.Request)
 }
 
 func computeMedians(months []monthlyTotals) medianSummary {
+	trailing := months
+	if len(trailing) > 12 {
+		trailing = trailing[:12]
+	}
 	var incomes, spends []float64
-	for _, m := range months {
+	for _, m := range trailing {
 		if m.Income > 0 {
 			incomes = append(incomes, m.Income)
 			spends = append(spends, m.Fixed+m.Variable)

@@ -1471,8 +1471,9 @@ func (s *Scheduler) backfillNetWorthSnapshots() error {
 		log.Printf("WARNING: backfill snapshots: load assets: %v", err)
 	}
 
-	// Replay transactions to build running state
-	acctCash := make(map[uuid.UUID]float64)
+	// Replay transactions to build running state. Cash stays in each
+	// transaction's currency and is converted at every day's FX.
+	acctCash := make(cashLedger)
 	type holdingState struct {
 		quantity  float64
 		totalCost float64
@@ -1481,13 +1482,14 @@ func (s *Scheduler) backfillNetWorthSnapshots() error {
 
 	// Build a map of transactions by date for efficient lookup
 	type txnEvent struct {
-		accID  uuid.UUID
-		typ    string
-		isin   string
-		amtEUR float64
-		feeEUR float64
-		taxEUR float64
-		qty    float64
+		accID    uuid.UUID
+		typ      string
+		isin     string
+		currency string
+		cash     float64 // signed cash effect in currency
+		amtEUR   float64 // EUR at the transaction date, for the cost-basis fallback
+		feeEUR   float64
+		qty      float64
 	}
 	txnsByDate := make(map[string][]txnEvent)
 	for _, txn := range txns {
@@ -1497,13 +1499,14 @@ func (s *Scheduler) backfillNetWorthSnapshots() error {
 			isin = txn.SecurityISIN.String
 		}
 		txnsByDate[dateKey] = append(txnsByDate[dateKey], txnEvent{
-			accID:  txn.AccountID,
-			typ:    txn.Type,
-			isin:   isin,
-			amtEUR: toEURAt(numericToFloat(txn.Amount), txn.Currency, txn.Date),
-			feeEUR: toEURAt(numericToFloat(txn.Fee), txn.Currency, txn.Date),
-			taxEUR: toEURAt(numericToFloat(txn.Tax), txn.Currency, txn.Date),
-			qty:    numericToFloat(txn.Quantity),
+			accID:    txn.AccountID,
+			typ:      txn.Type,
+			isin:     isin,
+			currency: txn.Currency,
+			cash:     snapshotCashDelta(txn.Type, isin != "", numericToFloat(txn.Amount), numericToFloat(txn.Fee), numericToFloat(txn.Tax)),
+			amtEUR:   math.Abs(toEURAt(numericToFloat(txn.Amount), txn.Currency, txn.Date)),
+			feeEUR:   math.Abs(toEURAt(numericToFloat(txn.Fee), txn.Currency, txn.Date)),
+			qty:      numericToFloat(txn.Quantity),
 		})
 	}
 
@@ -1563,13 +1566,27 @@ func (s *Scheduler) backfillNetWorthSnapshots() error {
 		txnsByDate[r.date] = filtered
 	}
 
-	// Iterate day-by-day from first transaction to yesterday in UTC.
-	// Today's snapshot is handled by updateNetWorthSnapshot which uses
-	// live prices and actual cash balances for higher accuracy.
-	startDate := txns[0].Date
+	// Iterate day-by-day from the first transaction (or the first property,
+	// vehicle or loan, if earlier) to yesterday in UTC. Today's snapshot is
+	// handled by updateNetWorthSnapshot which uses live prices and actual
+	// cash balances for higher accuracy.
+	startDate := backfillStartDate(txns[0].Date, physical)
 	start := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
 	today := time.Now().UTC()
 	end := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -1)
+
+	// Nothing tracked existed before start: rows there are leftovers (all
+	// zero on the seed, 2016-08 → 2022-12) that made "All" charts start years
+	// before the first transaction.
+	if n, err := s.queries.DeleteNetWorthSnapshotsBefore(ctx, start); err != nil {
+		log.Printf("WARNING: backfill snapshots: delete before %s: %v", start.Format("2006-01-02"), err)
+	} else if n > 0 {
+		log.Printf("backfill snapshots: removed %d snapshots before %s", n, start.Format("2006-01-02"))
+	}
+
+	clampCash := func(accID uuid.UUID) bool {
+		return !acctHasExplicitCash[accID] && isSecuritiesOnlyAccountType(accTypes[accID])
+	}
 
 	snapshots := 0
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
@@ -1577,15 +1594,10 @@ func (s *Scheduler) backfillNetWorthSnapshots() error {
 
 		// Apply transactions for this day
 		for _, ev := range txnsByDate[dateKey] {
+			acctCash.add(ev.accID, ev.currency, ev.cash)
 			switch ev.typ {
-			case "deposit", "interest", "cash_transfer_in":
-				acctCash[ev.accID] += ev.amtEUR - ev.feeEUR - ev.taxEUR
-			case "withdrawal", "fee", "tax", "cash_transfer_out":
-				acctCash[ev.accID] -= ev.amtEUR + ev.feeEUR + ev.taxEUR
 			case "transfer":
-				if ev.isin == "" {
-					acctCash[ev.accID] -= ev.amtEUR + ev.feeEUR + ev.taxEUR
-				} else {
+				if ev.isin != "" {
 					h, ok := holdings[ev.isin]
 					if !ok {
 						h = &holdingState{}
@@ -1608,7 +1620,6 @@ func (s *Scheduler) backfillNetWorthSnapshots() error {
 					}
 				}
 			case "buy", "savings_plan":
-				acctCash[ev.accID] -= ev.amtEUR + ev.feeEUR + ev.taxEUR
 				if ev.isin != "" {
 					h, ok := holdings[ev.isin]
 					if !ok {
@@ -1619,7 +1630,6 @@ func (s *Scheduler) backfillNetWorthSnapshots() error {
 					h.totalCost += ev.amtEUR + ev.feeEUR
 				}
 			case "sell":
-				acctCash[ev.accID] += ev.amtEUR - ev.feeEUR - ev.taxEUR
 				if ev.isin != "" {
 					h, ok := holdings[ev.isin]
 					if ok && h.quantity > 0 {
@@ -1632,18 +1642,12 @@ func (s *Scheduler) backfillNetWorthSnapshots() error {
 						}
 					}
 				}
-			case "dividend":
-				acctCash[ev.accID] += ev.amtEUR - ev.feeEUR - ev.taxEUR
 			}
 		}
 
-		cashBalance := 0.0
-		for accID, bal := range acctCash {
-			if bal < 0 && !acctHasExplicitCash[accID] && isSecuritiesOnlyAccountType(accTypes[accID]) {
-				bal = 0
-			}
-			cashBalance += bal
-		}
+		cashBalance := acctCash.eur(func(amount float64, currency string) float64 {
+			return toEURAt(amount, currency, d)
+		}, clampCash)
 
 		// Compute investment value using market prices, converting to EUR
 		investmentValue := 0.0

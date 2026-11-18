@@ -27,6 +27,35 @@ export function institutionLabel(institution: string): string {
   return institutionLabels[institution] || labelFor(institution);
 }
 
+/** Statutory deposit insurance per depositor and bank (EU: Einlagensicherung). */
+export const DEPOSIT_INSURANCE_LIMIT = 100_000;
+/** "Near limit" from here, to leave room to react before the limit. */
+export const DEPOSIT_INSURANCE_NEAR = 90_000;
+/** US brokers: cash is protected by SIPC, not by EU deposit insurance. */
+const SIPC_INSTITUTIONS = new Set(['morgan_stanley']);
+
+export interface DepositProtection {
+  /** Scheme name for the label: "Einlagensicherung", "Institutssicherung" or "SIPC". */
+  scheme: string;
+  /** EUR limit the status is judged against; null when it is not a EUR limit (SIPC). */
+  limit: number | null;
+  status: 'ok' | 'near' | 'over' | 'other';
+}
+
+/**
+ * How a bank's or broker's cash (in EUR, all accounts there together) is
+ * protected. One rule for the whole app: covered below 90k, near the limit
+ * from 90k, over the limit above 100k. Savings banks are covered by their
+ * Institutssicherung; US brokers by SIPC (US$ 250,000 for cash), which is
+ * not EU deposit insurance and is not judged against the EUR limit.
+ */
+export function depositProtection(institution: string, cashEUR: number): DepositProtection {
+  if (SIPC_INSTITUTIONS.has(institution)) return { scheme: 'SIPC', limit: null, status: 'other' };
+  const scheme = institution === 'sparkasse' ? 'Institutssicherung' : 'Einlagensicherung';
+  const status = cashEUR > DEPOSIT_INSURANCE_LIMIT ? 'over' : cashEUR >= DEPOSIT_INSURANCE_NEAR ? 'near' : 'ok';
+  return { scheme, limit: DEPOSIT_INSURANCE_LIMIT, status };
+}
+
 export default function AccountCard({ account, sparklineData, sparklineLabel, institutionCashTotal }: Props) {
   const tc = useThemeColors();
   // /api/accounts returns balance / cash_balance / holdings_value already
@@ -105,24 +134,24 @@ export default function AccountCard({ account, sparklineData, sparklineLabel, in
         )}
       </div>
 
-      {/* Deposit insurance indicator for cash accounts. Thresholds: under 90k
-          covered, 90k–100k approaching, above 100k over the limit. The 100k
-          cap is the EU statutory deposit-protection limit per institution per
-          depositor; the 90k band leaves a buffer to react. */}
+      {/* Deposit protection for cash accounts, by the shared rule in depositProtection. */}
       {(account.type === 'checking' || account.type === 'savings') && institutionCashTotal != null && institutionCashTotal > 0 && (() => {
-        const limit = 100_000;
-        const amberFloor = 90_000;
-        const scheme = account.institution === 'sparkasse' ? 'Institutssicherung' : 'Einlagensicherung';
-        const status: 'ok' | 'near' | 'over' =
-          institutionCashTotal > limit ? 'over' :
-          institutionCashTotal >= amberFloor ? 'near' : 'ok';
+        const p = depositProtection(account.institution, institutionCashTotal);
+        if (p.limit === null) {
+          return (
+            <p className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-ink-muted">
+              <Chip>{p.scheme}</Chip>
+              <span>Cash is protected by {p.scheme} (US), not by EU deposit insurance</span>
+            </p>
+          );
+        }
         return (
           <p className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-ink-muted">
-            <Chip tone={status === 'over' ? 'danger' : status === 'near' ? 'warning' : 'success'}>
-              {status === 'over' ? 'Over limit' : status === 'near' ? 'Near limit' : 'Covered'}
+            <Chip tone={p.status === 'over' ? 'danger' : p.status === 'near' ? 'warning' : 'success'}>
+              {p.status === 'over' ? 'Over limit' : p.status === 'near' ? 'Near limit' : 'Covered'}
             </Chip>
             <span>
-              Deposit insurance ({scheme}): <span data-privacy="blur">{fmtEUR(institutionCashTotal)}</span> of {fmtEUR(limit)} at this institution
+              Deposit insurance ({p.scheme}): <span data-privacy="blur">{fmtEUR(institutionCashTotal)}</span> of {fmtEUR(p.limit)} at this institution
             </span>
           </p>
         );

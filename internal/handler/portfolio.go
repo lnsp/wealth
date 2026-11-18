@@ -277,12 +277,16 @@ func (h *PortfolioHandler) HandleHoldings(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// maxNetWorthSnapshotRows bounds how many daily snapshots one request reads:
+// 100 years, so "All" (days=9999) is never truncated.
+const maxNetWorthSnapshotRows = 36600
+
 func (h *PortfolioHandler) HandleNetWorth(w http.ResponseWriter, r *http.Request) {
 	limit := int32(365)
 	if l := r.URL.Query().Get("days"); l != "" {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 {
-			if n > 5000 {
-				n = 5000
+			if n > maxNetWorthSnapshotRows {
+				n = maxNetWorthSnapshotRows
 			}
 			limit = int32(n)
 		}
@@ -1494,6 +1498,10 @@ func (h *PortfolioHandler) HandleSetTargetAllocation(w http.ResponseWriter, r *h
 }
 
 // HandleGoalsProgress returns financial goals with current progress and on-track status.
+// Progress is measured against each goal's funding account, or a priority-
+// ordered share of liquid wealth (see computeGoalsProgress) — never total net
+// worth, which would count the same euros, the pension and the property
+// towards every goal.
 func (h *PortfolioHandler) HandleGoalsProgress(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1507,98 +1515,37 @@ func (h *PortfolioHandler) HandleGoalsProgress(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Get current net worth
-	snaps, err := h.queries.ListNetWorthSnapshots(ctx, 1)
-	if err != nil || len(snaps) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"goals": []any{}})
+	// Account balances exactly as /portfolio/accounts reports them: cash plus
+	// holdings at the latest price, in EUR.
+	accounts, err := h.queries.ListAccounts(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list accounts: "+err.Error())
 		return
 	}
-	currentValue := 0.0
-	if snaps[0].Total.Valid {
-		f, _ := snaps[0].Total.Float64Value()
-		currentValue = f.Float64
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	cashByAcct, err := computeAllAccountCashEUR(ctx, h.queries, accounts, fxRates)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "account cash: "+err.Error())
+		return
+	}
+	holdings, err := h.queries.ListCurrentHoldings(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list holdings: "+err.Error())
+		return
+	}
+	prices := h.loadPriceMap(ctx)
+	balances := make(map[uuid.UUID]goalAccount, len(accounts))
+	for _, a := range accounts {
+		balances[a.ID] = goalAccount{Type: a.Type, Balance: cashByAcct[a.ID]}
+	}
+	for _, hld := range holdings {
+		if b, ok := balances[hld.AccountID]; ok {
+			b.Balance += holdingValueEURFromMap(hld, prices, fxRates)
+			balances[hld.AccountID] = b
+		}
 	}
 
-	now := time.Now()
-
-	type goalProgress struct {
-		ID                  string  `json:"id"`
-		Name                string  `json:"name"`
-		TargetAmount        float64 `json:"target_amount"`
-		TargetDate          string  `json:"target_date"`
-		CurrentValue        float64 `json:"current_value"`
-		ProgressPct         float64 `json:"progress_pct"`
-		ProjectedValue      float64 `json:"projected_value"`
-		MonthlyContribution float64 `json:"monthly_contribution"`
-		AssumedReturnPct    float64 `json:"assumed_return_pct"`
-		Status              string  `json:"status"` // "on_track", "behind", "complete", "ahead"
-		MonthsRemaining     int     `json:"months_remaining"`
-	}
-
-	var results []goalProgress
-	for _, g := range goals {
-		target := numericToFloat(g.TargetAmount)
-		monthly := numericToFloat(g.MonthlyContribution)
-		annualReturn := numericToFloat(g.AssumedReturnPct) / 100.0
-
-		// Months until target date
-		months := int(g.TargetDate.Sub(now).Hours() / (24 * 30.44))
-		if months < 0 {
-			months = 0
-		}
-
-		// Project future value: compound growth + monthly contributions
-		// FV = PV × (1+r)^n + PMT × ((1+r)^n - 1) / r
-		if annualReturn <= -0.9999 {
-			annualReturn = -0.9999
-		}
-		monthlyReturn := math.Pow(1+annualReturn, 1.0/12.0) - 1
-		n := float64(months)
-		projected := currentValue
-		if math.Abs(monthlyReturn) > 1e-9 && n > 0 {
-			growthFactor := math.Pow(1+monthlyReturn, n)
-			if !math.IsNaN(growthFactor) && !math.IsInf(growthFactor, 0) {
-				projected = currentValue*growthFactor + monthly*(growthFactor-1)/monthlyReturn
-			}
-		} else if n > 0 {
-			projected = currentValue + monthly*n
-		}
-		if math.IsNaN(projected) || math.IsInf(projected, 0) {
-			projected = currentValue
-		}
-
-		progressPct := 0.0
-		if target > 0 {
-			progressPct = (currentValue / target) * 100
-		}
-
-		status := "on_track"
-		if currentValue >= target {
-			status = "complete"
-		} else if months == 0 {
-			status = "behind"
-		} else if projected >= target*1.1 {
-			status = "ahead"
-		} else if projected < target*0.8 {
-			status = "behind"
-		}
-
-		results = append(results, goalProgress{
-			ID:                  g.ID.String(),
-			Name:                g.Name,
-			TargetAmount:        target,
-			TargetDate:          g.TargetDate.Format("2006-01-02"),
-			CurrentValue:        math.Round(currentValue*100) / 100,
-			ProgressPct:         math.Round(progressPct*10) / 10,
-			ProjectedValue:      math.Round(projected*100) / 100,
-			MonthlyContribution: monthly,
-			AssumedReturnPct:    numericToFloat(g.AssumedReturnPct),
-			Status:              status,
-			MonthsRemaining:     months,
-		})
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"goals": results})
+	writeJSON(w, http.StatusOK, map[string]any{"goals": computeGoalsProgress(goals, balances, time.Now())})
 }
 
 // rebalanceHolding is the minimal view computeRebalanceTrades needs from a
@@ -2469,7 +2416,12 @@ func (h *PortfolioHandler) HandleSavingsRate(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// HandleAttribution computes per-holding contribution to daily change.
+// HandleAttribution explains the change between the two latest net-worth
+// snapshots (the hero's "today"). Each holding is priced at both snapshot
+// dates, each at that date's FX, which is how the snapshots themselves value
+// it; flows are the transactions dated in between; the rest — FX on foreign
+// cash, property revaluation, loan steps — is "other". The four parts add up
+// to the snapshot change by construction.
 func (h *PortfolioHandler) HandleAttribution(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	holdings, err := h.queries.ListCurrentHoldings(ctx)
@@ -2477,6 +2429,17 @@ func (h *PortfolioHandler) HandleAttribution(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "list holdings: "+err.Error())
 		return
 	}
+	snaps, err := h.queries.ListNetWorthSnapshots(ctx, 2)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list snapshots: "+err.Error())
+		return
+	}
+	contribs := []attributionContribution{} // never nil: serialises as [] so clients can read .length
+	if len(snaps) < 2 {
+		writeJSON(w, http.StatusOK, map[string]any{"contributions": contribs, "total_change": 0, "summary": ""})
+		return
+	}
+	to, from := snaps[0], snaps[1]
 
 	secs, _ := h.queries.ListSecurities(ctx)
 	secNames := make(map[string]string)
@@ -2484,46 +2447,33 @@ func (h *PortfolioHandler) HandleAttribution(w http.ResponseWriter, r *http.Requ
 		secNames[s.ISIN] = s.Name
 	}
 
-	type contribution struct {
-		ISIN   string  `json:"isin"`
-		Name   string  `json:"name"`
-		Change float64 `json:"change"`
-	}
-
 	// Aggregate by ISIN
 	agg := make(map[string]float64) // ISIN -> qty
 	for _, h := range holdings {
-		if h.Quantity.Valid {
-			f, _ := h.Quantity.Float64Value()
-			agg[h.SecurityISIN] += f.Float64
-		}
+		agg[h.SecurityISIN] += numericToFloat(h.Quantity)
 	}
 
-	// Estimate daily change per holding from price history (converted to EUR)
 	fxRates := loadFXRatesMap(ctx, h.queries)
-	contribs := []contribution{} // never nil: serialises as [] so clients can read .length
-	totalChange := 0.0
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	marketChange := 0.0
 	for isin, qty := range agg {
+		if qty <= 0 {
+			continue
+		}
 		priceRows, err := h.queries.ListPriceHistory(ctx, isin)
-		if err != nil || len(priceRows) < 2 {
+		if err != nil {
 			continue
 		}
-		latest := priceRows[len(priceRows)-1]
-		prev := priceRows[len(priceRows)-2]
-		if !latest.Close.Valid || !prev.Close.Valid {
+		change, ok := holdingMoveEUR(priceRows, qty, from.Date, to.Date, histFX, fxRates)
+		if !ok {
 			continue
 		}
-		lf, _ := latest.Close.Float64Value()
-		pf, _ := prev.Close.Float64Value()
-		latestEUR := convertAmountToEUR(lf.Float64, latest.Currency, fxRates)
-		prevEUR := convertAmountToEUR(pf.Float64, prev.Currency, fxRates)
-		change := (latestEUR - prevEUR) * qty
-		totalChange += change
+		marketChange += change
 		name := secNames[isin]
 		if name == "" {
 			name = isin
 		}
-		contribs = append(contribs, contribution{
+		contribs = append(contribs, attributionContribution{
 			ISIN: isin, Name: name, Change: math.Round(change*100) / 100,
 		})
 	}
@@ -2533,28 +2483,33 @@ func (h *PortfolioHandler) HandleAttribution(w http.ResponseWriter, r *http.Requ
 		return math.Abs(contribs[i].Change) > math.Abs(contribs[j].Change)
 	})
 
-	// Generate summary sentence
-	summary := ""
-	if len(contribs) > 0 {
-		top := contribs[0]
-		if len(contribs) >= 2 {
-			second := contribs[1]
-			if top.Change >= 0 && second.Change >= 0 {
-				summary = fmt.Sprintf("Driven by %s (+%s EUR) and %s (+%s EUR)", top.Name, fmtEUR(top.Change), second.Name, fmtEUR(second.Change))
-			} else if top.Change >= 0 && second.Change < 0 {
-				summary = fmt.Sprintf("Driven by %s (+%s EUR), offset by %s (-%s EUR)", top.Name, fmtEUR(top.Change), second.Name, fmtEUR(-second.Change))
-			} else {
-				summary = fmt.Sprintf("Dragged by %s (-%s EUR) and %s (-%s EUR)", top.Name, fmtEUR(-top.Change), second.Name, fmtEUR(-second.Change))
-			}
-		} else {
-			summary = fmt.Sprintf("Driven by %s (%+.0f EUR)", top.Name, top.Change)
+	// Real flows between the two snapshots, classified as in the waterfall.
+	flows, income := 0.0, 0.0
+	if txns, err := listAllTransactionsRows(ctx, h.queries); err == nil {
+		accts, _ := h.queries.ListAccounts(ctx)
+		chrono := make([]db.ListTransactionsRow, len(txns))
+		for i := range txns {
+			chrono[i] = txns[len(txns)-1-i]
 		}
+		physical := h.loadPhysicalAttribution(ctx, txns, histFX, fxRates)
+		implicit := computeImplicitCashClampEvents(accts, chrono, histFX, fxRates)
+		flows, income = netWorthFlows(txns, inKindWashSet(txns), physical.linked, implicit, from.Date, to.Date, histFX, fxRates)
 	}
 
+	netChange := numericToFloat(to.Total) - numericToFloat(from.Total)
+	round := func(v float64) float64 { return math.Round(v*100) / 100 }
 	writeJSON(w, http.StatusOK, map[string]any{
 		"contributions": contribs,
-		"total_change":  math.Round(totalChange*100) / 100,
-		"summary":       summary,
+		// total_change is the market move on held securities (price and FX).
+		"total_change":  round(marketChange),
+		"market_change": round(marketChange),
+		"flows":         round(flows),
+		"income":        round(income),
+		"other":         round(netChange - marketChange - flows - income),
+		"net_change":    round(netChange),
+		"from_date":     from.Date.Format("2006-01-02"),
+		"to_date":       to.Date.Format("2006-01-02"),
+		"summary":       attributionSummary(contribs),
 	})
 }
 
@@ -2735,6 +2690,9 @@ func (h *PortfolioHandler) HandleNextActions(w http.ResponseWriter, r *http.Requ
 		Urgency  string  `json:"urgency"`  // now, this-month, this-quarter
 		Category string  `json:"category"` // tax, rebalance, savings, cost, risk
 		Link     string  `json:"link"`
+		// ImpactKind says what impact_eur is: "saving" (money gained or tax
+		// avoided) or "cost" (money that will leave, e.g. a tax debit).
+		ImpactKind string `json:"impact_kind"`
 	}
 	var actions []action
 
@@ -2743,6 +2701,15 @@ func (h *PortfolioHandler) HandleNextActions(w http.ResponseWriter, r *http.Requ
 	if monthsElapsed < 1 {
 		monthsElapsed = 1
 	}
+
+	// Tax settings live in the browser (Tax tools); the page passes them on.
+	churchTax := 0.0
+	if v, err := strconv.ParseFloat(r.URL.Query().Get("church_tax"), 64); err == nil && !math.IsNaN(v) {
+		churchTax = v
+	}
+	joint := r.URL.Query().Get("joint") == "1"
+	taxRate := analytics.CapitalIncomeTaxRate(churchTax)
+	allowance := analytics.SparerPauschbetragForYear(now.Year(), joint)
 
 	// --- Batch-load all data upfront ---
 	holdings, _ := h.queries.ListCurrentHoldings(ctx)
@@ -2835,28 +2802,56 @@ func (h *PortfolioHandler) HandleNextActions(w http.ResponseWriter, r *http.Requ
 		li.costBasis += lot.CostBasis
 		li.value += lot.CurrentValue
 	}
+	// A realised loss saves tax this year only against gains realised this
+	// year in a pot it may offset, and only above the Sparer-Pauschbetrag.
+	// §23 assets (crypto, gold) are outside capital income and skipped.
+	lossPots := analytics.ComputeLossPots(taxTxns)
+	incomeYTD := capitalIncomeFromPots(lossPots, now.Year())
+	var harvest []harvestCandidate
+	harvestPct := make(map[string]float64)
 	for isin, li := range lossByISIN {
 		if li.totalPL >= -100 || li.costBasis <= 0 {
 			continue
 		}
 		lossPct := li.totalPL / li.costBasis * 100
-		if lossPct > -5 {
+		if lossPct > -5 || analytics.IsPrivateSaleAssetClass(secMap[isin].AssetClass) {
 			continue
 		}
-		taxableGain := math.Abs(li.totalPL) * (1 - tfsMap[isin])
-		saving := taxableGain * analytics.EffectiveTaxRate
+		harvestPct[isin] = lossPct
+		harvest = append(harvest, harvestCandidate{
+			ISIN: isin, Name: li.name, Loss: -li.totalPL, TFS: tfsMap[isin],
+			Share: analytics.IsShareAssetClass(secMap[isin].AssetClass),
+		})
+	}
+	sort.Slice(harvest, func(i, j int) bool {
+		if harvest[i].Loss != harvest[j].Loss {
+			return harvest[i].Loss > harvest[j].Loss
+		}
+		return harvest[i].ISIN < harvest[j].ISIN
+	})
+	for i, saving := range harvestSavings(harvest, incomeYTD, allowance, taxRate) {
+		if saving < 1 {
+			continue // nothing realised this year for it to offset
+		}
+		c := harvest[i]
+		offsets := "this year's realised gains"
+		if c.Share {
+			offsets = "this year's realised share gains (share losses offset nothing else)"
+		}
 		actions = append(actions, action{
-			Title:    "Harvest tax loss: " + li.name,
-			Detail:   fmt.Sprintf("Down %s EUR (%.1f%%). Selling and rebuying could save ~%s EUR in tax.", fmtEUR(li.totalPL), lossPct, fmtEUR(saving)),
-			Impact:   math.Round(saving),
-			Urgency:  "this-quarter",
-			Category: "tax",
-			Link:     "/analysis",
+			Title:      "Harvest tax loss: " + c.Name,
+			Detail:     fmt.Sprintf("Down %s EUR (%.1f%%). Selling now offsets %s and saves about %s EUR in tax; the position can be bought back.", fmtEUR(-c.Loss), harvestPct[c.ISIN], offsets, fmtEUR(saving)),
+			Impact:     math.Round(saving),
+			ImpactKind: "saving",
+			Urgency:    "this-quarter",
+			Category:   "tax",
+			Link:       "/analysis",
 		})
 	}
 
 	// --- 2. Loss Pot Netting (carry-forward losses that can offset future gains) ---
-	lossPots := analytics.ComputeLossPots(taxTxns)
+	// Using the pot now rather than later mostly moves tax in time (the losses
+	// never expire, and the gains' cost basis steps up), so no saving is shown.
 	if len(lossPots) > 0 {
 		latest := lossPots[len(lossPots)-1]
 		unusedLoss := 0.0
@@ -2867,14 +2862,14 @@ func (h *PortfolioHandler) HandleNextActions(w http.ResponseWriter, r *http.Requ
 			unusedLoss += math.Abs(latest.CarryForwardGeneral)
 		}
 		if unusedLoss > 100 {
-			taxSaved := unusedLoss * analytics.EffectiveTaxRate
 			actions = append(actions, action{
-				Title:    "Use loss carry-forward",
-				Detail:   fmt.Sprintf("%s EUR in carry-forward losses available. Realizing gains up to this amount would be tax-free (saves ~%s EUR).", fmtEUR(unusedLoss), fmtEUR(taxSaved)),
-				Impact:   math.Round(taxSaved),
-				Urgency:  "this-quarter",
-				Category: "tax",
-				Link:     "/analysis",
+				Title:      "Use loss carry-forward",
+				Detail:     fmt.Sprintf("%s EUR in carry-forward losses available. Gains realised up to this amount are tax-free now; this shifts tax to later rather than saving it.", fmtEUR(unusedLoss)),
+				Impact:     0,
+				ImpactKind: "saving",
+				Urgency:    "this-quarter",
+				Category:   "tax",
+				Link:       "/analysis",
 			})
 		}
 	}
@@ -2913,6 +2908,8 @@ func (h *PortfolioHandler) HandleNextActions(w http.ResponseWriter, r *http.Requ
 	}
 
 	// --- 4. FSA Utilization ---
+	// Dividends and interest so far this year, extrapolated to December on
+	// top of everything realised (incomeYTD already holds them once).
 	ytdIncome := 0.0
 	for _, txn := range txns {
 		if txn.Date.Year() != now.Year() {
@@ -2933,22 +2930,42 @@ func (h *PortfolioHandler) HandleNextActions(w http.ResponseWriter, r *http.Requ
 			}
 		}
 	}
-	projected := ytdIncome / monthsElapsed * 12
-	if projected < analytics.Sparerpauschbetrag*0.8 {
-		unused := analytics.Sparerpauschbetrag - projected
-		forfeited := unused * analytics.EffectiveTaxRate
-		urgency := "this-quarter"
-		if now.Month() >= 10 {
-			urgency = "this-month" // year-end approaching
+	expected := incomeYTD
+	expected.otherRaw += ytdIncome * (12/monthsElapsed - 1)
+	projected := expected.taxable() // realised gains (not extrapolated) + dividends and interest
+	if projected < allowance*0.8 {
+		// The unused allowance is worth something only if there are gains to
+		// realise into it: those become tax-free for good.
+		shareGains, otherGains := 0.0, 0.0
+		for _, lot := range lots {
+			if lot.UnrealizedPL <= 0 || prices[lot.ISIN] <= 0 {
+				continue
+			}
+			ac := secMap[lot.ISIN].AssetClass
+			switch {
+			case analytics.IsPrivateSaleAssetClass(ac):
+			case analytics.IsShareAssetClass(ac):
+				shareGains += lot.UnrealizedPL
+			default:
+				otherGains += lot.UnrealizedPL * (1 - tfsMap[lot.ISIN])
+			}
 		}
-		actions = append(actions, action{
-			Title:    "Optimize Freistellungsauftrag",
-			Detail:   fmt.Sprintf("Projected %s EUR of 1.000 EUR used. ~%s EUR in tax-free allowance may be wasted.", fmtEUR(projected), fmtEUR(unused)),
-			Impact:   math.Round(forfeited),
-			Urgency:  urgency,
-			Category: "tax",
-			Link:     "/analysis",
-		})
+		room := allowanceGainRoom(expected, shareGains, otherGains, allowance)
+		if worth := room * taxRate; worth >= 1 {
+			urgency := "this-quarter"
+			if now.Month() >= 10 {
+				urgency = "this-month" // year-end approaching
+			}
+			actions = append(actions, action{
+				Title:      "Use the rest of your Sparer-Pauschbetrag",
+				Detail:     fmt.Sprintf("Projected %s EUR of your %s EUR allowance used in %d. Realising gains worth about %s EUR of taxable income before 31 December would use the rest tax-free.", fmtEUR(projected), fmtEUR(allowance), now.Year(), fmtEUR(room)),
+				Impact:     math.Round(worth),
+				ImpactKind: "saving",
+				Urgency:    urgency,
+				Category:   "tax",
+				Link:       "/analysis",
+			})
+		}
 	}
 
 	// --- 5. Concentration Risk ---
@@ -3013,31 +3030,27 @@ func (h *PortfolioHandler) HandleNextActions(w http.ResponseWriter, r *http.Requ
 	}
 
 	// --- 8. Vorabpauschale Preparation (Oct-Dec) ---
+	// Same § 18 InvStG computation as the Tax page: 1 January value, pro-rated
+	// mid-year buys, capped at the year's actual increase plus distributions.
 	if now.Month() >= 10 {
-		fundValue := 0.0
-		basiszins, hasBasiszins := analytics.BasiszinsByYear[now.Year()]
-		if !hasBasiszins {
-			basiszins = 2.5
+		curVal := make(map[string]float64)
+		curQty := make(map[string]float64)
+		for _, hv := range hvs {
+			curVal[hv.isin] += hv.value
+			curQty[hv.isin] += hv.qty
 		}
-		tax := 0.0
-		if basiszins > 0 {
-			for _, hv := range hvs {
-				sec := secMap[hv.isin]
-				if sec.AssetClass == "etf" || sec.AssetClass == "fund" {
-					fundValue += hv.value
-					basisertrag := hv.value * basiszins / 100 * 0.7
-					tax += basisertrag * (1 - tfsMap[hv.isin]) * analytics.EffectiveTaxRate
-				}
-			}
-		}
-		if fundValue > 10000 && tax > 10 {
+		entries := (&AnalysisHandler{queries: h.queries}).computeYearVorabpauschale(ctx, now.Year(), txns, secMap, tfsMap, curVal, curQty, histFX, fxRates)
+		nextAllowance := analytics.SparerPauschbetragForYear(now.Year()+1, joint)
+		vpTaxable, tax := vorabpauschaleTax(entries, tfsMap, nextAllowance, taxRate)
+		if tax > 10 {
 			actions = append(actions, action{
-				Title:    "Prepare for Vorabpauschale",
-				Detail:   fmt.Sprintf("~%s EUR in Vorabpauschale tax due Jan 2. Ensure sufficient cash in brokerage account.", fmtEUR(tax)),
-				Impact:   math.Round(tax),
-				Urgency:  "this-month",
-				Category: "tax",
-				Link:     "/analysis",
+				Title:      "Prepare for Vorabpauschale",
+				Detail:     fmt.Sprintf("Your funds' Vorabpauschale for %d is about %s EUR taxable. Beyond the %s EUR Sparer-Pauschbetrag for %d, about %s EUR tax will be debited in early January. Keep that much cash in the brokerage account.", now.Year(), fmtEUR(vpTaxable), fmtEUR(nextAllowance), now.Year()+1, fmtEUR(tax)),
+				Impact:     math.Round(tax),
+				ImpactKind: "cost",
+				Urgency:    "this-month",
+				Category:   "tax",
+				Link:       "/analysis",
 			})
 		}
 	}
@@ -4190,7 +4203,7 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 	// returns DESC date order, so the first hit per month is end-of-month).
 	// Using max here previously caused the cumulative time-series to ratchet
 	// upward on intra-month peaks, breaking the reconciliation identity.
-	allSnaps, _ := h.queries.ListNetWorthSnapshots(ctx, 5000)
+	allSnaps, _ := h.queries.ListNetWorthSnapshots(ctx, maxNetWorthSnapshotRows)
 	monthNW := make(map[string]float64)
 	monthPhysical := make(map[string]float64)
 	for _, s := range allSnaps {
@@ -4209,6 +4222,10 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 	monthContrib := make(map[string]float64)
 	monthDiv := make(map[string]float64)
 	monthInt := make(map[string]float64)
+	// Fees and taxes per month, built exactly like the totals above so the
+	// monthly market residual has the same definition as market_returns.
+	monthFees := make(map[string]float64)
+	monthTaxes := make(map[string]float64)
 	monthPhysicalEvents := physical.monthly()
 	for m, t := range monthPhysicalEvents {
 		monthContrib[m] += t.contrib
@@ -4217,13 +4234,15 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 		monthContrib[ev.Date.Format("2006-01")] += ev.DeltaEUR
 	}
 	for _, txn := range txns {
+		m := txn.Date.Format("2006-01")
+		monthFees[m] += convertAmountToEURAtDate(numericToFloat(txn.Fee), txn.Currency, txn.Date, histFX, fxRates)
+		monthTaxes[m] += convertAmountToEURAtDate(numericToFloat(txn.Tax), txn.Currency, txn.Date, histFX, fxRates)
 		if _, isWash := washed[txn.ID]; isWash {
 			continue
 		}
 		if physical.linked[txn.ID] {
 			continue
 		}
-		m := txn.Date.Format("2006-01")
 		amt := 0.0
 		if txn.Amount.Valid {
 			f, _ := txn.Amount.Float64Value()
@@ -4238,15 +4257,18 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 			monthDiv[m] += amt
 		case analytics.BucketInterest:
 			monthInt[m] += amt
+		case analytics.BucketFee:
+			monthFees[m] += amt
+		case analytics.BucketTax:
+			monthTaxes[m] += amt
 		}
 	}
 
 	monthSet := make(map[string]bool)
-	for m := range monthNW {
-		monthSet[m] = true
-	}
-	for m := range monthContrib {
-		monthSet[m] = true
+	for _, set := range []map[string]float64{monthNW, monthContrib, monthDiv, monthInt, monthFees, monthTaxes} {
+		for m := range set {
+			monthSet[m] = true
+		}
 	}
 	var months []string
 	for m := range monthSet {
@@ -4314,6 +4336,8 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 		Interest      float64 `json:"interest"`
 		Assets        float64 `json:"assets"`         // physical asset value change
 		PropertyCosts float64 `json:"property_costs"` // purchase costs and loan interest (negative)
+		Fees          float64 `json:"fees"`           // cumulative fees (negative)
+		Taxes         float64 `json:"taxes"`          // cumulative taxes (negative)
 		Total         float64 `json:"total"`
 	}
 
@@ -4323,6 +4347,8 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 	cumInt := 0.0
 	cumCapital := 0.0
 	cumCosts := 0.0
+	cumFees := 0.0
+	cumTaxes := 0.0
 	crossoverMonth := ""
 	for _, m := range months {
 		cumContrib += monthContrib[m]
@@ -4330,22 +4356,26 @@ func (h *PortfolioHandler) HandleWealthWaterfall(w http.ResponseWriter, r *http.
 		cumInt += monthInt[m]
 		cumCapital += monthPhysicalEvents[m].capital
 		cumCosts += monthPhysicalEvents[m].costs + monthPhysicalEvents[m].interest
+		cumFees += monthFees[m]
+		cumTaxes += monthTaxes[m]
 		nw := monthNW[m]
 		if nw == 0 {
 			continue
 		}
 		cumAssets := monthPhysical[m] - cumCapital
-		// Market return is the residual that closes the identity: whatever
-		// portion of NW isn't explained by contributions/dividends/interest is
-		// market+fees+taxes (folded together because fees/taxes aren't broken
-		// out per month here). This guarantees the stacked area sums to the
-		// actual NW snapshot, instead of drifting due to missing price data.
-		cumMR := nw - cumContrib - cumDiv - cumInt - cumAssets + cumCosts
+		// Market return is the residual that closes the identity, with fees
+		// and taxes taken out as in market_returns above, so a period's market
+		// return (the difference of two months) means the same as the
+		// all-time figure. It still holds FX moves on foreign cash. This
+		// guarantees the stacked area sums to the actual NW snapshot, instead
+		// of drifting due to missing price data.
+		cumMR := nw - cumContrib - cumDiv - cumInt - cumAssets + cumCosts + math.Abs(cumFees) + math.Abs(cumTaxes)
 		timeSeries = append(timeSeries, monthAttrib{
 			Month: m, Contributions: math.Round(cumContrib),
 			MarketReturn: math.Round(cumMR), Dividends: math.Round(cumDiv),
 			Interest: math.Round(cumInt), Assets: math.Round(cumAssets),
 			PropertyCosts: -math.Round(cumCosts), Total: math.Round(nw),
+			Fees: -math.Round(math.Abs(cumFees)), Taxes: -math.Round(math.Abs(cumTaxes)),
 		})
 		// Crossover: cumulative returns surpass cumulative contributions
 		// (gate on >10k contributed to avoid early-month artifacts).

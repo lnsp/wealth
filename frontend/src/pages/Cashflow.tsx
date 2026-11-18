@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, type CashflowData, type CashflowMonth } from '../api/client';
+import { api, type CashflowBucket, type CashflowData, type CashflowMonth } from '../api/client';
 import {
   PageHeader, Section, MetricCard, MetricGrid, RankedBars,
   LoadingState, ErrorState, EmptyState, SectionBoundary,
@@ -14,17 +14,62 @@ const monthDate = (ym: string) => {
   return new Date(Number(y), Number(m) - 1, 1);
 };
 
-const categoryLabel = (c: string) => (c === 'internal' ? 'Internal transfer' : labelFor(c));
+const CATEGORY_LABELS: Record<string, string> = {
+  internal: 'Own accounts',
+  investment: 'Investments',
+  loan_principal: 'Loan principal',
+  fees: 'Bank fees',
+  unclassified: 'Not yet categorised',
+};
+const categoryLabel = (c: string) => CATEGORY_LABELS[c] ?? labelFor(c);
 
-const hasActivity = (m: CashflowMonth) => m.income !== 0 || m.fixed !== 0 || m.variable !== 0;
+/** A month counts as imported when any cash row landed in it, transfers included. */
+const hasActivity = (m: CashflowMonth) =>
+  m.has_data || m.income !== 0 || m.fixed !== 0 || m.variable !== 0 || m.transfer !== 0 || m.unclassified !== 0;
+
+/**
+ * Whole-euro cells that add up across the row: net is rounded income minus rounded spend,
+ * so 100,40 / 50,60 shows 100 − 51 = 49, not a separately rounded 50.
+ */
+function rowFigures(m: CashflowMonth) {
+  const income = Math.round(m.income);
+  const spend = Math.round(m.fixed + m.variable);
+  return { income, spend, net: income - spend };
+}
+
+/**
+ * Position of one month's net on a trend axis that always includes zero, in % of the track.
+ * Example: nets 3.900, 3.563 and −500 span −500…3.900, so zero sits at 11,4 %;
+ * 3.900 runs from 11,4 % to 100 %, −500 from 0 % to 11,4 %.
+ */
+function trendBar(net: number, min: number, max: number): { left: number; width: number; zero: number } {
+  const lo = Math.min(0, min);
+  const hi = Math.max(0, max);
+  const span = hi - lo;
+  if (span <= 0 || net === 0) return { left: 0, width: 0, zero: span > 0 ? (-lo / span) * 100 : 0 };
+  const zero = (-lo / span) * 100;
+  const at = ((net - lo) / span) * 100;
+  const width = Math.max(1, Math.abs(at - zero));
+  return net > 0
+    ? { left: zero, width: Math.min(width, 100 - zero), zero }
+    : { left: Math.max(0, zero - width), width: Math.min(width, zero), zero };
+}
+
+/**
+ * What "Apply to Planning" writes. A non-positive typical net is a budget of 0, not
+ * "keep the old value"; with no spending measured the FIRE figure is cleared (null).
+ */
+function planningValues(m: CashflowData['medians']): { investBudget: number; fireExpenses: number | null } {
+  return {
+    investBudget: Math.max(0, Math.round(m.monthly_surplus)),
+    fireExpenses: m.monthly_spend > 0 ? Math.round(m.monthly_spend * 12) : null,
+  };
+}
 
 /** Whole-euro figure without the symbol (the table caption names the unit). */
-const plain = (n: number) => fmtNum(Math.round(n));
-const signed = (n: number) => {
-  const r = Math.round(n);
-  return `${r > 0 ? '+' : ''}${fmtNum(r)}`;
-};
-const netTone = (n: number) => (Math.round(n) > 0 ? 'text-sage' : Math.round(n) < 0 ? 'text-claret' : 'text-ink');
+const plain = (n: number) => fmtNum(n);
+const signed = (n: number) => `${n > 0 ? '+' : ''}${fmtNum(n)}`;
+const netTone = (n: number) => (n > 0 ? 'text-sage' : n < 0 ? 'text-claret' : 'text-ink');
 
 // Month, Income, Spend, Net fit a phone; desktop adds a Trend column.
 const GRID = 'grid grid-cols-[86px_1fr_1fr_1fr] md:grid-cols-[130px_1fr_1fr_1fr_140px] items-center';
@@ -32,6 +77,27 @@ const GRID = 'grid grid-cols-[86px_1fr_1fr_1fr] md:grid-cols-[130px_1fr_1fr_1fr_
 type RowGroup =
   | { kind: 'month'; month: CashflowMonth }
   | { kind: 'gap'; newest: string; oldest: string };
+
+/** Merge buckets by label into ranked items. Shares only where every item is positive. */
+function toItems(list: CashflowBucket[], withSign = false): { items: RankedBarItem[]; total: number } {
+  const merged = new Map<string, number>();
+  for (const b of list) {
+    const label = categoryLabel(b.category);
+    merged.set(label, (merged.get(label) ?? 0) + b.amount);
+  }
+  const entries = [...merged.entries()].filter(([, v]) => Math.round(v) !== 0).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+  const total = entries.reduce((s, [, v]) => s + v, 0);
+  const allPositive = !withSign && entries.every(([, v]) => v > 0);
+  return {
+    total,
+    items: entries.map(([label, value]) => ({
+      label,
+      value,
+      display: fmtEUR(value, { sign: withSign }),
+      share: allPositive && total > 0 ? fmtPct((value / total) * 100) : undefined,
+    })),
+  };
+}
 
 function Chevron({ open }: { open: boolean }) {
   return (
@@ -86,36 +152,23 @@ export default function Cashflow() {
 
   const breakdown = useMemo(() => {
     const buckets = (data?.buckets ?? []).filter(b => b.month === selectedMonth);
-    const toItems = (list: typeof buckets): { items: RankedBarItem[]; total: number } => {
-      const merged = new Map<string, number>();
-      for (const b of list) {
-        const label = categoryLabel(b.category);
-        merged.set(label, (merged.get(label) ?? 0) + b.amount);
-      }
-      const positive = [...merged.entries()].filter(([, v]) => Math.round(v) > 0).sort((a, b) => b[1] - a[1]);
-      const total = positive.reduce((s, [, v]) => s + v, 0);
-      return {
-        total,
-        items: positive.map(([label, value]) => ({
-          label,
-          value,
-          display: fmtEUR(value),
-          share: fmtPct(total > 0 ? (value / total) * 100 : 0),
-        })),
-      };
-    };
     return {
       spend: toItems(buckets.filter(b => b.bucket === 'fixed' || b.bucket === 'variable')),
       income: toItems(buckets.filter(b => b.bucket === 'income')),
+      notCounted: toItems(buckets.filter(b => b.bucket === 'transfer' || b.bucket === 'unclassified'), true),
     };
   }, [data, selectedMonth]);
 
   const applyToPlanning = () => {
     if (!data) return;
-    const m = data.medians;
-    if (m.monthly_surplus > 0) localStorage.setItem('monthly_invest_budget', String(Math.round(m.monthly_surplus)));
-    if (m.monthly_spend > 0) localStorage.setItem('fire_expenses', String(Math.round(m.monthly_spend * 12)));
-    if (m.annual_gross_income > 0) localStorage.setItem('gross_annual_income', String(Math.round(m.annual_gross_income)));
+    const v = planningValues(data.medians);
+    try {
+      localStorage.setItem('monthly_invest_budget', String(v.investBudget));
+      if (v.fireExpenses === null) localStorage.removeItem('fire_expenses');
+      else localStorage.setItem('fire_expenses', String(v.fireExpenses));
+      // Gross income is not written: take-home pay is after tax and social
+      // contributions, and Planning's insurance and human-capital figures need gross.
+    } catch { /* storage unavailable */ }
     setAppliedAt(Date.now());
   };
 
@@ -151,13 +204,16 @@ export default function Cashflow() {
   }
 
   const med = data.medians;
-  // The server takes its medians over the months that have income.
-  const medianMonths = months.filter(m => m.income > 0).length;
-  const savingsRate = med.monthly_income > 0 ? (med.monthly_surplus / med.monthly_income) * 100 : null;
+  const savingsRate = med.savings_rate_pct;
   const surplus = Math.round(med.monthly_surplus);
+  const plan = planningValues(med);
+  const canApply = med.months > 0;
+  const running = months.find(m => m.partial);
+  const unclassifiedTotal = months.reduce((s, m) => s + m.unclassified, 0);
+  const unconverted = data.unconverted_currencies ?? [];
 
-  // Trend bar (desktop only): each month's net within the range of the window.
-  const nets = months.filter(hasActivity).map(m => m.net);
+  // Trend bar (desktop only): each month's net on an axis anchored at zero.
+  const nets = rows.flatMap(r => (r.kind === 'month' ? [rowFigures(r.month).net] : []));
   const maxNet = Math.max(0, ...nets);
   const minNet = Math.min(0, ...nets);
 
@@ -166,12 +222,12 @@ export default function Cashflow() {
       <PageHeader title="Cashflow" />
 
       <MetricGrid className="mt-2 md:mt-6">
-        <MetricCard label="Typical income" value={fmtEUR(med.monthly_income)} />
-        <MetricCard label="Typical spend" value={fmtEUR(med.monthly_spend)} />
+        <MetricCard label="Typical income" value={canApply ? fmtEUR(med.monthly_income) : '—'} />
+        <MetricCard label="Typical spend" value={canApply ? fmtEUR(med.monthly_spend) : '—'} />
         <MetricCard
           label="Typical net"
-          value={fmtEUR(surplus, { sign: true })}
-          tone={surplus > 0 ? 'positive' : surplus < 0 ? 'negative' : 'neutral'}
+          value={canApply ? fmtEUR(surplus, { sign: true }) : '—'}
+          tone={!canApply ? 'neutral' : surplus > 0 ? 'positive' : surplus < 0 ? 'negative' : 'neutral'}
         />
         <MetricCard
           label="Savings rate"
@@ -181,10 +237,25 @@ export default function Cashflow() {
         />
       </MetricGrid>
       <p className="mt-3 text-[13px] text-ink-muted max-w-2xl">
-        Monthly medians over the {medianMonths} {medianMonths === 1 ? 'month' : 'months'} with imported income in the
-        past {months.length}. Typical net is typical income minus typical spend, and the savings rate is typical net
-        as a share of typical income.
+        {canApply
+          ? `Medians over the ${med.months} complete ${med.months === 1 ? 'month' : 'months'} with imported income in the past ${med.window_months}`
+          : `No complete month in the past ${med.window_months} has imported income yet, so there is no typical month`}
+        {running ? `; ${fmtMonth(monthDate(running.month))} is still running and is left out` : ''}. Typical net is
+        the median month’s net. The savings rate is total net as a share of total income over those months.
+        Transfers between your own accounts and into investments count as neither income nor spending.
       </p>
+      {unclassifiedTotal > 0.5 && (
+        <p className="mt-2 text-[13px] text-ink-body max-w-2xl">
+          <span data-privacy="blur">{fmtEUR(unclassifiedTotal)}</span> of incoming payments matched no category and
+          is not counted as income.{' '}
+          <Link to="/transactions" className="font-medium text-forest underline underline-offset-2">Categorise them on Transactions</Link>.
+        </p>
+      )}
+      {unconverted.length > 0 && (
+        <p className="mt-2 text-[13px] text-ink-body max-w-2xl">
+          Transactions in {unconverted.join(', ')} have no exchange rate yet and are left out.
+        </p>
+      )}
 
       <SectionBoundary>
         <Section title="Monthly Cashflow" subtitle="Select a month to open its spending. Amounts in EUR.">
@@ -216,9 +287,9 @@ export default function Cashflow() {
               }
               const m = row.month;
               const open = m.month === selectedMonth;
-              const spend = m.fixed + m.variable;
+              const fig = rowFigures(m);
               const panelId = `cashflow-${m.month}`;
-              const ratio = maxNet - minNet > 0 ? (m.net - minNet) / (maxNet - minNet) : 0.5;
+              const bar = trendBar(fig.net, minNet, maxNet);
               return (
                 <Fragment key={m.month}>
                   <button
@@ -234,15 +305,20 @@ export default function Cashflow() {
                       <Chevron open={open} />
                       <span>
                         {fmtMonthShort(monthDate(m.month))}
-                        <span className="sr-only">, income</span>
+                        {m.partial && <span className="block text-[12px] leading-4 font-normal text-ink-muted">to date</span>}
+                        <span className="sr-only">{m.partial ? ', month still running' : ''}, income</span>
                       </span>
                     </span>
-                    <span data-privacy="blur">{plain(m.income)}<span className="sr-only"> €, spend</span></span>
-                    <span data-privacy="blur">{plain(spend)}<span className="sr-only"> €, net</span></span>
-                    <span data-privacy="blur" className={netTone(m.net)}>{signed(m.net)}<span className="sr-only"> €</span></span>
+                    <span data-privacy="blur">{plain(fig.income)}<span className="sr-only"> €, spend</span></span>
+                    <span data-privacy="blur">{plain(fig.spend)}<span className="sr-only"> €, net</span></span>
+                    <span data-privacy="blur" className={netTone(fig.net)}>{signed(fig.net)}<span className="sr-only"> €</span></span>
                     <span className="hidden md:block pl-6" aria-hidden="true">
-                      <span className="block h-2 rounded-[2px] bg-divider overflow-hidden">
-                        <span className="block h-full bg-forest" style={{ width: `${Math.max(2, Math.min(100, ratio * 100))}%` }} />
+                      <span className="relative block h-2 rounded-[2px] bg-divider overflow-hidden">
+                        {minNet < 0 && <span className="absolute inset-y-0 w-px bg-ink-muted" style={{ left: `${bar.zero}%` }} />}
+                        <span
+                          className={`absolute inset-y-0 ${fig.net < 0 ? 'bg-claret' : 'bg-forest'}`}
+                          style={{ left: `${bar.left}%`, width: `${bar.width}%` }}
+                        />
                       </span>
                     </span>
                   </button>
@@ -269,6 +345,20 @@ export default function Cashflow() {
                           ? <RankedBars items={breakdown.income.items} />
                           : <p className="text-[13px] text-ink-body">No income recorded in this month.</p>}
                       </div>
+                      {breakdown.notCounted.items.length > 0 && (
+                        <div className="flex flex-col gap-3 min-w-0 md:col-span-2">
+                          <h3 className="label-caps">Not counted as income or spending</h3>
+                          <RankedBars items={breakdown.notCounted.items} />
+                          <p className="text-[13px] text-ink-muted max-w-2xl">
+                            Money moved between your own accounts or into and out of investments, and loan principal.
+                            {m.unclassified > 0.5 && (
+                              <> Incoming payments that matched no category stay here until you{' '}
+                                <Link to="/transactions" className="font-medium text-forest underline underline-offset-2">categorise them</Link>.
+                              </>
+                            )}
+                          </p>
+                        </div>
+                      )}
                     </div>
                   )}
                 </Fragment>
@@ -284,16 +374,30 @@ export default function Cashflow() {
           subtitle="Use these figures as the starting inputs on the Planning page instead of typed estimates."
         >
           <div className="rounded-apple border border-divider px-4 py-4 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-            <ul className="text-[14px] text-ink-body space-y-1">
-              <li>Monthly invest budget: <span className="text-ink" data-privacy="blur">{fmtEUR(Math.max(0, med.monthly_surplus))}</span> (typical net)</li>
-              <li>FIRE expenses: <span className="text-ink" data-privacy="blur">{fmtEUR(med.monthly_spend * 12)}</span> per year (typical spend × 12)</li>
-              <li>Annual income: <span className="text-ink" data-privacy="blur">{fmtEUR(med.annual_gross_income)}</span> (income received in the past {months.length} months)</li>
-            </ul>
+            <div className="flex flex-col gap-3">
+              <ul className="text-[14px] text-ink-body space-y-1">
+                <li>
+                  Monthly invest budget: <span className="text-ink" data-privacy="blur">{fmtEUR(plan.investBudget)}</span>{' '}
+                  {surplus < 0 ? '(typical net is negative, so nothing is left to invest)' : '(typical net)'}
+                </li>
+                <li>
+                  FIRE expenses:{' '}
+                  {plan.fireExpenses === null
+                    ? 'cleared (no spending recorded)'
+                    : <><span className="text-ink" data-privacy="blur">{fmtEUR(plan.fireExpenses)}</span> per year (typical spend × 12)</>}
+                </li>
+              </ul>
+              <p className="text-[13px] text-ink-muted max-w-xl">
+                Annual take-home pay: <span className="text-ink-body" data-privacy="blur">{fmtEUR(med.annual_take_home)}</span>{' '}
+                (salary per month with income × 12). It is after tax and social contributions, so it does not
+                replace the gross income you enter on Planning.
+              </p>
+            </div>
             <div className="flex flex-wrap items-center gap-3 shrink-0">
               <span role="status" className="text-[13px] text-ink-muted">
-                {appliedAt ? `Applied ${fmtDateTime(appliedAt)}` : ''}
+                {appliedAt ? `Applied ${fmtDateTime(appliedAt)}` : canApply ? '' : 'Needs a complete month with income.'}
               </span>
-              <button type="button" onClick={applyToPlanning} className="apple-btn-secondary min-h-[44px]">
+              <button type="button" onClick={applyToPlanning} disabled={!canApply} className="apple-btn-secondary min-h-[44px]">
                 Apply to Planning
               </button>
             </div>

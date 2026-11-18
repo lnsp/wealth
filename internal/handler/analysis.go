@@ -3953,10 +3953,29 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 }
 
 // HandleOpportunityCost computes opportunity costs from cash drag, timing delays, and FSA waste.
+// Query params: monthly_expenses (€) and reserve_months (default 6) size the
+// emergency reserve the same way as the Contribution Router; joint=1 doubles
+// the saver's allowance; church_rate (0–0.09) sets the capital-income rate.
 func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	now := time.Now().UTC()
 	year := now.Year()
+	q := r.URL.Query()
+
+	monthlyExpenses := 0.0
+	if v, err := parseFiniteFloat(q.Get("monthly_expenses")); err == nil && v > 0 && v <= 1e7 {
+		monthlyExpenses = v
+	}
+	reserveMonths := float64(analytics.PlanningReserveMonths)
+	if v, err := parseFiniteFloat(q.Get("reserve_months")); err == nil && v >= 0 && v <= 36 {
+		reserveMonths = v
+	}
+	joint := q.Get("joint") == "1"
+	churchRate := 0.0
+	if v, err := parseFiniteFloat(q.Get("church_rate")); err == nil && v >= 0 && v <= 0.09 {
+		churchRate = v
+	}
+	capRate := analytics.CapitalIncomeTaxRate(churchRate)
 
 	accts, _ := h.queries.ListAccounts(ctx)
 	txns, _ := listAllTransactionsRows(ctx, h.queries)
@@ -3965,18 +3984,35 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 	fxRates := loadFXRatesMap(ctx, h.queries)
 	histFX := loadHistoricalFXRates(ctx, h.queries)
 	tfsMap := make(map[string]float64, len(secs))
+	secMap := make(map[string]db.Security, len(secs))
 	for _, s := range secs {
 		tfsMap[s.ISIN] = securityTFSRate(s)
+		secMap[s.ISIN] = s
 	}
 
 	// Portfolio total and annual return estimate
 	portfolioValue := 0.0
+	valueByISIN := make(map[string]float64)
+	qtyByISIN := make(map[string]float64)
+	unrealisedTaxable := 0.0 // § 20 gains that could be realised tax-free within the allowance
 	for _, eh := range enriched {
 		portfolioValue += eh.value
+		if eh.value > 0 {
+			valueByISIN[eh.security.ISIN] += eh.value
+			qtyByISIN[eh.security.ISIN] += numericToFloat(eh.holding.Quantity)
+		}
+		if gain := eh.value - eh.costValue; gain > 0 && !analytics.IsPrivateSaleAssetClass(eh.security.AssetClass) {
+			unrealisedTaxable += gain * (1 - tfsMap[eh.security.ISIN])
+		}
 	}
-	annualReturn := 0.07 // 7% nominal
+	annualReturnPct := analytics.PlanningDefaultReturnPct
+	annualReturn := annualReturnPct / 100
+	cashRatePct := analytics.PlanningCashRatePct
+	cashSpread := math.Max(0, annualReturnPct-cashRatePct) / 100
 
 	// --- 1. Cash Drag Analysis ---
+	// Idle cash still earns savings interest, so the cost is the spread between
+	// the expected portfolio return and the stated cash rate.
 	type accountCashDrag struct {
 		AccountName     string  `json:"account_name"`
 		AccountType     string  `json:"account_type"`
@@ -3996,24 +4032,24 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 			continue
 		}
 		totalCash += cash
-		oc := cash * annualReturn
 		cashDragAccounts = append(cashDragAccounts, accountCashDrag{
 			AccountName: acc.Name, AccountType: acc.Type,
 			CashBalance:     math.Round(cash*100) / 100,
-			OpportunityCost: math.Round(oc*100) / 100,
+			OpportunityCost: math.Round(cash*cashSpread*100) / 100,
 		})
 	}
 	sort.Slice(cashDragAccounts, func(i, j int) bool {
 		return cashDragAccounts[i].CashBalance > cashDragAccounts[j].CashBalance
 	})
 
-	totalWealth := portfolioValue + totalCash
-	recommendedReserve := totalWealth * 0.05 // 5% cash reserve
-	if recommendedReserve < 5000 {
-		recommendedReserve = 5000
+	// Reserve: the same months-of-expenses rule as the Contribution Router.
+	// Without known expenses no cash is called idle.
+	reserveKnown := monthlyExpenses > 0
+	recommendedReserve := monthlyExpenses * reserveMonths
+	excessCash, cashDragAnnual := 0.0, 0.0
+	if reserveKnown {
+		excessCash, cashDragAnnual = idleCashCost(totalCash, recommendedReserve, annualReturnPct, cashRatePct)
 	}
-	excessCash := math.Max(totalCash-recommendedReserve, 0)
-	cashDragAnnual := excessCash * annualReturn
 
 	// --- 2. Timing Cost: Sparplan delays ---
 	// Find months where savings_plan/buy was later than usual
@@ -4067,27 +4103,23 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 	avgDelayCost := float64(avgDay-1) * dailyReturn * avgMonthly * 12 // annual cost of avg delay
 
 	// --- 3. Rebalancing delay cost ---
-	// Check allocation drift from targets
+	// Euros that would have to move to reach the targets (half the summed
+	// absolute drift), assumed to earn 2 % less a year.
 	targets, _ := h.queries.ListTargetAllocations(ctx)
 	rebalanceCost := 0.0
 	if len(targets) > 0 && portfolioValue > 0 {
-		// Sum of absolute drift × estimated return difference
+		targetPct := make(map[string]float64, len(targets))
 		for _, t := range targets {
-			targetPct := numericToFloat(t.TargetWeightPct)
-			for _, eh := range enriched {
-				if eh.security.ISIN == t.SecurityISIN {
-					actualPct := eh.value / portfolioValue * 100
-					drift := math.Abs(actualPct - targetPct)
-					// Overweight in low-return assets or underweight in high-return = cost
-					// Estimate: 2% return drag per 10% drift
-					rebalanceCost += portfolioValue * drift / 100 * 0.02
-				}
-			}
+			targetPct[t.SecurityISIN] += numericToFloat(t.TargetWeightPct)
 		}
+		rebalanceCost = rebalanceTurnover(valueByISIN, targetPct) * 0.02
 	}
 
-	// --- 4. FSA Waste ---
-	ytdIncome := 0.0
+	// --- 4. Unused saver's allowance ---
+	// Income using the allowance this year: dividends and interest (projected
+	// to the full year), gains and losses already realised, and the
+	// Vorabpauschale deemed received on the first working day of the year.
+	recurringYTD := 0.0
 	for _, txn := range txns {
 		if txn.Date.Year() != year {
 			continue
@@ -4099,7 +4131,7 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 				if txn.Type == "dividend" && txn.SecurityISIN.Valid {
 					amtEUR *= 1 - tfsMap[txn.SecurityISIN.String]
 				}
-				ytdIncome += amtEUR
+				recurringYTD += amtEUR
 			}
 		}
 	}
@@ -4107,9 +4139,30 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 	if monthsElapsed < 1 {
 		monthsElapsed = 1
 	}
-	projectedIncome := ytdIncome / monthsElapsed * 12
-	fsaUnused := math.Max(analytics.Sparerpauschbetrag-projectedIncome, 0)
-	fsaWaste := fsaUnused * analytics.EffectiveTaxRate
+	projectedRecurring := recurringYTD / monthsElapsed * 12
+
+	realisedTaxable := 0.0
+	taxTxns, _, _, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
+	if summary := analytics.ComputeTaxSummary(taxTxns, year, nil); summary != nil {
+		for _, s := range summary.BySecurity {
+			if analytics.IsPrivateSaleAssetClass(secMap[s.ISIN].AssetClass) {
+				continue
+			}
+			realisedTaxable += s.TaxablePL
+		}
+	}
+	vorabTaxable := 0.0
+	for _, vp := range h.computeYearVorabpauschale(ctx, year-1, txns, secMap, tfsMap, valueByISIN, qtyByISIN, histFX, fxRates) {
+		vorabTaxable += vp.Vorabpauschale * (1 - tfsMap[vp.ISIN])
+	}
+
+	allowance := analytics.SparerPauschbetragForYear(year, joint)
+	projectedIncome := math.Max(0, projectedRecurring+realisedTaxable+vorabTaxable)
+	fsaUnused := math.Max(allowance-projectedIncome, 0)
+	// The allowance is only worth something if there are gains to realise
+	// into it (sell and rebuy to step up the cost basis).
+	fsaHarvestable := math.Min(fsaUnused, unrealisedTaxable)
+	fsaWaste := fsaHarvestable * capRate
 
 	// --- Total ---
 	totalAnnual := cashDragAnnual + avgDelayCost + rebalanceCost + fsaWaste
@@ -4144,27 +4197,36 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"cash_drag": map[string]any{
-			"accounts":           cashDragAccounts,
-			"total_cash":         math.Round(totalCash*100) / 100,
+			"accounts":            cashDragAccounts,
+			"total_cash":          math.Round(totalCash*100) / 100,
 			"recommended_reserve": math.Round(recommendedReserve),
-			"excess_cash":        math.Round(excessCash),
-			"annual_cost":        math.Round(cashDragAnnual),
+			"reserve_known":       reserveKnown,
+			"reserve_months":      reserveMonths,
+			"excess_cash":         math.Round(excessCash),
+			"annual_cost":         math.Round(cashDragAnnual),
+			"expected_return_pct": annualReturnPct,
+			"cash_rate_pct":       cashRatePct,
 		},
 		"timing": map[string]any{
-			"avg_invest_day":  avgDay,
-			"avg_monthly":     math.Round(avgMonthly),
-			"annual_cost":     math.Round(avgDelayCost),
+			"avg_invest_day": avgDay,
+			"avg_monthly":    math.Round(avgMonthly),
+			"annual_cost":    math.Round(avgDelayCost),
 		},
 		"rebalance": map[string]any{
 			"annual_cost": math.Round(rebalanceCost),
 		},
 		"fsa_waste": map[string]any{
-			"projected_income": math.Round(projectedIncome),
-			"unused":           math.Round(fsaUnused),
-			"annual_cost":      math.Round(fsaWaste),
+			"allowance":           allowance,
+			"projected_income":    math.Round(projectedIncome),
+			"projected_recurring": math.Round(projectedRecurring),
+			"realised_gains":      math.Round(realisedTaxable),
+			"vorabpauschale":      math.Round(vorabTaxable),
+			"unused":              math.Round(fsaUnused),
+			"harvestable":         math.Round(fsaHarvestable),
+			"annual_cost":         math.Round(fsaWaste),
 		},
-		"total_annual":    math.Round(totalAnnual),
-		"monthly_rollup":  monthlySeries,
+		"total_annual":   math.Round(totalAnnual),
+		"monthly_rollup": monthlySeries,
 	})
 }
 

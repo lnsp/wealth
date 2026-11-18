@@ -7,6 +7,7 @@ export interface PensionSource {
   monthly_gross: number;
   rentenpunkte: number;
   start_age: number;
+  /** Taxable share in percent; 0 or missing means "derive it from the type and start year". */
   tax_portion_pct: number;
 }
 
@@ -20,14 +21,17 @@ export interface PlanningState {
   // Shared dashboard data
   accounts: Account[];
   allSnapshots: NetWorthSnapshot[];
+  /** Everything, including property, cars and loans. Only the estate calculator uses it. */
   totalNetWorth: number;
+  /** Cash + securities: the scope of FIRE, Human Capital, the Playbook and every projection. */
+  investableNetWorth: number;
 
   // Projection (FIRE Calculator + Life Events read this)
   projData: ProjectionData | null;
   /** The projection request failed; `reloadProjection` retries it. */
   projFailed: boolean;
   reloadProjection: () => void;
-  /** Monthly contribution the backend derived from the last 12 months of deposits. */
+  /** Net contribution over the last 12 months (deposits − withdrawals + share vests) per month, from the backend. */
   projDefaultContrib: number | null;
   projContrib: string;
   setProjContrib: (v: string) => void;
@@ -44,6 +48,12 @@ export interface PlanningState {
   setPensionIncome: (v: string) => void;
   otherIncome: string;
   setOtherIncome: (v: string) => void;
+  /** Inflation, % a year; shared by FIRE, Pension Gap and Life Events. */
+  fireInflation: string;
+  setFireInflation: (v: string) => void;
+  /** Church-tax rate (0, 0.08, 0.09) and joint filing, as set on the Tax page. */
+  churchRate: number;
+  joint: boolean;
 
   // "Your Profile" — the inputs several calculators share. Edited in one
   // place at the top of the page (pages/Planning.tsx).
@@ -77,6 +87,14 @@ export interface PlanningState {
   setGrowthBrokerage: (v: string) => void;
   growthOther: string;
   setGrowthOther: (v: string) => void;
+
+  // Human capital, % a year — edited in Human Capital, also used by the Playbook's milestone.
+  hcSalaryGrowth: number;
+  setHcSalaryGrowth: (v: number) => void;
+  hcDiscount: number;
+  setHcDiscount: (v: number) => void;
+  hcPortfolioGrowth: number;
+  setHcPortfolioGrowth: (v: number) => void;
 }
 
 const PlanningCtx = createContext<PlanningState | null>(null);

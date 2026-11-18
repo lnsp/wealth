@@ -2,7 +2,9 @@ import { useState } from 'react';
 import { usePlanning } from './PlanningContext';
 import { Section, SubHeading, MetricCard, MetricGrid, ProgressBar, EmptyState } from '../ui';
 import { fmtEUR, fmtPct, fmtDate } from '../../utils/format';
-import { Assumptions, downloadText, readStored, writeStored } from './shared';
+import { Assumptions, downloadText, readStored, toNum, writeStored } from './shared';
+import { humanCapitalCrossover, parsePct } from './planningMath';
+import { DEFAULT_MARGINAL_RATE_PCT } from './constants';
 
 const GROWTH_RATE = 0.07;
 const DONE_KEY = 'playbook_done';
@@ -13,14 +15,18 @@ type PlanYear = { year: number; age: number; actions: string[]; projectedNW: num
 const actionKey = (year: number, action: string) => `${year}|${action}`;
 
 // Year-by-year action plan combining: year-in-review (last calendar year
-// + YTD NW deltas from snapshots), milestone progress bars (FIRE number,
-// human-capital crossover, next 100k/250k/500k/1M), and an annual
+// + YTD NW deltas from snapshots), milestone progress bars (the FIRE
+// Calculator's target and date, the Human Capital crossover with the same
+// inputs, next 100k/250k/500k/1M of cash and investments), and an annual
 // checklist (initial setup → recurring Steuererklärung / tax-loss
 // harvesting / rebalance triggers → age-gated retirement events).
 // Ticked actions are saved per item in localStorage; the export button
 // serializes the plan exactly as shown to a .txt download.
 export default function FinancialIndependencePlaybook() {
-  const { accounts, allSnapshots, totalNetWorth, projData, pensionCurrentAge, pensionAge, crBudget, crMarginalRate, crGrossIncome, fireExpenses, fireSWR } = usePlanning();
+  const {
+    accounts, allSnapshots, investableNetWorth, projData, pensionCurrentAge, pensionAge, crBudget, crMarginalRate, crGrossIncome,
+    hcSalaryGrowth, hcDiscount, hcPortfolioGrowth,
+  } = usePlanning();
   const [done, setDone] = useState<Record<string, boolean>>(() => {
     try {
       const parsed: unknown = JSON.parse(readStored(DONE_KEY, '{}'));
@@ -42,9 +48,9 @@ export default function FinancialIndependencePlaybook() {
   const thisYear = now.getFullYear();
   const currentAge = pensionCurrentAge;
   const retireAge = pensionAge;
-  const grossIncome = parseFloat(crGrossIncome) || 0;
-  const monthlyBudget = parseFloat(crBudget) || 0;
-  const marginalRate = parseFloat(crMarginalRate) || 42;
+  const grossIncome = toNum(crGrossIncome);
+  const monthlyBudget = toNum(crBudget);
+  const marginalRate = parsePct(crMarginalRate, DEFAULT_MARGINAL_RATE_PCT);
 
   // ── Year in review — uses snapshots to surface calendar-year deltas ──
   let review: { lastYearNW: number; lastYearPct: number; ytdNW: number; ytdPct: number } | null = null;
@@ -67,9 +73,9 @@ export default function FinancialIndependencePlaybook() {
     };
   }
 
-  // ── Milestones ──
-  const nw = totalNetWorth;
-  const milestoneContrib = projData?.contribution || monthlyBudget || 0;
+  // ── Milestones ── (cash and investments: the house and car don't compound)
+  const nw = investableNetWorth;
+  const milestoneContrib = projData?.contribution ?? monthlyBudget;
   const projectYearsTo = (target: number) => {
     if (nw >= target) return 0;
     let v = nw;
@@ -79,33 +85,42 @@ export default function FinancialIndependencePlaybook() {
     }
     return null;
   };
-  const fireExpAnnual = parseFloat(fireExpenses || '0') || 0;
-  const fireSWRVal = parseFloat(fireSWR) || 3.5;
-  const fireTarget = fireExpAnnual > 0 ? fireExpAnnual / (fireSWRVal / 100) : 0;
-
   const milestones: Milestone[] = [];
   const nextRound = Math.ceil(nw / 50000) * 50000;
   if (nextRound > nw) {
     const yrs = projectYearsTo(nextRound);
-    milestones.push({ label: `${fmtEUR(nextRound)} net worth`, money: true, pct: Math.min(100, nw / nextRound * 100), projectedDate: yrs ? `${thisYear + yrs}` : '—' });
+    milestones.push({ label: `${fmtEUR(nextRound)} in cash and investments`, money: true, pct: Math.min(100, nw / nextRound * 100), projectedDate: yrs ? `${thisYear + yrs}` : '—' });
   }
-  if (fireTarget > 0) {
-    const yrs = projectYearsTo(fireTarget);
-    milestones.push({ label: 'Financial independence (target portfolio)', money: false, pct: Math.min(100, nw / fireTarget * 100), projectedDate: yrs ? `${thisYear + yrs} (age ${currentAge + yrs})` : nw >= fireTarget ? 'Reached' : '—' });
+  // Financial independence: exactly the FIRE Calculator's target and date.
+  const drawdown = projData?.drawdown;
+  if (drawdown && drawdown.fire_number > 0) {
+    const months = drawdown.months_to_fire ?? (drawdown.fire_date ? drawdown.years_to_fire * 12 : -1);
+    const date = months === 0 ? 'Reached'
+      : months > 0 ? `${drawdown.fire_date.slice(0, 4)} (age ${currentAge + Math.floor(months / 12)})` : '—';
+    milestones.push({ label: 'Financial independence (FIRE Calculator target)', money: false, pct: Math.min(100, nw / drawdown.fire_number * 100), projectedDate: date });
   }
-  if (grossIncome > 0) {
-    let humanCap = 0;
-    for (let y = 1; y <= retireAge - currentAge; y++) humanCap += grossIncome * Math.pow(1.02, y) / Math.pow(1.03, y);
-    if (humanCap > 0) {
-      const crossYrs = projectYearsTo(humanCap);
-      milestones.push({ label: 'Financial capital overtakes human capital', money: false, pct: Math.min(100, nw / humanCap * 100), projectedDate: crossYrs ? `${thisYear + crossYrs}` : nw >= humanCap ? 'Reached' : 'over 60 years' });
+  // Human capital: the Human Capital section's crossover, same inputs.
+  if (grossIncome > 0 && retireAge > currentAge) {
+    const hc = humanCapitalCrossover({
+      income: grossIncome, growth: hcSalaryGrowth / 100, discount: hcDiscount / 100, years: retireAge - currentAge,
+      startWealth: nw, monthlyContrib: monthlyBudget, portfolioGrowth: hcPortfolioGrowth / 100,
+    });
+    const humanNow = hc.series[0]?.human ?? 0;
+    if (humanNow > 0) {
+      const idx = hc.crossoverIndex;
+      milestones.push({
+        label: 'Financial capital overtakes human capital',
+        money: false,
+        pct: Math.min(100, nw / humanNow * 100),
+        projectedDate: idx === 0 ? 'Reached' : idx != null ? `${thisYear + idx} (age ${currentAge + idx})` : 'Not before retirement',
+      });
     }
   }
   for (const t of [100000, 250000, 500000, 1000000]) {
     if (nw < t) {
       if (t !== nextRound) {
         const yrs = projectYearsTo(t);
-        milestones.push({ label: `${fmtEUR(t)} net worth`, money: true, pct: Math.min(100, nw / t * 100), projectedDate: yrs ? `${thisYear + yrs}` : '—' });
+        milestones.push({ label: `${fmtEUR(t)} in cash and investments`, money: true, pct: Math.min(100, nw / t * 100), projectedDate: yrs ? `${thisYear + yrs}` : '—' });
       }
       break;
     }
@@ -126,7 +141,7 @@ export default function FinancialIndependencePlaybook() {
   const planReady = grossIncome > 0 || monthlyBudget > 0;
   const years: PlanYear[] = [];
   if (planReady) {
-    let projNW = totalNetWorth;
+    let projNW = investableNetWorth;
     const annualContrib = monthlyBudget * 12;
     for (let y = 0; y <= Math.min(retireAge - currentAge, 30); y++) {
       const age = currentAge + y;
@@ -164,14 +179,14 @@ export default function FinancialIndependencePlaybook() {
       'Financial Independence Playbook',
       '='.repeat(40),
       `Generated: ${fmtDate(now)}`,
-      `Current net worth: ${fmtEUR(totalNetWorth)}`,
+      `Cash and investments: ${fmtEUR(investableNetWorth)}`,
       `Monthly budget: ${fmtEUR(monthlyBudget)}`,
       `Current age: ${currentAge} | Retire at: ${retireAge}`,
       `Projection: ${fmtPct(GROWTH_RATE * 100, { digits: 0 })} growth a year`,
       '',
     ];
     for (const y of display) {
-      lines.push(`${y.year} (age ${y.age}) — projected net worth: ${fmtEUR(y.projectedNW)}`);
+      lines.push(`${y.year} (age ${y.age}) — projected cash and investments: ${fmtEUR(y.projectedNW)}`);
       for (const a of y.actions) lines.push(`  [${done[actionKey(y.year, a)] ? 'x' : ' '}] ${a}`);
       lines.push('');
     }
@@ -216,7 +231,7 @@ export default function FinancialIndependencePlaybook() {
               <li key={m.label} className="border-b border-divider py-3">
                 <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-x-4">
                   <span className="text-[14px] font-medium text-ink" data-privacy={m.money ? 'blur' : undefined}>{m.label}</span>
-                  <span className="text-[13px] text-ink-muted">{m.projectedDate === '—' ? 'Not within 60 years' : m.projectedDate === 'Reached' ? 'Reached' : `Expected ${m.projectedDate}`}</span>
+                  <span className="text-[13px] text-ink-muted">{m.projectedDate === '—' ? 'Not within 60 years' : m.projectedDate === 'Reached' || m.projectedDate === 'Not before retirement' ? m.projectedDate : `Expected ${m.projectedDate}`}</span>
                 </div>
                 <div className="flex items-center gap-3">
                   <ProgressBar className="flex-1" value={m.pct} label={`Progress to ${m.label}`} />
@@ -226,9 +241,9 @@ export default function FinancialIndependencePlaybook() {
             ))}
           </ul>
           <p className="mt-2 text-[13px] text-ink-muted">
-            Assumes you keep adding <span data-privacy="blur">{fmtEUR(milestoneContrib)}</span> a month
-            ({projData?.contribution ? 'your 12-month average' : 'the monthly budget from Your Profile'}) and {fmtPct(GROWTH_RATE * 100, { digits: 0 })} growth a year.
-            Human capital uses 2 % salary growth and a 3 % discount rate.
+            Amount milestones assume you keep adding <span data-privacy="blur">{fmtEUR(milestoneContrib)}</span> a month
+            ({projData ? 'your net contributions over the last 12 months' : 'the monthly budget from Your Profile'}) and {fmtPct(GROWTH_RATE * 100, { digits: 0 })} growth a year.
+            Financial independence is the FIRE Calculator’s result; the human-capital crossover uses the inputs of the Human Capital section.
           </p>
         </div>
       )}
@@ -255,7 +270,7 @@ export default function FinancialIndependencePlaybook() {
       {!planEmpty && (
         <>
           <p className="mt-1 text-[13px] text-ink-muted">
-            Projected net worth assumes {monthlyBudget > 0
+            Projected cash and investments assume {monthlyBudget > 0
               ? <>the <span data-privacy="blur">{fmtEUR(monthlyBudget)}</span> monthly budget from Your Profile</>
               : <>no further contributions (no monthly budget is set in <a href="#profile" className="font-medium text-forest underline">Your Profile</a>)</>}
             {' '}and {fmtPct(GROWTH_RATE * 100, { digits: 0 })} growth a year. Ticks are saved in this browser.

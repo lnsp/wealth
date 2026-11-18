@@ -3,28 +3,41 @@ import { usePlanning } from './PlanningContext';
 import { Section, SubHeading, MetricCard, MetricGrid, NumberField, Chip, EmptyState } from '../ui';
 import { fmtEUR, fmtPct } from '../../utils/format';
 import { Assumptions, ScrollTable, toNum } from './shared';
+import {
+  accountTaxClass, capitalIncomeTaxRate, depletionAge, parsePct, pensionTaxableShare, simulateWithdrawals,
+  statutoryAnnual, type SimPension, type WithdrawalOrder, type WithdrawalParams,
+} from './planningMath';
+import {
+  DEFAULT_INFLATION_PCT, EARLIEST_STATUTORY_AGE, GRUNDFREIBETRAG_2026, RENTENWERT, SPARER_PAUSCHBETRAG, TFS_EQUITY_FUND,
+} from './constants';
 
-// 30-year year-by-year withdrawal simulation comparing three strategies:
-// optimal (fill 0% Grundfreibetrag with brokerage gains first, then tax-
-// free cash, then taxable brokerage), brokerage-first (naive), and cash-
-// first (naive). The "optimal" advantage compounds because the German
-// 11604 EUR Grundfreibetrag would otherwise go unused early on.
+const ORDERS: { id: WithdrawalOrder; label: string; detail: string }[] = [
+  { id: 'optimal', label: 'Tax-free band first', detail: 'Brokerage gains up to the allowances, then cash, then more brokerage' },
+  { id: 'brokerage_first', label: 'Brokerage first', detail: 'Sell investments before using cash' },
+  { id: 'cash_first', label: 'Cash first', detail: 'Use cash before selling investments' },
+];
+
+// 30-year year-by-year withdrawal simulation comparing three withdrawal
+// orders. All tax rules live in planningMath.simulateWithdrawals: pensions
+// taxed with the § 32a tariff on the year's total, brokerage sales taxed on
+// their gain share with the Günstigerprüfung for every order, crypto and gold
+// tax-free after a year (§ 23). Spending and pensions are entered in today's
+// money and inflated from today; the table shows euros of each year.
 //
-// Return, inflation and the yearly pension increase are inputs (defaults 4 % / 2 % /
-// 1,5 %); every other constant is listed under "Assumptions" below the results.
-//
-// Sensitivity analysis re-runs a simplified optimal with 6 stress
-// scenarios (high inflation, low returns, no Rentenanpassung, late-life
-// Pflege costs, worst-case combo) to flag depletion risk.
+// Stress tests re-run the cheapest order for 40 years with one assumption
+// changed (high inflation, low returns, no pension increases, care costs, all
+// four) to flag when the money runs out.
 export default function WithdrawalSimulation() {
-  const { accounts, fireExpenses, pensionIncome, pensionSources, pensionAge, pensionCurrentAge, crMarginalRate, growthBrokerage, growthOther } = usePlanning();
+  const {
+    accounts, projData, fireExpenses, pensionIncome, pensionSources, pensionAge, pensionCurrentAge,
+    growthBrokerage, growthOther, crChildren, churchRate, joint, fireInflation, setFireInflation,
+  } = usePlanning();
   const [returnPct, setReturnPct] = useState(4);
-  const [inflationPct, setInflationPct] = useState(2);
   const [pensionAdjPct, setPensionAdjPct] = useState(1.5);
   const retireAge = pensionAge;
   const currentAge = pensionCurrentAge;
-  const annualNeed = parseFloat(fireExpenses) || 0;
-  const marginalRate = parseFloat(crMarginalRate) || 42;
+  const annualNeed = toNum(fireExpenses);
+  const inflationPct = parsePct(fireInflation, DEFAULT_INFLATION_PCT);
 
   const title = 'Withdrawal Simulation';
 
@@ -42,159 +55,85 @@ export default function WithdrawalSimulation() {
     );
   }
 
+  const thisYear = new Date().getFullYear();
   const yearsToRetire = retireAge - currentAge;
-  const returnRate = returnPct / 100;
-  const inflationRate = inflationPct / 100;
-  const pensionAdjRate = pensionAdjPct / 100;
-  const brokerageGrowth = toNum(growthBrokerage);
-  const cashGrowth = toNum(growthOther);
-  const grundfreibetrag = 11604;
-  const brokTaxRate = 0.185; // ~26.375% Abgeltungsteuer+Soli × 70% after 30% Teilfreistellung
+  const brokerageGrowth = toNum(growthBrokerage) / 100;
+  const cashGrowth = toNum(growthOther) / 100;
 
-  const brokerageAccs = accounts.filter(a => ['brokerage', 'crypto', 'precious_metals'].includes(a.type) && a.is_active);
-  const cashAccs = accounts.filter(a => (a.type === 'checking' || a.type === 'savings') && a.is_active);
-  const brokerageVal = brokerageAccs.reduce((s, a) => s + (a.balance ?? 0), 0) * Math.pow(1 + brokerageGrowth / 100, yearsToRetire);
-  const cashVal = cashAccs.reduce((s, a) => s + (a.balance ?? 0), 0) * Math.pow(1 + cashGrowth / 100, yearsToRetire);
+  // Today's balances by how withdrawals are taxed. Loans and negative balances are not sources;
+  // company, Riester and Rürup contracts pay out as pensions (entered under Pension Gap).
+  const today = { capital: 0, privateSale: 0, cash: 0 };
+  for (const a of accounts) {
+    const bal = a.balance ?? 0;
+    if (!a.is_active || bal <= 0) continue;
+    const cls = accountTaxClass(a);
+    if (cls === 'capital') today.capital += bal;
+    else if (cls === 'private_sale') today.privateSale += bal;
+    else if (cls === 'cash') today.cash += bal;
+  }
+  const growBrokerage = Math.pow(1 + brokerageGrowth, yearsToRetire);
+  const tfs = projData?.drawdown?.teilfreistellung_pct != null ? projData.drawdown.teilfreistellung_pct / 100 : TFS_EQUITY_FUND;
 
-  const explicitAnnualPension = parseFloat(pensionIncome) || 0;
-  const computePensionAtAge = (age: number, yearsElapsed: number, pensionAdj: number) => {
-    const growth = Math.pow(1 + pensionAdj, yearsElapsed);
-    if (explicitAnnualPension > 0) {
-      const gross = age >= 67 ? explicitAnnualPension * growth : 0;
-      return { gross, taxable: gross * 0.83 };
-    }
-    let gross = 0;
-    let taxable = 0;
-    for (const src of pensionSources) {
-      const startAge = src.start_age || 67;
-      if (age < startAge) continue;
-      const baseAnnual = src.monthly_gross > 0
-        ? src.monthly_gross * 12
-        : (src.rentenpunkte > 0 ? src.rentenpunkte * 39.32 * 12 : 0);
-      if (baseAnnual <= 0) continue;
-      const adjGross = baseAnnual * growth;
-      const taxPct = (src.tax_portion_pct ?? 83) / 100;
-      gross += adjGross;
-      taxable += adjGross * taxPct;
-    }
-    return { gross, taxable };
-  };
-
-  type SimYear = { year: number; age: number; need: number; fromBrokerage: number; fromCash: number; fromPension: number; taxPaid: number; remaining: number; shortfall: number };
-  const simulate = (strategy: 'optimal' | 'brokerage_first' | 'cash_first'): SimYear[] => {
-    let brok = brokerageVal;
-    let cash = cashVal;
-    const years: SimYear[] = [];
-
-    for (let y = 0; y < 30; y++) {
-      const age = retireAge + y;
-      const calYear = new Date().getFullYear() + yearsToRetire + y;
-      const need = annualNeed * Math.pow(1 + inflationRate, y);
-      const { gross: pensionAnnual, taxable: pensionTaxable } = computePensionAtAge(age, y, pensionAdjRate);
-      const pensionTax = Math.max(0, pensionTaxable - grundfreibetrag) * (marginalRate / 100);
-      const netPension = Math.max(0, pensionAnnual - pensionTax);
-      let remaining = need - netPension;
-      let fromBrok = 0, fromCash = 0, taxPaid = pensionTax;
-
-      if (remaining <= 0) {
-        years.push({ year: calYear, age, need: Math.round(need), fromBrokerage: 0, fromCash: 0, fromPension: Math.round(netPension), taxPaid: Math.round(taxPaid), remaining: Math.round(brok + cash), shortfall: 0 });
-        brok *= (1 + returnRate); cash *= 1.01;
-        continue;
-      }
-
-      const withdrawTaxableBrokerage = () => {
-        if (remaining <= 0 || brok <= 0) return;
-        const grossNeeded = remaining / (1 - brokTaxRate);
-        const grossB = Math.min(brok, grossNeeded);
-        const taxB = grossB * brokTaxRate;
-        const netB = grossB - taxB;
-        brok -= grossB;
-        fromBrok += grossB;
-        taxPaid += taxB;
-        remaining = Math.max(0, remaining - netB);
+  // Pensions: the Pension Gap sources when there are any, else the FIRE Calculator's figure (after tax).
+  const explicitAnnualPension = toNum(pensionIncome);
+  const sources = pensionSources.filter(src => src.monthly_gross > 0 || src.rentenpunkte > 0);
+  const pensions: SimPension[] = sources.length > 0
+    ? sources.map(src => {
+      const start = src.start_age > 0 ? src.start_age : retireAge;
+      const claimAge = src.type === 'gesetzliche' ? Math.max(start, EARLIEST_STATUTORY_AGE) : start;
+      const annualGross = src.type === 'gesetzliche' && src.rentenpunkte > 0 ? statutoryAnnual(src.rentenpunkte, claimAge) : src.monthly_gross * 12;
+      return {
+        type: src.type,
+        annualGross,
+        startAge: claimAge,
+        taxableShare: pensionTaxableShare(src.type, thisYear + (claimAge - currentAge), claimAge, src.tax_portion_pct),
       };
+    })
+    : explicitAnnualPension > 0
+      ? [{ type: 'other', annualGross: explicitAnnualPension, startAge: retireAge, taxableShare: 0, isNet: true }]
+      : [];
 
-      const withdrawCash = () => {
-        if (remaining <= 0 || cash <= 0) return;
-        const fromC = Math.min(remaining, cash);
-        cash -= fromC;
-        fromCash += fromC;
-        remaining = Math.max(0, remaining - fromC);
-      };
-
-      if (strategy === 'optimal') {
-        // Optimal: fill the 0% Grundfreibetrag bracket with brokerage gains
-        // first (Teilfreistellung -> /0.7 to convert tax-free room into gross
-        // brokerage withdrawal), THEN tax-free cash, THEN taxable brokerage.
-        const taxableRoom = Math.max(0, grundfreibetrag - pensionTaxable);
-        const brokInFreeband = Math.min(remaining, brok, taxableRoom / 0.7);
-        if (brokInFreeband > 0) {
-          brok -= brokInFreeband;
-          fromBrok += brokInFreeband;
-          remaining = Math.max(0, remaining - brokInFreeband);
-        }
-        withdrawCash();
-        withdrawTaxableBrokerage();
-      } else if (strategy === 'brokerage_first') {
-        withdrawTaxableBrokerage();
-        withdrawCash();
-      } else {
-        withdrawCash();
-        withdrawTaxableBrokerage();
-      }
-
-      brok *= (1 + returnRate); cash *= 1.01;
-      const shortfall = Math.max(0, Math.round(remaining));
-      years.push({ year: calYear, age, need: Math.round(need), fromBrokerage: Math.round(fromBrok), fromCash: Math.round(fromCash), fromPension: Math.round(netPension), taxPaid: Math.round(taxPaid), remaining: Math.round(brok + cash), shortfall });
-    }
-    return years;
+  const base: WithdrawalParams = {
+    retireAge,
+    yearsToRetire,
+    firstCalendarYear: thisYear + yearsToRetire,
+    annualNeed,
+    inflation: inflationPct / 100,
+    returnRate: returnPct / 100,
+    cashRate: 0.01,
+    pensionAdj: pensionAdjPct / 100,
+    capital: today.capital * growBrokerage,
+    capitalBasis: today.capital,
+    privateSale: today.privateSale * growBrokerage,
+    cash: today.cash * Math.pow(1 + cashGrowth, yearsToRetire),
+    tfs,
+    capRate: capitalIncomeTaxRate(churchRate),
+    allowance: SPARER_PAUSCHBETRAG * (joint ? 2 : 1),
+    pensions,
+    childless: toNum(crChildren) === 0,
+    joint,
+    churchRate,
+    years: 30,
   };
 
-  const optimal = simulate('optimal');
-  const brokFirst = simulate('brokerage_first');
-  const cashFirst = simulate('cash_first');
-
-  const totalTax = (sim: SimYear[]) => sim.reduce((s, y) => s + y.taxPaid, 0);
-  const depletionAge = (sim: SimYear[]) => sim.find(y => y.remaining <= 0 && y.shortfall > 0)?.age || sim.find(y => y.remaining <= 0)?.age || null;
-  const optTax = totalTax(optimal);
-  const worstNaive = Math.max(totalTax(brokFirst), totalTax(cashFirst));
-  const savings = worstNaive - optTax;
-
-  const runScenario = (inflRate: number, retRate: number, pensionAdj: number, careCostAge: number | null, careCostAnnual: number) => {
-    let brok = brokerageVal, cash = cashVal;
-    for (let y = 0; y < 40; y++) {
-      const age = retireAge + y;
-      const need = annualNeed * Math.pow(1 + inflRate, y) + (careCostAge && age >= careCostAge ? careCostAnnual : 0);
-      const { gross: pensionGross, taxable: pensionTaxable } = computePensionAtAge(age, y, pensionAdj);
-      const pensionTax = Math.max(0, pensionTaxable - grundfreibetrag) * (marginalRate / 100);
-      const netPension = Math.max(0, pensionGross - pensionTax);
-      let rem = Math.max(0, need - netPension);
-      const taxableRoom = Math.max(0, grundfreibetrag - pensionTaxable);
-      const freeBrok = Math.min(rem, brok, taxableRoom / 0.7);
-      if (freeBrok > 0) { brok -= freeBrok; rem = Math.max(0, rem - freeBrok); }
-      const fromC = Math.min(rem, cash); cash -= fromC; rem = Math.max(0, rem - fromC);
-      if (rem > 0 && brok > 0) {
-        const grossB = Math.min(brok, rem / (1 - brokTaxRate));
-        brok -= grossB;
-        rem = Math.max(0, rem - grossB * (1 - brokTaxRate));
-      }
-      brok *= (1 + retRate); cash *= 1.01;
-      if (brok + cash <= 0.5 && rem > 1) return age;
-    }
-    return null;
-  };
+  const results = ORDERS.map(o => {
+    const sim = simulateWithdrawals(base, o.id);
+    return { ...o, sim, tax: sim.reduce((s, y) => s + y.taxPaid, 0), left: sim[sim.length - 1]?.remaining ?? 0 };
+  });
+  const cheapest = results.reduce((a, b) => (b.tax < a.tax ? b : a));
+  const dearest = results.reduce((a, b) => (b.tax > a.tax ? b : a));
+  const savings = dearest.tax - cheapest.tax;
 
   const scenarios = [
-    { label: 'Base case', detail: 'Your inputs above', inflation: inflationRate, returns: returnRate, pensionAdj: pensionAdjRate, careAge: null as number | null, careCost: 0 },
-    { label: 'High inflation', detail: '3,5 % a year', inflation: 0.035, returns: returnRate, pensionAdj: pensionAdjRate, careAge: null, careCost: 0 },
-    { label: 'Low returns', detail: '2 % a year', inflation: inflationRate, returns: 0.02, pensionAdj: pensionAdjRate, careAge: null, careCost: 0 },
-    { label: 'No pension increases', detail: 'Pensions stay flat (no Rentenanpassung)', inflation: inflationRate, returns: returnRate, pensionAdj: 0, careAge: null, careCost: 0 },
-    { label: 'Long-term care', detail: '24.000 € a year extra from age 80', inflation: inflationRate, returns: returnRate, pensionAdj: pensionAdjRate, careAge: 80, careCost: 24000 },
-    { label: 'Worst case', detail: 'All four at once', inflation: 0.035, returns: 0.02, pensionAdj: 0, careAge: 80, careCost: 24000 },
+    { label: 'Base case', detail: 'Your inputs above', p: {} },
+    { label: 'High inflation', detail: '3,5 % a year', p: { inflation: 0.035 } },
+    { label: 'Low returns', detail: '2 % a year', p: { returnRate: 0.02 } },
+    { label: 'No pension increases', detail: 'Pensions stay flat (no Rentenanpassung)', p: { pensionAdj: 0 } },
+    { label: 'Long-term care', detail: '24.000 € a year extra from age 80, in today’s money', p: { careFromAge: 80, careCost: 24000 } },
+    { label: 'Worst case', detail: 'All four at once', p: { inflation: 0.035, returnRate: 0.02, pensionAdj: 0, careFromAge: 80, careCost: 24000 } },
   ];
 
-  const pensionSourceCount = pensionSources.filter(src => src.monthly_gross > 0 || src.rentenpunkte > 0).length;
-  const depletesAt = depletionAge(optimal);
+  const depletesAt = depletionAge(cheapest.sim);
 
   return (
     <Section
@@ -204,25 +143,31 @@ export default function WithdrawalSimulation() {
     >
       <div className="grid grid-cols-2 gap-x-3 gap-y-4 md:grid-cols-3">
         <NumberField label="Return in retirement" unit="% p.a." value={returnPct} onValueChange={setReturnPct} />
-        <NumberField label="Inflation" unit="% p.a." value={inflationPct} onValueChange={setInflationPct} />
+        <NumberField label="Inflation" unit="% p.a." value={inflationPct} onValueChange={v => setFireInflation(String(v))} hint="Shared with the FIRE Calculator." />
         <NumberField label="Yearly pension increase" unit="% p.a." value={pensionAdjPct} onValueChange={setPensionAdjPct} />
       </div>
 
       <SubHeading className="mt-6">Tax paid over 30 years, by withdrawal order</SubHeading>
       <MetricGrid className="mt-3">
-        <MetricCard label="Tax-optimised order" value={fmtEUR(optTax)} sublabel="Tax-free allowance first, then cash, then brokerage" />
-        <MetricCard label="Brokerage first" value={fmtEUR(totalTax(brokFirst))} sublabel="Sell investments before using cash" />
-        <MetricCard label="Cash first" value={fmtEUR(totalTax(cashFirst))} sublabel="Use cash before selling investments" />
+        {results.map(r => (
+          <MetricCard
+            key={r.id}
+            label={r.label}
+            value={fmtEUR(r.tax)}
+            sublabel={<>{r.detail}. <span data-privacy="blur">{fmtEUR(r.left)}</span> left after 30 years.</>}
+          />
+        ))}
       </MetricGrid>
 
-      {savings > 0 && (
-        <p className="mt-3 text-[14px] text-ink-body">
-          The tax-optimised order saves <span className="font-medium text-sage" data-privacy="blur">{fmtEUR(savings)}</span> in tax compared with the more expensive of the other two.
-        </p>
-      )}
+      <p className="mt-3 text-[14px] text-ink-body">
+        {savings >= 1
+          ? <>“{cheapest.label}” pays the least tax: <span className="font-medium text-sage" data-privacy="blur">{fmtEUR(savings)}</span> less than “{dearest.label}”.</>
+          : 'All three orders pay about the same tax.'}
+        {' '}Every order gets the same allowances, including the lower personal rate on capital gains where it applies (Günstigerprüfung).
+      </p>
 
-      <SubHeading className="mt-6">Tax-optimised order, year by year</SubHeading>
-      <p className="mt-1 mb-3 text-[13px] text-ink-muted">Amounts per year. The first ten years, then every fifth.</p>
+      <SubHeading className="mt-6">“{cheapest.label}”, year by year</SubHeading>
+      <p className="mt-1 mb-3 text-[13px] text-ink-muted">Amounts per year, in euros of that year. The first ten years, then every fifth.</p>
       <ScrollTable label="Withdrawal simulation, year by year">
         <table className="apple-table min-w-[680px]">
           <thead>
@@ -237,7 +182,7 @@ export default function WithdrawalSimulation() {
             </tr>
           </thead>
           <tbody>
-            {optimal.filter((_, i) => i < 10 || i % 5 === 0).map(y => (
+            {cheapest.sim.filter((_, i) => i < 10 || i % 5 === 0).map(y => (
               <tr key={y.year}>
                 <td className="whitespace-nowrap">{y.year} <span className="text-ink-muted">({y.age})</span></td>
                 <td className="num" data-privacy="blur">{fmtEUR(y.need)}</td>
@@ -262,10 +207,10 @@ export default function WithdrawalSimulation() {
       )}
 
       <SubHeading className="mt-6">Stress tests</SubHeading>
-      <p className="mt-1 text-[13px] text-ink-muted">The tax-optimised order over 40 years, with one assumption changed at a time.</p>
+      <p className="mt-1 text-[13px] text-ink-muted">“{cheapest.label}” over 40 years, with one assumption changed at a time.</p>
       <ul className="mt-2 border-t border-divider">
         {scenarios.map(s => {
-          const deplAge = runScenario(s.inflation, s.returns, s.pensionAdj, s.careAge, s.careCost);
+          const deplAge = depletionAge(simulateWithdrawals({ ...base, years: 40, ...s.p }, cheapest.id));
           const survives = deplAge === null;
           return (
             <li key={s.label} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-divider py-2.5">
@@ -283,20 +228,21 @@ export default function WithdrawalSimulation() {
 
       <Assumptions>
         <p>
-          {explicitAnnualPension > 0
-            ? <>Pension: <span data-privacy="blur">{fmtEUR(explicitAnnualPension)}</span> a year from age 67 — the “Pension income in retirement” figure from the FIRE Calculator — with 83 % of it taxable.</>
-            : pensionSourceCount > 0
-              ? <>Pension: your {pensionSourceCount} pension {pensionSourceCount === 1 ? 'source' : 'sources'} from Pension Gap, each from its own start age; pension points are valued at 39,32 € a month each.</>
-              : <>Pension: none. No pension is entered in the FIRE Calculator or under Pension Gap, so the portfolio covers all spending.</>}
-          {' '}It rises {fmtPct(pensionAdjPct)} a year.
+          {sources.length > 0
+            ? <>Pension: your {sources.length} pension {sources.length === 1 ? 'source' : 'sources'} from Pension Gap, each from its own start age (the statutory pension not before 63, reduced 0,3 % a month before 67); pension points are worth {fmtEUR(RENTENWERT, { cents: true })} a month each. The taxable share follows the start year (statutory and Rürup) or age (private annuities); company and Riester pensions are taxed in full.</>
+            : explicitAnnualPension > 0
+              ? <>Pension: <span data-privacy="blur">{fmtEUR(explicitAnnualPension)}</span> a year after tax from age {retireAge} — the “Pension income in retirement” figure from the FIRE Calculator.</>
+              : <>Pension: none. No pension is entered under Pension Gap or in the FIRE Calculator, so the portfolio covers all spending.</>}
+          {' '}Pensions are in today’s money and rise {fmtPct(pensionAdjPct)} a year from today.
         </p>
         <p>
-          Starting balances: today’s brokerage, crypto and precious-metal accounts grow {fmtPct(brokerageGrowth)} a year and cash {fmtPct(cashGrowth)} a year until retirement (the rates set in Withdrawal Sources), with no further deposits.
+          Starting balances: today’s brokerage, crypto and precious-metal accounts grow {fmtPct(brokerageGrowth * 100)} a year and cash {fmtPct(cashGrowth * 100)} a year until retirement (the rates set in Withdrawal Sources), with no further deposits; loans and accounts below zero are left out.
         </p>
-        <p>In retirement, investments return {fmtPct(returnPct)} a year and cash earns 1 % a year; spending of <span data-privacy="blur">{fmtEUR(annualNeed)}</span> a year (your annual expenses) rises with inflation.</p>
         <p>
-          Tax: brokerage withdrawals at 18,5 % (26,375 % flat-rate tax after the 30 % partial exemption for equity funds, applied to the whole withdrawal);
-          pension income above the 11.604 € basic allowance (Grundfreibetrag) at your {fmtPct(marginalRate, { digits: 0 })} marginal rate. The allowance stays fixed for all years.
+          Spending of <span data-privacy="blur">{fmtEUR(annualNeed)}</span> a year in today’s money rises {fmtPct(inflationPct)} a year from today, so the first retirement year needs <span data-privacy="blur">{fmtEUR(annualNeed * Math.pow(1 + inflationPct / 100, yearsToRetire))}</span>. In retirement, investments return {fmtPct(returnPct)} a year and cash earns 1 %.
+        </p>
+        <p>
+          Tax: pensions with the 2026 income-tax tariff on their combined taxable part (basic allowance {fmtEUR(GRUNDFREIBETRAG_2026)}, assumed to rise with prices), after health and care insurance of retirees. Brokerage sales are taxed only on their gain, at {fmtPct(base.capRate * 100, { digits: 3 })} after the {fmtPct(tfs * 100, { digits: 0 })} partial exemption and the {fmtEUR(base.allowance)} saver’s allowance, or at your personal rate if lower; today’s balance counts as the amount paid in. Crypto and gold held over a year are tax-free.
         </p>
       </Assumptions>
     </Section>

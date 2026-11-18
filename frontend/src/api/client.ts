@@ -624,14 +624,20 @@ export interface ProjectionData {
   current_value: number;
   target_amount: number;
   target_date: string;
+  /** Name of the goal behind target_amount / target_date (drawn as a reference line only). */
+  target_goal_name?: string;
   contribution: number;
+  /** Trailing 12-month net contribution (deposits − withdrawals + vests) ÷ months covered, regardless of overrides. */
+  default_contribution?: number;
+  contribution_basis?: { kind: string; months_covered: number; deposits: number; withdrawals: number; in_kind: number };
   return_pct: number;
   horizon_years?: number;
   contrib_growth_pct?: number;
   has_confidence?: boolean;
   sensitivity?: SensitivityBar[];
   projection_end?: number;
-  milestones?: { year: number; years_from_now: number; projected_value: number; contributions: number; growth: number; real_value: number }[];
+  /** contributions excludes starting_value: projected_value = starting_value + contributions + growth. */
+  milestones?: { year: number; years_from_now: number; projected_value: number; starting_value?: number; contributions: number; growth: number; real_value: number }[];
   projection_accuracy?: {
     months_ago: number;
     past_value: number;
@@ -639,6 +645,10 @@ export interface ProjectionData {
     actual_value: number;
     diff_eur: number;
     diff_pct: number;
+    /** "default_projection_then": the default projection as of 12 months ago (value then, trailing contribution then, default return). */
+    basis?: string;
+    assumed_contribution?: number;
+    assumed_return_pct?: number;
   };
   drawdown?: {
     series: { date: string; value: number }[];
@@ -649,7 +659,40 @@ export interface ProjectionData {
     success_rate: number;
     tax_breakdown?: { year: number; gross_withdrawal: number; estimated_tax: number; net_received: number; effective_rate_pct: number; remaining_value: number }[];
     cumulative_tax: number;
+    // FIRE model fields (Planning). Amounts are in today's euros.
+    reached?: boolean;
+    fire_number_nominal?: number;
+    months_to_fire?: number;
+    first_year_withdrawal?: number;
+    first_year_tax?: number;
+    spending_gap?: number;
+    bridge_years?: number;
+    bridge_reserve?: number;
+    pension_from_age?: number;
+    gain_share_pct?: number;
+    teilfreistellung_pct?: number;
+    tax_rate_pct?: number;
+    allowance?: number;
+    inflation_pct?: number;
+    swr_pct?: number;
+    in_todays_euros?: boolean;
   };
+}
+
+/** FIRE inputs for the projection endpoint (Planning page). Amounts in today's euros a year. */
+export interface FireProjectionParams {
+  contribution?: number;
+  returnPct?: number;
+  /** Spending the portfolio and the pension must cover (after other income). */
+  expenses?: number;
+  swr?: number;
+  /** Pension after tax, paid from pensionAge. */
+  pension?: number;
+  currentAge?: number;
+  pensionAge?: number;
+  inflationPct?: number;
+  churchRate?: number;
+  joint?: boolean;
 }
 
 export interface RebalanceTrade {
@@ -862,6 +905,21 @@ export const api = {
     if (taxPortion != null && taxPortion >= 0 && taxPortion <= 1) params.set('tax_portion', String(taxPortion));
     if (horizonYears != null && horizonYears >= 1 && horizonYears <= 50) params.set('horizon_years', String(horizonYears));
     if (contribGrowth != null && contribGrowth >= 0 && contribGrowth <= 20) params.set('contrib_growth', String(contribGrowth));
+    const qs = params.toString();
+    return request<ProjectionData>(`/portfolio/projection${qs ? `?${qs}` : ''}`);
+  },
+  getFireProjection: (p: FireProjectionParams) => {
+    const params = new URLSearchParams();
+    if (p.contribution != null && Number.isFinite(p.contribution)) params.set('contribution', String(p.contribution));
+    if (p.returnPct != null && Number.isFinite(p.returnPct)) params.set('return_pct', String(p.returnPct));
+    if (p.expenses != null && p.expenses > 0) params.set('expenses', String(p.expenses));
+    if (p.swr != null && p.swr > 0) params.set('swr', String(p.swr));
+    if (p.pension != null && p.pension > 0) params.set('pension', String(p.pension));
+    if (p.currentAge != null && p.currentAge > 0) params.set('current_age', String(Math.round(p.currentAge)));
+    if (p.pensionAge != null && p.pensionAge > 0) params.set('pension_age', String(Math.round(p.pensionAge)));
+    if (p.inflationPct != null && Number.isFinite(p.inflationPct)) params.set('inflation', String(p.inflationPct));
+    if (p.churchRate != null && p.churchRate > 0) params.set('church_rate', String(p.churchRate));
+    if (p.joint) params.set('joint', '1');
     const qs = params.toString();
     return request<ProjectionData>(`/portfolio/projection${qs ? `?${qs}` : ''}`);
   },

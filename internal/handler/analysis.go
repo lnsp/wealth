@@ -3226,16 +3226,16 @@ func (h *AnalysisHandler) HandleHealthScore(w http.ResponseWriter, r *http.Reque
 
 	// Risk on the investable series (cash + securities): the house, the car
 	// and the mortgage are not part of the portfolio's risk.
+	// Same series, flows and risk-free rate as the Risk tab, so the two agree.
 	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 3000)
-	points := make([]analytics.DailyValuation, 0, len(snaps))
-	for i := len(snaps) - 1; i >= 0; i-- {
-		if val := investableNetWorth(snaps[i]); val > 0 {
-			points = append(points, analytics.DailyValuation{Date: snaps[i].Date, Value: val})
-		}
-	}
+	points := investableRiskSeries(snaps)
 	if len(points) > 60 {
-		adjustedPoints := analytics.BuildCashflowAdjustedSeries(points, h.buildExternalFlowsForRisk(ctx))
-		metrics := analytics.ComputeRiskMetrics(adjustedPoints, 0.03, points[len(points)-1].Value)
+		adjustedPoints := analytics.BuildCashflowAdjustedSeries(points, h.buildInvestableFlowsForRisk(ctx))
+		riskFreeRate := 0.0
+		if prepared := analytics.PrepareRiskSeries(adjustedPoints); len(prepared) >= 2 {
+			riskFreeRate = analytics.AverageRiskFreeRate(prepared[0].Date, prepared[len(prepared)-1].Date)
+		}
+		metrics := analytics.ComputeRiskMetrics(adjustedPoints, riskFreeRate, points[len(points)-1].Value)
 		in.HasRisk = true
 		in.Sharpe = metrics.SharpeRatio
 		in.Volatility = metrics.AnnualizedVolatility

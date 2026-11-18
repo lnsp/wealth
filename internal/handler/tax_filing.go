@@ -1012,6 +1012,15 @@ func firstWorkingDayOfYear(year int) time.Time {
 //     (2024 → 30.04.2026). From 2025 the regular rule applies again, so 2025 →
 //     28.02.2027, a Sunday, → 01.03.2027; 2026 → 29.02.2028.
 //     Source: lxgesetze.de/egao/97-36, checked 2026-11-18.
+// IncomeTaxReturnDeadlines exposes incomeTaxReturnDeadlines (already rolled
+// past weekends and holidays) for the scheduler's reminders.
+func IncomeTaxReturnDeadlines(taxYear int) (unadvised, advised time.Time) {
+	return incomeTaxReturnDeadlines(taxYear)
+}
+
+// FirstWorkingDayOfYear is the day the Vorabpauschale is debited (§ 18 Abs. 3 InvStG).
+func FirstWorkingDayOfYear(year int) time.Time { return firstWorkingDayOfYear(year) }
+
 func incomeTaxReturnDeadlines(taxYear int) (unadvised, advised time.Time) {
 	d := func(y int, m time.Month, day int) time.Time { return time.Date(y, m, day, 0, 0, 0, 0, time.UTC) }
 	switch taxYear {

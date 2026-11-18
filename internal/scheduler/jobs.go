@@ -23,6 +23,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"github.com/lnsp/wealth/internal/assets"
+	"github.com/lnsp/wealth/internal/handler"
 	db "github.com/lnsp/wealth/internal/database/generated"
 	"github.com/lnsp/wealth/internal/market"
 )
@@ -2181,9 +2182,9 @@ func (s *Scheduler) checkTaxCalendarReminders() {
 
 	var events []taxEvent
 
-	// Vorabpauschale (Jan 2)
+	// Vorabpauschale: debited on the first working day of the year.
 	events = append(events, taxEvent{
-		date:  time.Date(year, 1, 2, 0, 0, 0, 0, time.UTC),
+		date:  handler.FirstWorkingDayOfYear(year),
 		title: "Vorabpauschale",
 	})
 
@@ -2191,21 +2192,23 @@ func (s *Scheduler) checkTaxCalendarReminders() {
 	events = append(events, taxEvent{
 		date:    time.Date(year, 1, 15, 0, 0, 0, 0, time.UTC),
 		title:   "Freistellungsauftrag",
-		message: "Prüfen Sie, ob Ihr FSA (1.000 EUR) optimal auf Ihre Depots verteilt ist.",
+		message: "Check that your Freistellungsauftrag (1,000 € single, 2,000 € joint) is split across your German banks the way your income is.",
 	})
 
-	// Steuererklärung (Jul 31)
+	// Steuererklärung: § 149 AO deadline for last year's return without an
+	// adviser, rolled past weekends and holidays (§ 108 Abs. 3 AO).
+	returnDue, _ := handler.IncomeTaxReturnDeadlines(year - 1)
 	events = append(events, taxEvent{
-		date:    time.Date(year, 7, 31, 0, 0, 0, 0, time.UTC),
+		date:    returnDue,
 		title:   "Steuererklärung",
-		message: fmt.Sprintf("Einkommensteuererklärung %d einreichen (Frist: 31.07.%d).", year-1, year),
+		message: fmt.Sprintf("File your %d income tax return (due %s without a tax adviser).", year-1, returnDue.Format("02.01.2006")),
 	})
 
 	// Verlustbescheinigung (Dec 15)
 	events = append(events, taxEvent{
 		date:    time.Date(year, 12, 15, 0, 0, 0, 0, time.UTC),
 		title:   "Verlustbescheinigung",
-		message: "Verlustbescheinigung bei der Bank beantragen (Frist: 15.12.).",
+		message: "Request a Verlustbescheinigung from any bank holding unused losses if you want to offset them against gains at another bank (deadline 15 December, § 43a Abs. 3 S. 4 EStG).",
 	})
 
 	// Contribution Routing Review (Jan 10)
@@ -2232,10 +2235,10 @@ func (s *Scheduler) checkTaxCalendarReminders() {
 	// Vorabpauschale due on Jan 2 of `year` applies to the preceding tax year (`year - 1`)
 	vpTax := s.computeSchedulerVorabpauschaleTax(ctx, year-1)
 	if vpTax > 10 {
-		events[0].message = fmt.Sprintf("Vorabpauschale: ~%s EUR fällig am 02.01. Verrechnungskonto prüfen.", fmtEUR(vpTax))
+		events[0].message = fmt.Sprintf("Vorabpauschale: about %s € will be debited on %s. Make sure the settlement account is funded.", fmtEUR(vpTax), events[0].date.Format("02.01.2006"))
 		events[0].amount = vpTax
 	} else {
-		events[0].message = "Vorabpauschale: Kein relevanter Betrag für dieses Jahr."
+		events[0].message = "Vorabpauschale: no material amount this year."
 	}
 
 	// Check each event: if within 14 days, create notification (if not already sent)

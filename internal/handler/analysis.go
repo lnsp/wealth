@@ -131,7 +131,7 @@ func buildTaxTransactions(
 		if name == "" && txn.Counterparty.Valid {
 			name = txn.Counterparty.String
 		}
-		_, hasSec := secMap[isin]
+		sec, hasSec := secMap[isin]
 		tfs := tfsMap[isin]
 
 		taxTxns = append(taxTxns, analytics.TaxTransaction{
@@ -144,6 +144,7 @@ func buildTaxTransactions(
 			Quantity:       qty,
 			Amount:         taxAmt,
 			IsEquityFund:   equityMap[isin],
+			AssetClass:     sec.AssetClass, // loss pot (stock → Aktientopf) and §23 exclusion (crypto, commodity)
 			TFS:            tfs,
 			HasExplicitTFS: hasSec,
 		})
@@ -985,16 +986,20 @@ func (h *AnalysisHandler) HandleRisk(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleTax computes German tax summary for a given year.
+// Query: year, joint=1 (Zusammenveranlagung), church_tax=0.08|0.09.
 func (h *AnalysisHandler) HandleTax(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	yearStr := r.URL.Query().Get("year")
-	year := time.Now().Year()
+	now := time.Now()
+	curYear := now.Year()
+	year := curYear
 	if yearStr != "" {
 		if y, err := strconv.Atoi(yearStr); err == nil && y >= 2020 && y <= 2100 {
 			year = y
 		}
 	}
+	opts := taxOptionsFromRequest(r)
 
 	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
@@ -1014,51 +1019,47 @@ func (h *AnalysisHandler) HandleTax(w http.ResponseWriter, r *http.Request) {
 		secMap[s.ISIN] = s
 	}
 
-	taxTxns, _, tfsMap, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
+	taxTxns, names, tfsMap, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
+	curPrices := h.currentUnitPricesEUR(ctx)
 
-	// Compute tax-loss harvesting hints aggregated across accounts per ISIN (in EUR)
-	enriched, _ := h.loadEnrichedHoldings(ctx)
-	type aggHolding struct {
-		name      string
-		value     float64
-		costValue float64
-		tfs       float64
-	}
-	aggByISIN := make(map[string]*aggHolding)
-	var isinOrder []string
-	for _, eh := range enriched {
-		ah, ok := aggByISIN[eh.security.ISIN]
-		if !ok {
-			ah = &aggHolding{
-				name: eh.security.Name,
-				tfs:  securityTFSRate(eh.security),
-			}
-			aggByISIN[eh.security.ISIN] = ah
-			isinOrder = append(isinOrder, eh.security.ISIN)
-		}
-		ah.value += eh.value
-		ah.costValue += eh.costValue
-	}
+	// Vorabpauschalen of completed years: taxed in the following January
+	// (§18 Abs. 3 InvStG) and deducted from later sale gains (§19 Abs. 1 S. 3).
+	vpEvents := h.vorabpauschaleEvents(ctx, taxTxns, secMap, tfsMap, histFX, fxRates, 0, curYear-1, nil)
+	ledgerTxns := analytics.MergeVorabpauschaleEvents(taxTxns, vpEvents)
+
+	// Loss-harvest hints only make sense for the running year.
 	var hints []analytics.TaxLossHint
-	for _, isin := range isinOrder {
-		ah := aggByISIN[isin]
-		unrealizedPL := ah.value - ah.costValue
-		if unrealizedPL < -10 { // only suggest if meaningful loss
-			saving := (-unrealizedPL) * (1 - ah.tfs) * analytics.EffectiveTaxRate
-			hints = append(hints, analytics.TaxLossHint{
-				ISIN:            isin,
-				Name:            ah.name,
-				UnrealizedPL:    math.Round(unrealizedPL*100) / 100,
-				PotentialSaving: math.Round(saving*100) / 100,
-			})
-		}
+	if year == curYear {
+		hints = h.lossHarvestHints(ctx, ledgerTxns, curPrices, names, equityMap, now, opts)
 	}
 
-	// Compute available years from transactions
+	summary := analytics.ComputeTaxSummaryWithOptions(ledgerTxns, year, hints, opts)
+
+	// The table shows the Vorabpauschale computed for calendar year `year`,
+	// which is taxed in January of year+1. For the running year it is an
+	// estimate with today's price standing in for the year-end price.
+	var vorabpauschale []analytics.VorabpauschaleEntry
+	switch {
+	case year < curYear:
+		vorabpauschale = analytics.VorabpauschaleForYear(ledgerTxns, year, opts)
+	case year == curYear:
+		est := h.vorabpauschaleEvents(ctx, taxTxns, secMap, tfsMap, histFX, fxRates, curYear, curYear, curPrices)
+		vorabpauschale = analytics.VorabpauschaleForYear(analytics.MergeVorabpauschaleEvents(taxTxns, append(append([]analytics.TaxTransaction{}, vpEvents...), est...)), year, opts)
+	}
+	if vorabpauschale == nil {
+		vorabpauschale = []analytics.VorabpauschaleEntry{}
+	}
+
+	// Years with any realised sale or income (including Vorabpauschale
+	// received in January and §23 private sales).
 	yearSet := make(map[int]bool)
-	for _, t := range taxTxns {
-		if t.Type == "sell" || t.Type == "dividend" || t.Type == "interest" {
-			yearSet[t.Year] = true
+	sales, income := analytics.RealizedTaxEvents(ledgerTxns)
+	for _, s := range sales {
+		yearSet[s.Year] = true
+	}
+	for _, e := range income {
+		if e.Year <= curYear {
+			yearSet[e.Year] = true
 		}
 	}
 	availableYears := []int{}
@@ -1067,25 +1068,126 @@ func (h *AnalysisHandler) HandleTax(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(availableYears, func(i, j int) bool { return availableYears[i] > availableYears[j] })
 
-	summary := analytics.ComputeTaxSummary(taxTxns, year, hints)
-
-	curValByISIN := make(map[string]float64, len(aggByISIN))
-	curQtyByISIN := make(map[string]float64, len(enriched))
-	for _, eh := range enriched {
-		curValByISIN[eh.security.ISIN] += eh.value
-		curQtyByISIN[eh.security.ISIN] += numericToFloat(eh.holding.Quantity)
-	}
-	vorabpauschale := h.computeYearVorabpauschale(ctx, year, txns, secMap, tfsMap, curValByISIN, curQtyByISIN, histFX, fxRates)
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"summary":         summary,
-		"available_years": availableYears,
-		"vorabpauschale":  vorabpauschale,
+		"summary":                 summary,
+		"available_years":         availableYears,
+		"vorabpauschale":          vorabpauschale,
+		"vorabpauschale_year":     year,
+		"vorabpauschale_taxed_in": year + 1,
+		"vorabpauschale_estimate": year == curYear,
 	})
 }
 
-// computeYearVorabpauschale computes § 18 InvStG Vorabpauschale entries for `year`,
-// FIFO-deducting in-year sales/transfers per depot via analytics.ReconstructVorabpauschaleYear.
+// taxOptionsFromRequest reads the filing settings the Tax page keeps in the
+// browser: ?joint=1 (Zusammenveranlagung, doubles the Sparer-Pauschbetrag)
+// and ?church_tax=0.08|0.09 (Kirchensteuer, deductible per §32d Abs. 1 EStG).
+func taxOptionsFromRequest(r *http.Request) analytics.TaxOptions {
+	opts := analytics.TaxOptions{Joint: r.URL.Query().Get("joint") == "1"}
+	if v := r.URL.Query().Get("church_tax"); v != "" {
+		if f, err := parseFiniteFloat(v); err == nil && f >= 0 && f <= 1 {
+			opts.ChurchTaxRate = f
+		}
+	}
+	return opts
+}
+
+// currentUnitPricesEUR returns today's EUR price per unit for every security
+// currently held (latest price at the latest FX rate).
+func (h *AnalysisHandler) currentUnitPricesEUR(ctx context.Context) map[string]float64 {
+	value := make(map[string]float64)
+	qty := make(map[string]float64)
+	enriched, _ := h.loadEnrichedHoldings(ctx)
+	for _, eh := range enriched {
+		q := numericToFloat(eh.holding.Quantity)
+		if eh.value > 0 && q > 0 {
+			value[eh.security.ISIN] += eh.value
+			qty[eh.security.ISIN] += q
+		}
+	}
+	prices := make(map[string]float64, len(value))
+	for isin, v := range value {
+		prices[isin] = v / qty[isin]
+	}
+	return prices
+}
+
+// vorabpauschaleEvents builds one "vorabpauschale" pseudo-transaction per
+// fund and calendar year in [fromYear, throughYear], starting no earlier than
+// the fund's first acquisition. Each carries the EUR redemption price at the
+// start of the year (last close on or before 1 January) and at its end (last
+// close on or before 31 December, §18 Abs. 1 InvStG). For the running year
+// the year-end price is today's price from curPrices.
+func (h *AnalysisHandler) vorabpauschaleEvents(
+	ctx context.Context,
+	taxTxns []analytics.TaxTransaction,
+	secMap map[string]db.Security,
+	tfsMap map[string]float64,
+	histFX []market.HistoricalFXRate,
+	fxRates map[string]float64,
+	fromYear, throughYear int,
+	curPrices map[string]float64,
+) []analytics.TaxTransaction {
+	firstYear := make(map[string]int)
+	for _, t := range taxTxns {
+		if t.ISIN == "" || t.Quantity <= 0 || (t.Type != "buy" && t.Type != "savings_plan" && t.Type != "transfer") {
+			continue
+		}
+		sec, ok := secMap[t.ISIN]
+		if !ok || (sec.AssetClass != "etf" && sec.AssetClass != "fund") {
+			continue
+		}
+		if y, seen := firstYear[t.ISIN]; !seen || t.Year < y {
+			firstYear[t.ISIN] = t.Year
+		}
+	}
+	isins := make([]string, 0, len(firstYear))
+	for isin := range firstYear {
+		isins = append(isins, isin)
+	}
+	sort.Strings(isins)
+
+	curYear := time.Now().Year()
+	var events []analytics.TaxTransaction
+	for _, isin := range isins {
+		sec := secMap[isin]
+		start := firstYear[isin]
+		if fromYear > start {
+			start = fromYear
+		}
+		for y := start; y <= throughYear; y++ {
+			if bz, ok := analytics.BasiszinsByYear[y]; !ok || bz <= 0 {
+				continue
+			}
+			p0 := h.priceEURNear(ctx, isin, time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC), histFX, fxRates)
+			p1 := 0.0
+			if y == curYear && curPrices != nil {
+				p1 = curPrices[isin]
+			}
+			if p1 <= 0 {
+				p1 = h.priceEURNear(ctx, isin, time.Date(y, 12, 31, 0, 0, 0, 0, time.UTC), histFX, fxRates)
+			}
+			events = append(events, analytics.TaxTransaction{
+				Date:           fmt.Sprintf("%04d-12-31", y),
+				Year:           y,
+				Type:           "vorabpauschale",
+				ISIN:           isin,
+				Name:           sec.Name,
+				AssetClass:     sec.AssetClass,
+				TFS:            tfsMap[isin],
+				HasExplicitTFS: true,
+				VPJan1Price:    p0,
+				VPYearEndPrice: p1,
+			})
+		}
+	}
+	return events
+}
+
+// computeYearVorabpauschale returns the per-fund Vorabpauschale for calendar
+// year `year` (taxed in January year+1), computed by the tax ledger: units
+// held at year end with their original acquisition dates, start-of-year
+// prices, the cap and the 1/12 reduction after it (§18 InvStG). For the
+// running year, today's value stands in for the year-end price.
 func (h *AnalysisHandler) computeYearVorabpauschale(
 	ctx context.Context,
 	year int,
@@ -1097,76 +1199,120 @@ func (h *AnalysisHandler) computeYearVorabpauschale(
 	histFX []market.HistoricalFXRate,
 	fxRates map[string]float64,
 ) []analytics.VorabpauschaleEntry {
-	jan1Date := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
-	yearEndDate := time.Date(year, 12, 31, 0, 0, 0, 0, time.UTC)
+	secs := make([]db.Security, 0, len(secMap))
+	for _, s := range secMap {
+		secs = append(secs, s)
+	}
+	taxTxns, _, _, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
+	curPrices := make(map[string]float64, len(curValByISIN))
+	for isin, v := range curValByISIN {
+		if q := curQtyByISIN[isin]; v > 0 && q > 0 {
+			curPrices[isin] = v / q
+		}
+	}
+	events := h.vorabpauschaleEvents(ctx, taxTxns, secMap, tfsMap, histFX, fxRates, 0, year, curPrices)
+	return analytics.VorabpauschaleForYear(analytics.MergeVorabpauschaleEvents(taxTxns, events), year, analytics.TaxOptions{})
+}
 
-	vpTxns := make([]analytics.VorabpauschaleTxn, 0, len(txns))
-	for i := len(txns) - 1; i >= 0; i-- {
-		txn := txns[i]
-		if txn.Date.After(yearEndDate) || !txn.SecurityISIN.Valid {
+// priceEURNear returns the last EUR close on or before date, ignoring prices
+// more than a month older (a stale price would misstate the year's change).
+func (h *AnalysisHandler) priceEURNear(ctx context.Context, isin string, date time.Time, histFX []market.HistoricalFXRate, fxRates map[string]float64) float64 {
+	row, err := h.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{SecurityISIN: isin, Date: date})
+	if err != nil || !row.Close.Valid || date.Sub(row.Date) > 31*24*time.Hour {
+		return 0
+	}
+	return convertAmountToEURAtDate(numericToFloat(row.Close), row.Currency, row.Date, histFX, fxRates)
+}
+
+// lossHarvestHints lists depot positions whose FIFO sale today (cost basis at
+// purchase-date FX, value at today's price) would realise a loss, with the
+// reduction in this year's tax that sale would bring. The saving runs through
+// the full engine, so a share loss only counts against share gains, and
+// nothing is saved when this year's income is already covered by the
+// Sparer-Pauschbetrag or carried losses — the loss then just carries forward.
+func (h *AnalysisHandler) lossHarvestHints(
+	ctx context.Context,
+	ledgerTxns []analytics.TaxTransaction,
+	prices map[string]float64,
+	names map[string]string,
+	equityMap map[string]bool,
+	now time.Time,
+	opts analytics.TaxOptions,
+) []analytics.TaxLossHint {
+	acctNames := make(map[string]string)
+	if accts, err := h.queries.ListAccounts(ctx); err == nil {
+		for _, a := range accts {
+			acctNames[a.ID.String()] = a.Name
+		}
+	}
+	return computeLossHarvestHints(ledgerTxns, prices, names, equityMap, acctNames, now, opts)
+}
+
+// computeLossHarvestHints is the DB-free core of lossHarvestHints.
+func computeLossHarvestHints(
+	ledgerTxns []analytics.TaxTransaction,
+	prices map[string]float64,
+	names map[string]string,
+	equityMap map[string]bool,
+	acctNames map[string]string,
+	now time.Time,
+	opts analytics.TaxOptions,
+) []analytics.TaxLossHint {
+	lots := analytics.ComputeTaxLots(ledgerTxns, prices, names, equityMap)
+	type position struct {
+		acct, isin string
+		lots       []analytics.TaxLot
+		pl         float64
+		taxable    float64
+	}
+	byKey := make(map[string]*position)
+	var order []string
+	for _, l := range lots {
+		if l.PrivateSale || prices[l.ISIN] <= 0 {
 			continue
 		}
-		isin := txn.SecurityISIN.String
-		sec, ok := secMap[isin]
-		if !ok || (sec.AssetClass != "etf" && sec.AssetClass != "fund") {
-			continue
+		k := l.AccountID + "|" + l.ISIN
+		p, ok := byKey[k]
+		if !ok {
+			p = &position{acct: l.AccountID, isin: l.ISIN}
+			byKey[k] = p
+			order = append(order, k)
 		}
-		qty := numericToFloat(txn.Quantity)
-		amtEUR := convertAmountToEURAtDate(numericToFloat(txn.Amount), txn.Currency, txn.Date, histFX, fxRates)
-		feeEUR := convertAmountToEURAtDate(numericToFloat(txn.Fee), txn.Currency, txn.Date, histFX, fxRates)
-		if txn.Type == "buy" || txn.Type == "savings_plan" || txn.Type == "transfer" {
-			amtEUR += feeEUR
-		}
-		vpTxns = append(vpTxns, analytics.VorabpauschaleTxn{
-			AccountID: txn.AccountID.String(),
-			ISIN:      isin,
-			Year:      txn.Date.Year(),
-			Month:     int(txn.Date.Month()),
-			Type:      txn.Type,
-			Quantity:  qty,
-			AmountEUR: amtEUR,
-		})
+		p.lots = append(p.lots, l)
+		p.pl += l.UnrealizedPL
+		p.taxable += (l.CurrentValue - l.CostBasis - l.VorabpauschaleTaxed) * (1 - l.TFSRate)
 	}
 
-	positions := analytics.ReconstructVorabpauschaleYear(year, vpTxns)
-	var vpInputs []analytics.VorabpauschaleInput
-	for isin, pos := range positions {
-		sec := secMap[isin]
-		jan1Val := 0.0
-		if pos.Jan1Qty > 1e-9 {
-			if priceRow, err := h.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{SecurityISIN: isin, Date: jan1Date}); err == nil && priceRow.Close.Valid {
-				p := convertAmountToEURAtDate(numericToFloat(priceRow.Close), priceRow.Currency, priceRow.Date, histFX, fxRates)
-				jan1Val = pos.Jan1Qty * p
-			}
-			if jan1Val <= 0 {
-				jan1Val = pos.Jan1CostEUR
-			}
+	base := analytics.ComputeTaxSummaryWithOptions(ledgerTxns, now.Year(), nil, opts).EstimatedTax
+	var hints []analytics.TaxLossHint
+	for _, k := range order {
+		p := byKey[k]
+		if p.pl >= -10 || p.taxable >= 0 { // only meaningful losses
+			continue
 		}
-		yearEndVal := 0.0
-		if year == time.Now().Year() {
-			if v := curValByISIN[isin]; v > 0 {
-				yearEndVal = v
-			}
-		}
-		if yearEndVal <= 0 {
-			if priceRow, err := h.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{SecurityISIN: isin, Date: yearEndDate}); err == nil && priceRow.Close.Valid {
-				p := convertAmountToEURAtDate(numericToFloat(priceRow.Close), priceRow.Currency, priceRow.Date, histFX, fxRates)
-				yearEndVal = pos.YearEndQty * p
-			} else if curValByISIN[isin] > 0 && curQtyByISIN[isin] > 0 {
-				yearEndVal = pos.YearEndQty * (curValByISIN[isin] / curQtyByISIN[isin])
-			}
-		}
-		vpInputs = append(vpInputs, analytics.VorabpauschaleInput{
-			ISIN:          isin,
-			Name:          sec.Name,
-			Jan1Value:     jan1Val,
-			YearEndValue:  yearEndVal,
-			Distributions: pos.Distributions,
-			MidYearBuys:   pos.MidYearBuys,
-			TFSRate:       tfsMap[isin],
+		all := make([]analytics.TaxTransaction, 0, len(ledgerTxns)+1)
+		all = append(all, ledgerTxns...)
+		all = append(all, analytics.HypotheticalSellTxns(p.lots, now)...)
+		with := analytics.ComputeTaxSummaryWithOptions(all, now.Year(), nil, opts).EstimatedTax
+		pot := p.lots[0].Pot
+		hints = append(hints, analytics.TaxLossHint{
+			ISIN:            p.isin,
+			Name:            p.lots[0].Name,
+			UnrealizedPL:    math.Round(p.pl*100) / 100,
+			PotentialSaving: math.Round(math.Max(0, base-with)*100) / 100,
+			AccountID:       p.acct,
+			Account:         acctNames[p.acct],
+			TaxableLoss:     math.Round(p.taxable*100) / 100,
+			Pot:             pot,
 		})
 	}
-	return analytics.ComputeVorabpauschaleDetailed(year, vpInputs)
+	sort.SliceStable(hints, func(i, j int) bool {
+		if hints[i].PotentialSaving != hints[j].PotentialSaving {
+			return hints[i].PotentialSaving > hints[j].PotentialSaving
+		}
+		return hints[i].UnrealizedPL < hints[j].UnrealizedPL
+	})
+	return hints
 }
 
 // HandleCosts computes ETF cost analysis from TER data and current holdings.
@@ -2766,52 +2912,57 @@ func (h *AnalysisHandler) HandleHealthScore(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// HandleTaxLots returns FIFO lot inventory with per-lot tax impact.
+// HandleTaxLots returns FIFO lot inventory with per-lot tax impact, plus the
+// tax of selling everything today netted per loss pot.
+// Query: joint=1, church_tax=0.08|0.09.
 func (h *AnalysisHandler) HandleTaxLots(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	txns, err := listAllTransactionsRows(ctx, h.queries)
+	opts := taxOptionsFromRequest(r)
+	ledgerTxns, names, equityMap, prices, err := h.loadTaxLedgerInputs(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-	secs, _ := h.queries.ListSecurities(ctx)
-	taxTxns, names, _, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
-
-	// Get current EUR prices from active holdings
-	prices := make(map[string]float64)
-	activeISINs := make(map[string]bool)
-	enriched, _ := h.loadEnrichedHoldings(ctx)
-	for _, eh := range enriched {
-		if eh.value > 0 {
-			qty := 0.0
-			if eh.holding.Quantity.Valid {
-				f, _ := eh.holding.Quantity.Float64Value()
-				qty = f.Float64
-			}
-			if qty > 0 {
-				prices[eh.security.ISIN] = eh.value / qty
-				activeISINs[eh.security.ISIN] = true
-			}
-		}
-	}
-
-	lots := analytics.ComputeTaxLots(taxTxns, prices, names, equityMap)
+	lots := analytics.ComputeTaxLots(ledgerTxns, prices, names, equityMap)
 
 	// Filter out lots for ISINs no longer held (price=0 means sold/no market data)
 	filtered := make([]analytics.TaxLot, 0, len(lots))
 	for _, lot := range lots {
-		if activeISINs[lot.ISIN] || prices[lot.ISIN] > 0 {
+		if prices[lot.ISIN] > 0 {
 			filtered = append(filtered, lot)
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"lots": filtered})
+	now := time.Now()
+	sellAll := analytics.SummarizeSellAll(filtered, now, opts.ChurchTaxRate)
+	without, with := analytics.MarginalSaleTax(ledgerTxns, analytics.HypotheticalSellTxns(filtered, now), now.Year(), opts)
+	sellAll.TaxThisYear = math.Round((with-without)*100) / 100
+
+	writeJSON(w, http.StatusOK, map[string]any{"lots": filtered, "sell_all": sellAll})
+}
+
+// loadTaxLedgerInputs loads the chronological tax transactions with the
+// Vorabpauschalen of completed years merged in, plus today's EUR unit prices.
+func (h *AnalysisHandler) loadTaxLedgerInputs(ctx context.Context) ([]analytics.TaxTransaction, map[string]string, map[string]bool, map[string]float64, error) {
+	txns, err := listAllTransactionsRows(ctx, h.queries)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	secs, _ := h.queries.ListSecurities(ctx)
+	secMap := make(map[string]db.Security, len(secs))
+	for _, s := range secs {
+		secMap[s.ISIN] = s
+	}
+	taxTxns, names, tfsMap, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
+	vpEvents := h.vorabpauschaleEvents(ctx, taxTxns, secMap, tfsMap, histFX, fxRates, 0, time.Now().Year()-1, nil)
+	return analytics.MergeVorabpauschaleEvents(taxTxns, vpEvents), names, equityMap, h.currentUnitPricesEUR(ctx), nil
 }
 
 // HandleSellSimulator simulates the tax impact of selling specified EUR amounts.
+// Query: joint=1, church_tax=0.08|0.09.
 func (h *AnalysisHandler) HandleSellSimulator(w http.ResponseWriter, r *http.Request) {
 	var requests []analytics.SellRequest
 	if err := json.NewDecoder(r.Body).Decode(&requests); err != nil {
@@ -2826,77 +2977,63 @@ func (h *AnalysisHandler) HandleSellSimulator(w http.ResponseWriter, r *http.Req
 	}
 
 	ctx := r.Context()
-	txns, err := listAllTransactionsRows(ctx, h.queries)
+	opts := taxOptionsFromRequest(r)
+	ledgerTxns, names, equityMap, prices, err := h.loadTaxLedgerInputs(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-	secs, _ := h.queries.ListSecurities(ctx)
-	taxTxns, names, _, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
-
-	prices := make(map[string]float64)
-	activeISINs := make(map[string]bool)
-	enriched, _ := h.loadEnrichedHoldings(ctx)
-	for _, eh := range enriched {
-		if eh.value > 0 {
-			qty := 0.0
-			if eh.holding.Quantity.Valid {
-				f, _ := eh.holding.Quantity.Float64Value()
-				qty = f.Float64
-			}
-			if qty > 0 {
-				prices[eh.security.ISIN] = eh.value / qty
-				activeISINs[eh.security.ISIN] = true
-			}
-		}
-	}
-
-	allLots := analytics.ComputeTaxLots(taxTxns, prices, names, equityMap)
+	allLots := analytics.ComputeTaxLots(ledgerTxns, prices, names, equityMap)
 	var lots []analytics.TaxLot
 	for _, lot := range allLots {
-		if activeISINs[lot.ISIN] {
+		if prices[lot.ISIN] > 0 {
 			lots = append(lots, lot)
 		}
 	}
 
-	churchTaxRate := 0.0
-	if v := r.URL.Query().Get("church_tax"); v != "" {
-		if f, err := parseFiniteFloat(v); err == nil && f >= 0 && f <= 1 {
-			churchTaxRate = f
-		}
-	}
-	results, totalTax, totalProceeds := analytics.SimulateSell(lots, requests, churchTaxRate)
+	now := time.Now()
+	results, totalTax, totalProceeds := analytics.SimulateSellAt(lots, requests, opts.ChurchTaxRate, now)
 	if results == nil {
 		results = []analytics.SellSimResult{}
 	}
+	sold := 0.0
+	for _, res := range results {
+		sold += res.SellAmount
+	}
+
+	// The same sale priced through the full engine: this year's realised
+	// income, both loss pots, carried losses and the remaining allowance.
+	base := analytics.ComputeTaxSummaryWithOptions(ledgerTxns, now.Year(), nil, opts)
+	withTxns := append(append(make([]analytics.TaxTransaction, 0, len(ledgerTxns)+len(requests)), ledgerTxns...), analytics.SimulatedSellTxns(lots, requests, now)...)
+	withSale := analytics.ComputeTaxSummaryWithOptions(withTxns, now.Year(), nil, opts)
+	taxThisYear := withSale.EstimatedTax - base.EstimatedTax
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"results":         results,
-		"total_tax":       totalTax,
-		"total_proceeds":  totalProceeds,
-		"effective_rate":  math.Round(analytics.SellTaxRate(churchTaxRate)*100000) / 100000,
-		"church_tax_rate": churchTaxRate,
+		"results":                results,
+		"total_tax":              totalTax,
+		"total_proceeds":         totalProceeds,
+		"effective_rate":         math.Round(analytics.SellTaxRate(opts.ChurchTaxRate)*100000) / 100000,
+		"church_tax_rate":        opts.ChurchTaxRate,
+		"tax_this_year":          math.Round(taxThisYear*100) / 100,
+		"net_proceeds_this_year": math.Round((sold-taxThisYear)*100) / 100,
+		"allowance_remaining":    base.FreistellungRemain,
+		"allowance":              base.Allowance,
 	})
 }
 
 // HandleLossPots returns the German Aktienverlusttopf / allgemeiner Verlusttopf per year.
+// Query: church_tax=0.08|0.09 (rate for the cross-broker saving).
 func (h *AnalysisHandler) HandleLossPots(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	txns, err := listAllTransactionsRows(ctx, h.queries)
+	opts := taxOptionsFromRequest(r)
+	ledgerTxns, _, _, _, err := h.loadTaxLedgerInputs(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
 
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-	secs, _ := h.queries.ListSecurities(ctx)
-	taxTxns, _, tfsMap, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
-
-	pots := analytics.ComputeLossPots(taxTxns)
+	pots := analytics.ComputeLossPots(ledgerTxns)
 	if pots == nil {
 		pots = []analytics.LossPotYear{}
 	}
@@ -2917,106 +3054,48 @@ func (h *AnalysisHandler) HandleLossPots(w http.ResponseWriter, r *http.Request)
 		GeneralLosses float64 `json:"general_losses"`
 	}
 	acctPots := make(map[string]*acctPot)
-	type depotKey struct {
-		acctID string
-		isin   string
-	}
-	type fifoLot struct {
-		qty     float64
-		costPer float64
-	}
-	lots := make(map[depotKey][]fifoLot)
-	consumeFIFO := func(k depotKey, qty float64) (soldQty, costBasis float64) {
-		rem := qty
-		q := lots[k]
-		for rem > 1e-9 && len(q) > 0 {
-			if q[0].qty <= rem+1e-9 {
-				soldQty += q[0].qty
-				costBasis += q[0].qty * q[0].costPer
-				rem -= q[0].qty
-				q = q[1:]
-			} else {
-				soldQty += rem
-				costBasis += rem * q[0].costPer
-				q[0].qty -= rem
-				rem = 0
-			}
+	var acctOrder []string
+	get := func(id string) *acctPot {
+		ap, ok := acctPots[id]
+		if !ok {
+			ap = &acctPot{Account: acctNames[id]}
+			acctPots[id] = ap
+			acctOrder = append(acctOrder, id)
 		}
-		lots[k] = q
-		return soldQty, costBasis
+		return ap
 	}
 
-	for _, txn := range taxTxns { // already chronological
-		dk := depotKey{acctID: txn.AccountID, isin: txn.ISIN}
-		switch txn.Type {
-		case "buy", "savings_plan", "transfer":
-			if txn.ISIN == "" || txn.Quantity <= 0 {
-				continue
-			}
-			lots[dk] = append(lots[dk], fifoLot{qty: txn.Quantity, costPer: txn.Amount / txn.Quantity})
-		case "transfer_out":
-			if txn.ISIN == "" || txn.Quantity <= 0 {
-				continue
-			}
-			consumeFIFO(dk, txn.Quantity)
-		case "sell":
-			if txn.ISIN == "" || txn.Quantity <= 0 {
-				continue
-			}
-			// Always deduct sold lots across all prior years BEFORE filtering by currentYear!
-			soldQty, costBasis := consumeFIFO(dk, txn.Quantity)
-			if txn.Year != currentYear || soldQty <= 1e-9 {
-				continue
-			}
-			proceeds := txn.Amount
-			if soldQty < txn.Quantity {
-				proceeds = txn.Amount * (soldQty / txn.Quantity)
-			}
-			pl := (proceeds - costBasis) * (1 - tfsMap[txn.ISIN])
-			ap, ok := acctPots[txn.AccountID]
-			if !ok {
-				ap = &acctPot{Account: acctNames[txn.AccountID]}
-				acctPots[txn.AccountID] = ap
-			}
-			if equityMap[txn.ISIN] {
-				if pl >= 0 {
-					ap.EquityGains += pl
-				} else {
-					ap.EquityLosses += pl
-				}
-			} else {
-				if pl >= 0 {
-					ap.GeneralGains += pl
-				} else {
-					ap.GeneralLosses += pl
-				}
-			}
-		case "dividend":
-			if txn.Year != currentYear {
-				continue
-			}
-			divAmt := txn.Amount * (1 - tfsMap[txn.ISIN])
-			ap, ok := acctPots[txn.AccountID]
-			if !ok {
-				ap = &acctPot{Account: acctNames[txn.AccountID]}
-				acctPots[txn.AccountID] = ap
-			}
-			ap.GeneralGains += divAmt
-		case "interest":
-			if txn.Year != currentYear {
-				continue
-			}
-			ap, ok := acctPots[txn.AccountID]
-			if !ok {
-				ap = &acctPot{Account: acctNames[txn.AccountID]}
-				acctPots[txn.AccountID] = ap
-			}
-			ap.GeneralGains += txn.Amount
+	// Same engine as the summary: share pot = stock sales only, Teilfreistellung
+	// on fund gains and losses, in-kind transfers keep their lots, §23 assets
+	// (crypto, physical gold) excluded.
+	sales, income := analytics.RealizedTaxEvents(ledgerTxns)
+	for _, s := range sales {
+		if s.Year != currentYear || s.PrivateSale {
+			continue
 		}
+		ap := get(s.AccountID)
+		pl := s.TaxablePL()
+		switch {
+		case analytics.IsShareAssetClass(s.AssetClass) && pl >= 0:
+			ap.EquityGains += pl
+		case analytics.IsShareAssetClass(s.AssetClass):
+			ap.EquityLosses += pl
+		case pl >= 0:
+			ap.GeneralGains += pl
+		default:
+			ap.GeneralLosses += pl
+		}
+	}
+	for _, e := range income {
+		if e.Year != currentYear || e.PrivateSale {
+			continue
+		}
+		get(e.AccountID).GeneralGains += e.TaxableAmount()
 	}
 
 	perAccount := []acctPot{}
-	for _, ap := range acctPots {
+	for _, id := range acctOrder {
+		ap := acctPots[id]
 		ap.EquityGains = math.Round(ap.EquityGains*100) / 100
 		ap.EquityLosses = math.Round(ap.EquityLosses*100) / 100
 		ap.GeneralGains = math.Round(ap.GeneralGains*100) / 100
@@ -3024,19 +3103,28 @@ func (h *AnalysisHandler) HandleLossPots(w http.ResponseWriter, r *http.Request)
 		perAccount = append(perAccount, *ap)
 	}
 
-	totalEquityLoss, totalEquityGain := 0.0, 0.0
-	totalGeneralLoss, totalGeneralGain := 0.0, 0.0
+	// Each bank nets its own pots (general losses may offset share gains,
+	// not the reverse). What is left over — losses at one bank, taxed income
+	// at another — can only be netted in the tax return (Anlage KAP).
+	shareIncome, generalIncome, shareLoss, generalLoss := 0.0, 0.0, 0.0, 0.0
 	for _, ap := range perAccount {
-		totalEquityLoss += ap.EquityLosses
-		totalEquityGain += ap.EquityGains
-		totalGeneralLoss += ap.GeneralLosses
-		totalGeneralGain += ap.GeneralGains
+		s := ap.EquityGains + ap.EquityLosses
+		g := ap.GeneralGains + ap.GeneralLosses
+		if s > 0 && g < 0 {
+			o := math.Min(s, -g)
+			s -= o
+			g += o
+		}
+		shareIncome += math.Max(0, s)
+		generalIncome += math.Max(0, g)
+		shareLoss += math.Min(0, s)
+		generalLoss += math.Min(0, g)
 	}
 	crossBrokerSaving := 0.0
 	if len(perAccount) > 1 {
-		offsetableEquity := math.Min(math.Abs(totalEquityLoss), totalEquityGain)
-		offsetableGeneral := math.Min(math.Abs(totalGeneralLoss), totalGeneralGain)
-		crossBrokerSaving = (offsetableEquity + offsetableGeneral) * analytics.EffectiveTaxRate
+		offShare := math.Min(-shareLoss, shareIncome)
+		offGeneral := math.Min(-generalLoss, shareIncome-offShare+generalIncome)
+		crossBrokerSaving = (offShare + offGeneral) * analytics.CapitalIncomeTaxRate(opts.ChurchTaxRate)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

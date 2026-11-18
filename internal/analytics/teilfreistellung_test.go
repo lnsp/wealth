@@ -11,13 +11,13 @@ import (
 //   - Sonstige Investmentfonds (bonds, money market,
 //     commodity, equity <25%)                          → 0% TFS
 //
-// The codebase currently maps `asset_class == "etf"` → 30% TFS uniformly,
-// which over-claims the exemption on bond ETFs and under-claims it on
-// mixed funds. The TeilfreistellungRate helper exists so callers can route
-// through proper classification when fund-composition data is available.
-// These tests verify the helper against a curated set of well-known
-// German-traded ISINs whose equity weighting is publicly documented in
-// the issuer fact sheets.
+// Callers resolve the rate with ResolveSecurityTFSRate: securities.equity_pct
+// when known, otherwise a fund-name fallback (bond / money-market / gold
+// keywords → 0 %, "LifeStrategy NN%" → by its equity share, other ETFs →
+// 30 %). These tests verify TeilfreistellungRate against a curated set of
+// well-known German-traded ISINs whose equity weighting is publicly
+// documented in the issuer fact sheets, and the name fallback against the
+// fund names that used to be over-claimed.
 //
 // Sources for the equity-percentage figures used below:
 //   - iShares fact sheets (ishares.com/de)
@@ -128,35 +128,40 @@ func TestTeilfreistellung_KnownISINSet(t *testing.T) {
 	}
 }
 
-func TestTeilfreistellung_DocumentsCurrentSimplification(t *testing.T) {
-	// Pin the existing equityMap behavior at the handler boundary:
-	// `equityMap[isin] = sec.AssetClass == "etf"`. This grants 30% TFS
-	// to every ETF — INCLUDING bond ETFs — which is wrong under InvStG
-	// 2018 but is the live behavior across analysis.go / portfolio.go /
-	// scheduler/jobs.go (~15 call sites). TeilfreistellungRate is the
-	// migration target; until the equityMap callers route through it,
-	// users with bond ETFs see overstated after-tax figures.
-	//
-	// This test ensures the proper rates are available for those callers
-	// to adopt incrementally.
-	bondISIN := "IE00B3F81R35"
-	if got := simulateLegacyClassification(bondISIN, "etf"); got != TeilfreistellungEquity {
-		t.Errorf("legacy classification of bond ETF (asset_class=etf): TFS=%v, want %v — confirms the gap exists", got, TeilfreistellungEquity)
+func TestResolveSecurityTFSRate_NameFallback(t *testing.T) {
+	// Regression (audit KNOWN, bond-ETF Teilfreistellung): with equity_pct
+	// not yet populated, bond and low-equity funds must not get the 30 %
+	// equity-fund exemption.
+	cases := []struct {
+		name string
+		want float64
+	}{
+		{"iShares Core EUR Corp Bond UCITS ETF", 0},
+		{"iShares USD High Yield Corp Bond UCITS ETF", 0},
+		{"Amundi Prime Euro Govies UCITS ETF", 0},
+		{"Xtrackers II Eurozone Government Bond UCITS ETF", 0},
+		{"iShares Euro Inflation Linked Govt Bond UCITS ETF", 0},
+		{"iShares USD Treasury Bond 1-3yr UCITS ETF", 0},
+		{"Xtrackers II EUR Overnight Rate Swap UCITS ETF", 0},
+		{"Vanguard LifeStrategy 20% Equity UCITS ETF", 0},
+		{"Vanguard LifeStrategy 40% Equity UCITS ETF", 0.15},
+		{"Vanguard LifeStrategy 60% Equity UCITS ETF", 0.30},
+		{"Vanguard LifeStrategy 80% Equity UCITS ETF", 0.30},
+		{"Xtrackers MSCI World UCITS ETF 1C", 0.30},
+		{"Vanguard FTSE All-World UCITS ETF", 0.30},
 	}
-	// Proper classification via TeilfreistellungRate with real equity%:
-	if got := TeilfreistellungRate(0.00); got != TeilfreistellungBond {
-		t.Errorf("proper classification of bond ETF (equity=0%%): TFS=%v, want %v", got, TeilfreistellungBond)
+	for _, c := range cases {
+		if got := ResolveSecurityTFSRate("etf", c.name, nil); math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("ResolveSecurityTFSRate(etf, %q) = %.2f, want %.2f", c.name, got, c.want)
+		}
 	}
-}
-
-// simulateLegacyClassification reproduces the code pattern
-// `equityMap[isin] = sec.AssetClass == "etf"` followed by
-// `if equityMap[isin] { rate = TeilfreistellungEquity }`.
-// Documenting it as a tiny pure function lets the gap be observed
-// in CI rather than only in production tax reports.
-func simulateLegacyClassification(_ string, assetClass string) float64 {
-	if assetClass == "etf" {
-		return TeilfreistellungEquity
+	// A known equity_pct always wins over the name.
+	eq := 0.95
+	if got := ResolveSecurityTFSRate("etf", "Some Corp Bond Name", &eq); got != TeilfreistellungEquity {
+		t.Errorf("equity_pct 95 %% → %.2f, want 0.30", got)
 	}
-	return TeilfreistellungBond
+	// Stocks and crypto never get a Teilfreistellung.
+	if got := ResolveSecurityTFSRate("stock", "Vanguard LifeStrategy 80%", nil); got != 0 {
+		t.Errorf("stock → %.2f, want 0", got)
+	}
 }

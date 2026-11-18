@@ -72,11 +72,12 @@ func TestComputeTWR_IntradayDepositNoSignFlip(t *testing.T) {
 
 func TestComputeVorabpauschaleDetailed_MidYearProRataAndDistributions(t *testing.T) {
 	// 2024 Basiszins = 2.29%.
-	// Fund bought in July (month 7) for 12,000 EUR, year-end 13,000 EUR, distributions 50 EUR, equity TFS 30%.
-	// Full-year Basisertrag on 12,000 = 12000 * 0.0229 * 0.7 = 192.36 EUR.
-	// Pro-rated for July acquisition ((13 - 7)/12 = 6/12 = 0.5): 96.18 EUR.
-	// Minus 50 EUR distribution -> Vorabpauschale = 46.18 EUR.
-	// Tax after 30% TFS: 46.18 * 0.70 * 0.26375 = 8.53 EUR.
+	// Fund bought in July (month 7), worth 12,000 EUR at the 1 January price, year-end 13,000 EUR,
+	// distributions 50 EUR, equity TFS 30%. § 18 InvStG: cap first, then the 1/12 reduction.
+	// Basisertrag = 12000 * 0.0229 * 0.7 = 192.36 EUR; cap = 13000 - 12000 + 50 = 1050 → 192.36.
+	// Minus 50 EUR distribution → full-year 142.36 EUR; July acquisition × 6/12 → 71.18 EUR.
+	// Tax after 30% TFS: 71.18 * 0.70 * 0.26375 = 13.14 EUR.
+	// (The old expectation 46.18 pro-rated the Basisertrag before subtracting distributions.)
 	entries := ComputeVorabpauschaleDetailed(2024, []VorabpauschaleInput{
 		{
 			ISIN:          "IE00BK5BQT80",
@@ -91,11 +92,11 @@ func TestComputeVorabpauschaleDetailed_MidYearProRataAndDistributions(t *testing
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 Vorabpauschale entry, got %d", len(entries))
 	}
-	if math.Abs(entries[0].Vorabpauschale-46.18) > 0.05 {
-		t.Fatalf("Vorabpauschale = %.2f, want 46.18", entries[0].Vorabpauschale)
+	if math.Abs(entries[0].Vorabpauschale-71.18) > 0.05 {
+		t.Fatalf("Vorabpauschale = %.2f, want 71.18", entries[0].Vorabpauschale)
 	}
-	if math.Abs(entries[0].TaxOnVP-8.53) > 0.05 {
-		t.Fatalf("TaxOnVP = %.2f, want 8.53", entries[0].TaxOnVP)
+	if math.Abs(entries[0].TaxOnVP-13.14) > 0.05 {
+		t.Fatalf("TaxOnVP = %.2f, want 13.14", entries[0].TaxOnVP)
 	}
 }
 

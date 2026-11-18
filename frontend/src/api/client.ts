@@ -446,13 +446,55 @@ export interface TaxBySecurity {
   teilfreistellung: number;
   taxable_pl: number;
   is_equity_fund: boolean;
+  /** "share" (Aktienverlusttopf) or "general". */
+  pot?: string;
+  vorabpauschale_deducted?: number;
+  account_id?: string;
+  date?: string;
 }
 
 export interface TaxLossHint {
   isin: string;
   name: string;
   unrealized_pl: number;
+  /** Reduction in this year's tax if the depot position were sold today. */
   potential_saving: number;
+  account_id?: string;
+  account?: string;
+  /** Loss after Teilfreistellung. */
+  taxable_loss?: number;
+  /** "share" losses only offset share gains; "general" losses offset any capital income. */
+  pot?: string;
+}
+
+/** §23 EStG private sales (crypto, physical gold): personal income-tax rate, not Abgeltungsteuer. */
+export interface PrivateSaleSummary {
+  year: number;
+  taxable_gains: number;
+  taxable_losses: number;
+  net_taxable: number;
+  tax_free_pl: number;
+  freigrenze: number;
+  below_freigrenze: boolean;
+  taxable_amount: number;
+  other_income: number;
+  sales: { date: string; isin: string; name: string; quantity: number; proceeds: number; cost_basis: number; taxable_pl: number; tax_free_pl: number }[];
+}
+
+/** Filing settings the Tax page keeps in the browser and passes to the tax endpoints. */
+export interface TaxFilingOptions {
+  joint?: boolean;
+  /** Kirchensteuer rate: 0, 0.08 or 0.09. */
+  churchTax?: number;
+}
+
+function taxQuery(opts?: TaxFilingOptions, extra?: Record<string, string | number>): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(extra ?? {})) q.set(k, String(v));
+  if (opts?.joint) q.set('joint', '1');
+  if (opts?.churchTax && opts.churchTax > 0) q.set('church_tax', String(opts.churchTax));
+  const s = q.toString();
+  return s ? `?${s}` : '';
 }
 
 export interface TaxSummary {
@@ -469,11 +511,35 @@ export interface TaxSummary {
   dividend_income: number;
   by_security: TaxBySecurity[];
   tax_loss_hints?: TaxLossHint[];
+  interest_income?: number;
+  /** Vorabpauschale computed for the previous year, deemed received in January of this year. */
+  vorabpauschale_income?: number;
+  vorabpauschale_year?: number;
+  share_gains?: number;
+  share_losses?: number;
+  general_gains?: number;
+  general_losses?: number;
+  loss_carry_in_share?: number;
+  loss_carry_in_general?: number;
+  loss_carry_out_share?: number;
+  loss_carry_out_general?: number;
+  /** Sparer-Pauschbetrag for the year and filing status. */
+  allowance?: number;
+  joint?: boolean;
+  church_tax_rate?: number;
+  /** Abgeltungsteuer + Soli (+ church tax) as a fraction. */
+  tax_rate?: number;
+  private_sales?: PrivateSaleSummary | null;
 }
 
 export interface VorabpauschaleEntry {
+  year?: number;
   isin: string;
   name: string;
+  units?: number;
+  jan1_price?: number;
+  year_end_price?: number;
+  /** Units held at year end, valued at the 1 January price. */
   jan1_value: number;
   year_end_value: number;
   basiszins: number;
@@ -485,7 +551,12 @@ export interface VorabpauschaleEntry {
 export interface TaxData {
   summary: TaxSummary;
   available_years: number[];
+  /** Vorabpauschale computed for calendar year `vorabpauschale_year`, taxed in January of `vorabpauschale_taxed_in`. */
   vorabpauschale?: VorabpauschaleEntry[];
+  vorabpauschale_year?: number;
+  vorabpauschale_taxed_in?: number;
+  /** True for the running year: today's price stands in for the year-end price. */
+  vorabpauschale_estimate?: boolean;
 }
 
 export interface WealthReportSummary {
@@ -573,6 +644,7 @@ export interface CostData {
 }
 
 export interface TaxLot {
+  account_id?: string;
   isin: string;
   name: string;
   buy_date: string;
@@ -581,9 +653,33 @@ export interface TaxLot {
   current_value: number;
   unrealized_pl: number;
   is_equity_fund: boolean;
+  tfs_rate?: number;
   tax_if_sold: number;
   net_proceeds: number;
   effective_rate: number;
+  asset_class?: string;
+  /** "share", "general" or "private_sale". */
+  pot?: string;
+  private_sale?: boolean;
+  /** §23: first day a sale of this lot is tax-free. */
+  tax_free_from?: string;
+  vorabpauschale_taxed?: number;
+  /** Tax of selling this lot and every older lot of the same security in the same depot (FIFO), before allowance and loss pots. */
+  fifo_tax_if_sold?: number;
+}
+
+/** Tax of selling every open lot today. */
+export interface SellAllSummary {
+  share_pl: number;
+  general_pl: number;
+  taxable_gain: number;
+  /** Pots netted, before the Sparer-Pauschbetrag and carried losses. */
+  gross_tax: number;
+  /** Change in this year's tax after the remaining allowance and loss pots (negative = saving). */
+  tax_this_year: number;
+  private_sale_taxable_pl: number;
+  private_sale_tax_free_pl: number;
+  tax_rate: number;
 }
 
 export interface CurrencyExposureEntry {
@@ -801,15 +897,26 @@ export const api = {
   getETFHoldings: (isin: string) =>
     request<{ etf_isin: string; etf_name: string; holdings: ETFHoldingEntry[] }>(`/analysis/etf/${isin}/holdings`),
   getRisk: () => request<RiskData>('/analysis/risk'),
-  getTax: (year?: number) => request<TaxData>(`/analysis/tax${year ? `?year=${year}` : ''}`),
+  getTax: (year?: number, opts?: TaxFilingOptions) => request<TaxData>(`/analysis/tax${taxQuery(opts, year ? { year } : undefined)}`),
   getCurrency: () => request<{ currencies: CurrencyExposureEntry[] }>('/analysis/currency'),
   getCosts: () => request<CostData>('/analysis/costs'),
   getAlternatives: () => request<{ alternatives: { isin: string; name: string; current_ter: number; value: number; alternatives: { isin: string; name: string; ter: number; annual_saving: number; ten_year_saving: number }[] }[] }>('/analysis/alternatives'),
-  getTaxLots: () => request<{ lots: TaxLot[] }>('/analysis/tax-lots'),
-  simulateSell: (requests: { isin: string; amount_eur: number }[], churchTaxRate?: number) => {
-    const qs = churchTaxRate != null && churchTaxRate > 0 ? `?church_tax=${churchTaxRate}` : '';
-    return request<{ results: { isin: string; name: string; sell_amount: number; cost_basis: number; realized_gain: number; teilfreistellung: number; taxable_gain: number; estimated_tax: number; net_proceeds: number; lots_consumed: number; is_equity_fund: boolean }[]; total_tax: number; total_proceeds: number; effective_rate: number; church_tax_rate: number }>(
-      `/analysis/sell-simulator${qs}`, { method: 'POST', body: JSON.stringify(requests) });
+  getTaxLots: (opts?: TaxFilingOptions) => request<{ lots: TaxLot[]; sell_all?: SellAllSummary }>(`/analysis/tax-lots${taxQuery(opts)}`),
+  simulateSell: (requests: { isin: string; amount_eur: number }[], churchTaxRate?: number, joint?: boolean) => {
+    const qs = taxQuery({ churchTax: churchTaxRate, joint });
+    return request<{
+      results: { isin: string; name: string; sell_amount: number; cost_basis: number; realized_gain: number; teilfreistellung: number; taxable_gain: number; estimated_tax: number; net_proceeds: number; lots_consumed: number; is_equity_fund: boolean; tfs_rate?: number; pot?: string; vorabpauschale_deducted?: number; private_sale?: boolean; private_sale_taxable_pl?: number; private_sale_tax_free_pl?: number }[];
+      /** Pots netted across the sale, before allowance and carried losses. */
+      total_tax: number;
+      total_proceeds: number;
+      effective_rate: number;
+      church_tax_rate: number;
+      /** Change in this year's tax after the remaining allowance and loss pots. */
+      tax_this_year?: number;
+      net_proceeds_this_year?: number;
+      allowance_remaining?: number;
+      allowance?: number;
+    }>(`/analysis/sell-simulator${qs}`, { method: 'POST', body: JSON.stringify(requests) });
   },
   getCorrelation: () => request<{ labels: string[]; matrix: number[][] }>('/analysis/correlation'),
   getAllocationHistory: () => request<{ history: { date: string; weights: Record<string, number> }[]; holdings: string[] }>('/analysis/allocation-history'),

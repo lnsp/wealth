@@ -22,6 +22,12 @@ Eight `financial-auditor` subagents each checked one page against HEAD `82d789a`
   - Rentenwert since 2025-07: 40.79 €
   - BBG RV 2026: 101,400 €
 
+> **Status (2026-11-18):** every CRITICAL and WARNING finding below has been
+> addressed on branch `fix/calc-audit-2026-11-18`. The one exception is C4,
+> top-10 overlap: no full-holdings source exists, so overlap is now labelled a
+> lower bound with per-fund coverage. Remaining limitations are listed under
+> "Known Limitations" in TASKS.md.
+
 ---
 
 ## Cross-cutting root causes

@@ -416,7 +416,12 @@ test.describe('Analysis page', () => {
     const resp = await request.get('/api/analysis/costs');
     expect(resp.ok()).toBeTruthy();
     const data = await resp.json();
-    expect(data).toHaveProperty('benchmark');
+    // Without a known fund charge there is nothing to grade (audit C6): the
+    // benchmark is omitted instead of grading an all-stock portfolio "A+".
+    if (!data.benchmark) {
+      expect(data.coverage_pct).toBe(0);
+      return;
+    }
     expect(data.benchmark).toHaveProperty('grade');
     expect(data.benchmark).toHaveProperty('your_ter');
     expect(data.benchmark).toHaveProperty('avg_ter');
@@ -426,6 +431,7 @@ test.describe('Analysis page', () => {
 
   test('displays cost efficiency benchmark card', async ({ page, request }) => {
     const { benchmark } = await (await request.get('/api/analysis/costs')).json();
+    test.skip(!benchmark, 'no fund with a known charge, so there is no cost grade');
     const panel = await openTab(page, 'Costs');
     // The benchmark card shows the grade from the API and the comparison with a typical investor
     await expect(panel.getByText(`Cost grade ${benchmark.grade}`, { exact: true })).toBeVisible();

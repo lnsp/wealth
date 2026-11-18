@@ -73,6 +73,50 @@ func TestFetchHoldings(t *testing.T) {
 	if holdings[2].ISIN == "" {
 		t.Error("third holding should have synthetic ISIN")
 	}
+
+	// Audit C3: the synthetic ID must not depend on the ETF, or the same
+	// company never matches across funds.
+	other, err := fetchHoldingsFromURL(client, context.Background(), srv.URL, "IE00BJ0KDQ92")
+	if err != nil {
+		t.Fatalf("FetchHoldings failed: %v", err)
+	}
+	if other[2].ISIN != holdings[2].ISIN || holdings[2].ISIN != SyntheticConstituentID("NVIDIA Corp.") {
+		t.Errorf("synthetic ids %q / %q differ between ETFs", holdings[2].ISIN, other[2].ISIN)
+	}
+}
+
+func TestISINFromHref(t *testing.T) {
+	cases := map[string]string{
+		"/en/etf-profile.html?isin=US0378331005":                     "US0378331005",
+		"/en/etf-profile.html?isin=US5949181045&foo=1":               "US5949181045",
+		"/en/stock-profiles/US67066G1040":                            "US67066G1040",
+		"https://www.justetf.com/de/stock-profiles/us02079k1079?x=1": "US02079K1079",
+		"/en/stock-profiles/":                                        "",
+		"/en/news":                                                   "",
+		"/en/etf-profile.html?isin=NOTANISIN":                        "",
+	}
+	for href, want := range cases {
+		if got := isinFromHref(href); got != want {
+			t.Errorf("isinFromHref(%q) = %q, want %q", href, got, want)
+		}
+	}
+}
+
+func TestConstituentNameKey(t *testing.T) {
+	cases := map[string]string{
+		"NVIDIA Corp.":          "nvidia",
+		"  NVIDIA Corporation ": "nvidia",
+		"Alphabet Inc. A":       "alphabet inc a",
+		"Alphabet, Inc. C":      "alphabet inc c",
+		"Novo Nordisk A/S":      "novo nordisk a s",
+		"Inc.":                  "inc",
+		"AT&T Inc.":             "at&t",
+	}
+	for in, want := range cases {
+		if got := ConstituentNameKey(in); got != want {
+			t.Errorf("ConstituentNameKey(%q) = %q, want %q", in, got, want)
+		}
+	}
 }
 
 func TestFetchHoldings_ServerError(t *testing.T) {

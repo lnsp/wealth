@@ -1,6 +1,9 @@
 package parser
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // ClassifyAsset determines the asset class of a security based on its ISIN and name.
 // Returns one of: "etf", "stock", "bond", "fund", "commodity", "derivative", "crypto".
@@ -39,13 +42,24 @@ func ClassifyAsset(isin, name string) string {
 			return "bond"
 		}
 	}
+	// Broker abbreviations of bond funds: "XTR2-EUROZ.GOV.BD 1C",
+	// "AM.PR.EURO GOVIES". Whole words only.
+	tokens := nameTokens(nameLower)
+	for _, tok := range tokens {
+		if tok == "bd" || tok == "bds" || tok == "govies" {
+			return "bond"
+		}
+	}
 
 	// ETF indicators (brand names and keywords)
-	etfKeywords := []string{"etf", "ucits", "ishares", "vanguard", "xtrackers", "amundi", "lyxor", "spdr", "invesco"}
+	etfKeywords := []string{"ucits", "ishares", "vanguard", "xtrackers", "amundi", "lyxor", "spdr", "invesco"}
 	for _, kw := range etfKeywords {
 		if strings.Contains(nameLower, kw) {
 			return "etf"
 		}
+	}
+	if hasETFToken(tokens) {
+		return "etf"
 	}
 
 	// Fund indicators (non-ETF)
@@ -56,14 +70,51 @@ func ClassifyAsset(isin, name string) string {
 		}
 	}
 
-	// Commodity indicators
-	commodityKeywords := []string{"gold", "silver", "commodity", "rohstoff", "euwax"}
+	// Commodity indicators. "gold" and "silver" must be whole words so
+	// "Goldman Sachs" stays a stock (commodities are taxed under §23 EStG).
+	commodityKeywords := []string{"commodity", "rohstoff", "euwax"}
 	for _, kw := range commodityKeywords {
 		if strings.Contains(nameLower, kw) {
+			return "commodity"
+		}
+	}
+	for _, tok := range tokens {
+		if tok == "gold" || tok == "silver" {
 			return "commodity"
 		}
 	}
 
 	// Default: assume individual stock
 	return "stock"
+}
+
+// nameTokens splits a lower-cased security name into alphanumeric words.
+func nameTokens(nameLower string) []string {
+	return strings.FieldsFunc(nameLower, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+// hasETFToken matches whole-word ETF markers and the issuer abbreviations
+// German brokers print in fund names: "ISHSIII-MSCI EM USD(ACC)",
+// "XTR.MSCI WORLD 1C", "VANG.FTSE ALL-WLD U.ETF", "AIS-AM.MSCI WORLD",
+// "LYX.MSCI WORLD". Whole words, so "Netflix" no longer matches "etf" and
+// "Evangelische" not "vang".
+func hasETFToken(tokens []string) bool {
+	for i, tok := range tokens {
+		switch tok {
+		case "etf", "etfs", "xtr", "xtr2", "vang", "lyx":
+			return true
+		case "ais":
+			// Amundi Index Solutions: "AIS-AMUNDI ...", "AIS-AM.MSCI ...".
+			if i+1 < len(tokens) && strings.HasPrefix(tokens[i+1], "am") {
+				return true
+			}
+		}
+		// iShares plc umbrella abbreviations: ISHS, ISHSII ... ISHSVII.
+		if rest, ok := strings.CutPrefix(tok, "ishs"); ok && strings.Trim(rest, "ivx") == "" {
+			return true
+		}
+	}
+	return false
 }

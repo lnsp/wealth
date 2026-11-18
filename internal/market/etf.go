@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -301,20 +302,16 @@ func fetchHoldingsFromURL(c *JustETFClient, ctx context.Context, url, isin strin
 		// Extract ISIN from link if available
 		holdingISIN := ""
 		s.Find("a").Each(func(_ int, a *goquery.Selection) {
-			if href, exists := a.Attr("href"); exists {
-				if idx := strings.Index(href, "isin="); idx >= 0 {
-					holdingISIN = href[idx+5:]
-					if ampIdx := strings.IndexByte(holdingISIN, '&'); ampIdx >= 0 {
-						holdingISIN = holdingISIN[:ampIdx]
-					}
-				}
+			if href, exists := a.Attr("href"); exists && holdingISIN == "" {
+				holdingISIN = isinFromHref(href)
 			}
 		})
 
-		// Generate a deterministic name-based synthetic ID when constituent ISIN is absent.
+		// Without an ISIN, derive a synthetic ID from the normalised name only,
+		// so the same company gets the same ID in every ETF and overlap and
+		// look-through can match it across funds.
 		if holdingISIN == "" {
-			sum := sha256.Sum256([]byte(isin + "|" + strings.ToLower(name)))
-			holdingISIN = fmt.Sprintf("SYNTH:%x", sum[:6])
+			holdingISIN = SyntheticConstituentID(name)
 		}
 
 		holdings = append(holdings, ETFHolding{
@@ -325,4 +322,95 @@ func fetchHoldingsFromURL(c *JustETFClient, ctx context.Context, url, isin strin
 	})
 
 	return holdings, nil
+}
+
+// SyntheticConstituentPrefix marks constituent IDs derived from the name
+// because justETF did not link an ISIN. Rows stored before 2026-11 used an
+// ETF-specific hash or an "XX_" prefix; consumers must key all of them by
+// ConstituentNameKey rather than by the ID itself.
+const SyntheticConstituentPrefix = "SYNTH:"
+
+// SyntheticConstituentID returns the fund-independent synthetic ID for a
+// constituent without an ISIN: a short hash of ConstituentNameKey(name).
+func SyntheticConstituentID(name string) string {
+	sum := sha256.Sum256([]byte(ConstituentNameKey(name)))
+	return fmt.Sprintf("%s%x", SyntheticConstituentPrefix, sum[:6])
+}
+
+// IsSyntheticConstituentID reports whether id is not a real ISIN: empty, the
+// current "SYNTH:" form or the legacy "XX_" form.
+func IsSyntheticConstituentID(id string) bool {
+	return id == "" || strings.HasPrefix(id, SyntheticConstituentPrefix) || strings.HasPrefix(id, "XX_")
+}
+
+// legalFormTokens are trailing company-form words dropped when matching
+// constituent names, so "NVIDIA Corp." and "NVIDIA Corporation" match.
+var legalFormTokens = map[string]bool{
+	"inc": true, "incorporated": true, "corp": true, "corporation": true,
+	"co": true, "company": true, "plc": true, "ltd": true, "limited": true,
+	"ag": true, "se": true, "sa": true, "nv": true, "asa": true, "ab": true,
+	"spa": true, "oyj": true, "as": true,
+}
+
+// ConstituentNameKey normalises a constituent name for matching across
+// funds: lower case, punctuation to spaces, whitespace collapsed and
+// trailing legal-form words removed. Share-class letters are kept, so
+// "Alphabet A" and "Alphabet C" stay distinct.
+func ConstituentNameKey(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '&' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte(' ')
+		}
+	}
+	fields := strings.Fields(b.String())
+	for len(fields) > 1 && legalFormTokens[fields[len(fields)-1]] {
+		fields = fields[:len(fields)-1]
+	}
+	return strings.Join(fields, " ")
+}
+
+// isinFromHref extracts a constituent ISIN from a justETF link, either an
+// "isin=" query parameter or a "/stock-profiles/<ISIN>" path.
+func isinFromHref(href string) string {
+	candidate := ""
+	if idx := strings.Index(href, "isin="); idx >= 0 {
+		candidate = href[idx+5:]
+	} else if idx := strings.Index(href, "stock-profiles/"); idx >= 0 {
+		candidate = href[idx+len("stock-profiles/"):]
+	}
+	if end := strings.IndexAny(candidate, "&/?#"); end >= 0 {
+		candidate = candidate[:end]
+	}
+	candidate = strings.ToUpper(strings.TrimSpace(candidate))
+	if !looksLikeISIN(candidate) {
+		return ""
+	}
+	return candidate
+}
+
+// looksLikeISIN checks the ISIN shape: 2 letters, 9 alphanumerics, 1 digit.
+func looksLikeISIN(s string) bool {
+	if len(s) != 12 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case i < 2:
+			if r < 'A' || r > 'Z' {
+				return false
+			}
+		case i == 11:
+			if r < '0' || r > '9' {
+				return false
+			}
+		default:
+			if !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') {
+				return false
+			}
+		}
+	}
+	return true
 }

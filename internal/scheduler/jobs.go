@@ -638,6 +638,27 @@ func (s *Scheduler) updateFXRates() {
 	log.Printf("FX rate update: %s", msg)
 }
 
+// fundDataTarget decides what the fund-metadata job does for an asset class:
+// fetch justETF data for ETFs, bond funds and other funds, and probe single
+// "stocks" in case the name heuristic misclassified a fund.
+func fundDataTarget(assetClass string) (fetch, probe bool) {
+	switch assetClass {
+	case "etf", "bond", "fund":
+		return true, false
+	case "stock":
+		return false, true
+	}
+	return false, false
+}
+
+// metadataProvesEquityFund reports whether justETF data is strong enough to
+// reclassify a "stock" as an ETF: an ongoing charge and a sector breakdown.
+// ETCs and bond funds lack the sector breakdown and are left alone, since
+// reclassifying them as equity ETFs would grant a 30 % Teilfreistellung.
+func metadataProvesEquityFund(meta *market.ETFMetadata) bool {
+	return meta != nil && meta.TER > 0 && len(meta.SectorWeights) > 0
+}
+
 func (s *Scheduler) updateETFHoldings() {
 	if !s.tryStartJob("etf") {
 		return
@@ -664,16 +685,36 @@ func (s *Scheduler) updateETFHoldings() {
 
 	seenISIN := make(map[string]bool)
 	updated := 0
+	reclassified := 0
 	for _, h := range holdings {
-		if h.AssetClass != "etf" || seenISIN[h.SecurityISIN] {
+		fetch, probe := fundDataTarget(h.AssetClass)
+		if (!fetch && !probe) || seenISIN[h.SecurityISIN] {
 			continue
 		}
 		seenISIN[h.SecurityISIN] = true
 
 		meta, err := s.justETF.FetchMetadata(ctx, h.SecurityISIN)
 		if err != nil {
-			log.Printf("WARNING: ETF holdings update: fetch %s: %v", h.SecurityISIN, err)
+			if fetch {
+				log.Printf("WARNING: ETF holdings update: fetch %s: %v", h.SecurityISIN, err)
+			}
 			continue
+		}
+		if probe {
+			// A "stock" that justETF profiles with a charge and a sector
+			// breakdown is an equity fund the name heuristic missed (e.g.
+			// "ISHSIII-MSCI EM USD(ACC)"). Anything less is left alone.
+			if !metadataProvesEquityFund(meta) {
+				continue
+			}
+			if err := s.queries.UpdateSecurityAssetClass(ctx, db.UpdateSecurityAssetClassParams{
+				ISIN: h.SecurityISIN, AssetClass: "etf", AssetClass_2: h.AssetClass,
+			}); err != nil {
+				log.Printf("WARNING: ETF holdings update: reclassify %s: %v", h.SecurityISIN, err)
+				continue
+			}
+			reclassified++
+			log.Printf("ETF metadata: reclassified %s from %s to etf (justETF fund profile)", h.SecurityISIN, h.AssetClass)
 		}
 
 		existingSec := secByISIN[h.SecurityISIN]
@@ -745,7 +786,10 @@ func (s *Scheduler) updateETFHoldings() {
 			h.SecurityISIN, len(meta.SectorWeights), len(meta.CountryWeights), meta.TER)
 	}
 
-	msg := fmt.Sprintf("%d ETFs updated", updated)
+	msg := fmt.Sprintf("%d funds updated", updated)
+	if reclassified > 0 {
+		msg += fmt.Sprintf(", %d reclassified as ETF", reclassified)
+	}
 	log.Printf("ETF holdings update: %s", msg)
 	s.setJobStatus("etf", "ok", msg)
 }

@@ -3476,6 +3476,24 @@ func (q *Queries) UpdateNotificationChannel(ctx context.Context, arg UpdateNotif
 	return err
 }
 
+const updateSecurityAssetClass = `-- name: UpdateSecurityAssetClass :exec
+UPDATE securities SET asset_class = $2 WHERE isin = $1 AND asset_class = $3
+`
+
+type UpdateSecurityAssetClassParams struct {
+	ISIN         string `json:"isin"`
+	AssetClass   string `json:"asset_class"`
+	AssetClass_2 string `json:"asset_class_2"`
+}
+
+// Reclassifies a security when fund data proves its name-based class wrong
+// (e.g. a broker-abbreviated ETF stored as a stock). Only updates while the
+// class is still the one the caller saw.
+func (q *Queries) UpdateSecurityAssetClass(ctx context.Context, arg UpdateSecurityAssetClassParams) error {
+	_, err := q.db.Exec(ctx, updateSecurityAssetClass, arg.ISIN, arg.AssetClass, arg.AssetClass_2)
+	return err
+}
+
 const updateSecurityMetadata = `-- name: UpdateSecurityMetadata :exec
 UPDATE securities SET
     sector_weights = $2,

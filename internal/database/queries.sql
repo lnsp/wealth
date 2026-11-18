@@ -669,3 +669,9 @@ INSERT INTO price_index_points (series, period, value) VALUES ($1, $2, $3)
 ON CONFLICT (series, period) DO UPDATE SET value = EXCLUDED.value
     WHERE price_index_points.value IS DISTINCT FROM EXCLUDED.value
 RETURNING series;
+
+-- name: UpdateSecurityAssetClass :exec
+-- Reclassifies a security when fund data proves its name-based class wrong
+-- (e.g. a broker-abbreviated ETF stored as a stock). Only updates while the
+-- class is still the one the caller saw.
+UPDATE securities SET asset_class = $2 WHERE isin = $1 AND asset_class = $3;

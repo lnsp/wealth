@@ -9,7 +9,7 @@ import {
 import { fmtMoney, fmtNum, fmtQty, fmtDate, fmtDateTime, fmtMonth, labelFor } from '../utils/format';
 
 const TXN_TYPES = [
-  'buy', 'sell', 'dividend', 'deposit', 'withdrawal', 'interest', 'fee',
+  'buy', 'sell', 'dividend', 'deposit', 'withdrawal', 'interest', 'fee', 'tax',
   'transfer', 'transfer_out', 'savings_plan', 'cash_transfer_in', 'cash_transfer_out',
 ];
 
@@ -29,9 +29,9 @@ const categoryLabel = (c: string) => (c === 'internal' ? 'Internal transfer' : l
 const CASH_TXN_TYPES = new Set(['deposit', 'withdrawal', 'interest', 'transfer', 'transfer_out', 'cash_transfer_in', 'cash_transfer_out', 'fee']);
 const hasCategory = (t: TransactionRow) => CASH_TXN_TYPES.has(t.type) && !t.security_isin;
 
-// Imports store `amount` as a magnitude; the direction is carried by the type. This mirrors
-// txnSignedCashDelta in internal/handler/fx_cash.go so the sign shown here always agrees
-// with the type chip next to it.
+// Imports store `amount`, `fee` and `tax` as magnitudes; the direction is carried by the type.
+// These helpers mirror txnSignedCashDelta in internal/handler/fx_cash.go so the amount shown is
+// the cash the row actually moved, and its sign always agrees with the type chip next to it.
 const INFLOW_TYPES = new Set(['deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in']);
 const OUTFLOW_TYPES = new Set(['buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out']);
 
@@ -42,29 +42,66 @@ function cashDirection(t: TransactionRow): 1 | -1 | 0 {
   return 0; // in-kind movements: no cash effect
 }
 
-/** Amount text and colour, both derived from the same signed value. */
-function amountView(t: TransactionRow): { text: string; className: string } {
+/**
+ * Net cash effect: ±|amount| − |fee| − |tax|, or null for an in-kind security movement.
+ * Worked examples: a 20,00 € card payment with a 0,50 € fee → −20,50 €; a 600,00 € crypto
+ * buy with a 1,49 € fee → −601,49 €; a 100,00 USD dividend with 15,00 USD tax → +85,00 USD.
+ */
+function cashDelta(t: TransactionRow): number | null {
   const dir = cashDirection(t);
-  const magnitude = Math.abs(t.amount);
-  if (dir === 0) {
-    return { text: magnitude === 0 ? '—' : fmtMoney(magnitude, t.currency, { cents: true }), className: 'text-ink' };
+  if (dir === 0) return null;
+  return dir * Math.abs(t.amount) - Math.abs(t.fee ?? 0) - Math.abs(t.tax ?? 0);
+}
+
+type Unit = 'share' | 'unit';
+const unitWord = (q: number, unit: Unit) => `${unit}${q === 1 ? '' : 's'}`;
+
+interface AmountView {
+  text: string;
+  className: string;
+  /** Second line: what the amount includes ("incl. 0,50 € fee") or what the moved shares are worth. */
+  detail?: string;
+}
+
+/** Amount text and colour, both derived from the same signed cash value. */
+function amountView(t: TransactionRow, unit: Unit): AmountView {
+  const delta = cashDelta(t);
+  if (delta === null) {
+    // Shares move in or out; cash doesn't. Show the quantity and its direction.
+    const arrow = t.type === 'transfer_out' ? '→ out' : '← in';
+    const q = Math.abs(t.quantity ?? 0);
+    const worth = Math.abs(t.amount);
+    if (q > 0) {
+      return {
+        text: `${fmtQty(q)} ${unitWord(q, unit)} ${arrow}`,
+        className: 'text-ink',
+        detail: worth > 0 ? `worth ${fmtMoney(worth, t.currency, { cents: true })}` : undefined,
+      };
+    }
+    return { text: worth === 0 ? '—' : `${fmtMoney(worth, t.currency, { cents: true })} ${arrow}`, className: 'text-ink' };
   }
-  const value = dir * magnitude;
+  const fee = Math.abs(t.fee ?? 0);
+  const tax = Math.abs(t.tax ?? 0);
+  const parts: string[] = [];
+  if (fee > 0) parts.push(`${fmtMoney(fee, t.currency, { cents: true })} fee`);
+  if (tax > 0) parts.push(`${fmtMoney(tax, t.currency, { cents: true })} tax`);
   return {
-    text: fmtMoney(value, t.currency, { cents: true, sign: true }),
-    className: value > 0 ? 'text-sage' : 'text-ink',
+    text: fmtMoney(delta, t.currency, { cents: true, sign: true }),
+    className: delta >= 0.005 ? 'text-sage' : 'text-ink',
+    // Outflows pay fees and tax on top ("incl."); inflows arrive net of them ("after").
+    detail: parts.length > 0 ? `${cashDirection(t) < 0 ? 'incl.' : 'after'} ${parts.join(' · ')}` : undefined,
   };
 }
 
 const displayName = (t: TransactionRow) => t.counterparty || t.reference || t.security_isin || t.account_name;
 
-/** "5,123 shares at 97,60 €" for security rows, otherwise null. */
-function quantityLine(t: TransactionRow): string | null {
+/** "5,123 shares at 97,60 €" for security rows ("units" for crypto), otherwise null. */
+function quantityLine(t: TransactionRow, unit: Unit): string | null {
   if (!t.security_isin || t.quantity == null) return null;
   const q = Math.abs(t.quantity);
   if (q === 0) return null;
-  const shares = `${fmtQty(q)} ${q === 1 ? 'share' : 'shares'}`;
-  return t.price != null && t.price > 0 ? `${shares} at ${fmtMoney(t.price, t.currency, { cents: true })}` : shares;
+  const qty = `${fmtQty(q)} ${unitWord(q, unit)}`;
+  return t.price != null && t.price > 0 ? `${qty} at ${fmtMoney(t.price, t.currency, { cents: true })}` : qty;
 }
 
 const pad = (n: number) => String(n).padStart(2, '0');
@@ -72,6 +109,26 @@ const monthDate = (ym: string) => {
   const [y, m] = ym.split('-');
   return new Date(Number(y), Number(m) - 1, 1);
 };
+
+/** Months from the current one back to `firstDate`'s month ('YYYY-MM', newest first); 36 when unknown. */
+function monthsBackTo(firstDate: string | undefined, now = new Date()): string[] {
+  const m = /^(\d{4})-(\d{2})/.exec(firstDate ?? '');
+  const count = m
+    ? (now.getFullYear() - Number(m[1])) * 12 + (now.getMonth() + 1 - Number(m[2])) + 1
+    : 36;
+  return Array.from({ length: Math.min(Math.max(count, 1), 1200) }, (_, i) => {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+  });
+}
+
+/** Crypto and metals are counted in units, not shares. */
+function unitFor(t: TransactionRow, accountType: string | undefined): Unit {
+  if (t.security_isin?.startsWith('CRYPTO:')) return 'unit';
+  return accountType === 'crypto' || accountType === 'precious_metals' ? 'unit' : 'share';
+}
+
+const HISTORY_PAGE = 50;
 
 /** Compact native select with a chevron and an accessible name; keeps the global focus outline. */
 function CompactSelect({ label, dense = false, className = '', children, ...select }: { label: string; dense?: boolean; className?: string; children: ReactNode } & Omit<SelectHTMLAttributes<HTMLSelectElement>, 'className'>) {
@@ -111,8 +168,11 @@ export default function Transactions() {
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [importHistory, setImportHistory] = useState<ImportHistoryEntry[]>([]);
+  const [historyTotal, setHistoryTotal] = useState(0);
   const [showAllHistory, setShowAllHistory] = useState(false);
+  // All accounts, inactive ones included: their transactions are listed and counted too.
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [firstDate, setFirstDate] = useState<string | undefined>(undefined);
   const [showUploader, setShowUploader] = useState(false);
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
   const [categoryError, setCategoryError] = useState<string | null>(null);
@@ -129,13 +189,12 @@ export default function Transactions() {
     return ['', ''];
   }, [period, isMonth, customFrom, customTo]);
 
-  const monthOptions = useMemo(() => {
-    const now = new Date();
-    return Array.from({ length: 36 }, (_, i) => {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
-    });
-  }, []);
+  // Back to the month of the first transaction, so every row is reachable.
+  const monthOptions = useMemo(() => monthsBackTo(firstDate), [firstDate]);
+
+  const accountsById = useMemo(() => new Map(accounts.map(a => [a.id, a])), [accounts]);
+  const activeAccounts = useMemo(() => accounts.filter(a => a.is_active), [accounts]);
+  const unitOf = (t: TransactionRow) => unitFor(t, accountsById.get(t.account_id)?.type);
 
   const loadTransactions = useCallback(async () => {
     const seq = ++requestSeq.current;
@@ -145,6 +204,7 @@ export default function Transactions() {
       if (seq !== requestSeq.current) return;
       setTransactions(res.transactions || []);
       setTotal(res.total);
+      if (res.first_date) setFirstDate(res.first_date);
       setError(null);
     } catch (e) {
       if (seq !== requestSeq.current) return;
@@ -158,12 +218,23 @@ export default function Transactions() {
   }, [offset, typeFilter, search, dateFrom, dateTo, accountFilter]);
 
   const loadHistory = useCallback(() => {
-    api.getImportHistory().then(r => setImportHistory(r.history || [])).catch(() => {});
+    api.getImportHistory(HISTORY_PAGE, 0).then(r => {
+      const rows = r.history || [];
+      setImportHistory(rows);
+      setHistoryTotal(r.total ?? rows.length);
+    }).catch(() => {});
   }, []);
+
+  const loadMoreHistory = () => {
+    api.getImportHistory(HISTORY_PAGE, importHistory.length).then(r => {
+      setImportHistory(prev => [...prev, ...(r.history || [])]);
+      if (r.total != null) setHistoryTotal(r.total);
+    }).catch(() => {});
+  };
 
   useEffect(() => { loadTransactions(); }, [loadTransactions]);
   useEffect(() => { loadHistory(); }, [loadHistory]);
-  useEffect(() => { api.listAccounts().then(r => setAccounts(r.accounts || [])).catch(() => {}); }, []);
+  useEffect(() => { api.listAllAccounts().then(r => setAccounts(r.accounts || [])).catch(() => {}); }, []);
 
   /** Any filter change returns to the first page. */
   const withReset = <T,>(setter: (v: T) => void) => (v: T) => { setter(v); setOffset(0); };
@@ -261,7 +332,11 @@ export default function Transactions() {
             <span className="text-[14px] font-semibold text-ink">Import finished</span>
             <span className="flex flex-wrap gap-x-3.5 text-[13px] text-ink-body">
               <span>{fmtNum(importResult.imported)} new</span>
+              {(importResult.updated ?? 0) > 0 && <span>{fmtNum(importResult.updated)} updated</span>}
               <span>{fmtNum(importResult.skipped)} {importResult.skipped === 1 ? 'duplicate' : 'duplicates'} skipped</span>
+              {(importResult.rsu_vests ?? 0) > 0 && (
+                <span>{fmtNum(importResult.rsu_vests)} vesting {importResult.rsu_vests === 1 ? 'event' : 'events'}</span>
+              )}
               <span>{fmtNum(importErrors.length)} {importErrors.length === 1 ? 'error' : 'errors'}</span>
               {importResult.new_securities?.length > 0 && (
                 <span>{fmtNum(importResult.new_securities.length)} new {importResult.new_securities.length === 1 ? 'security' : 'securities'}</span>
@@ -317,7 +392,7 @@ export default function Transactions() {
         <div id="csv-import-panel" className="mt-3 rounded-apple border border-divider p-4">
           <SectionBoundary>
             <CsvUploader
-              accounts={accounts}
+              accounts={activeAccounts}
               onImportComplete={(result) => {
                 setImportResult(result);
                 setShowUploader(false);
@@ -334,7 +409,7 @@ export default function Transactions() {
         <div role="group" aria-label="Filter transactions" className="flex gap-2 min-w-0">
           <CompactSelect label="Filter by account" className="flex-[1.35] lg:flex-none lg:w-[200px]" value={accountFilter} onChange={(e) => changeAccount(e.target.value)}>
             <option value="">All accounts</option>
-            {accounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+            {accounts.map(a => <option key={a.id} value={a.id}>{a.is_active ? a.name : `${a.name} (inactive)`}</option>)}
           </CompactSelect>
           <CompactSelect label="Filter by transaction type" className="flex-1 lg:flex-none lg:w-[170px]" value={typeFilter} onChange={(e) => changeType(e.target.value)}>
             <option value="">All types</option>
@@ -413,13 +488,16 @@ export default function Transactions() {
                     <h2 className="label-caps mt-4 py-2 border-b border-ink">{groupLabel(g)}</h2>
                     <ul>
                       {g.rows.map(t => {
-                        const amount = amountView(t);
-                        const qty = quantityLine(t);
+                        const amount = amountView(t, unitOf(t));
+                        const qty = quantityLine(t, unitOf(t));
                         return (
                           <li key={t.id} className="flex flex-col gap-1.5 py-3 border-b border-divider">
                             <div className="flex items-baseline justify-between gap-3">
                               <span className="min-w-0 truncate text-[14px] font-medium text-ink" title={displayName(t)}>{displayName(t)}</span>
-                              <span className={`font-serif text-[18px] leading-6 whitespace-nowrap ${amount.className}`} data-privacy="blur">{amount.text}</span>
+                              <span className="flex flex-col items-end shrink-0" data-privacy="blur">
+                                <span className={`font-serif text-[18px] leading-6 whitespace-nowrap ${amount.className}`}>{amount.text}</span>
+                                {amount.detail && <span className="text-[12px] text-ink-muted whitespace-nowrap">{amount.detail}</span>}
+                              </span>
                             </div>
                             <div className="flex items-center gap-2.5">
                               <div className="flex-1 min-w-0 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] text-ink-muted">
@@ -461,8 +539,8 @@ export default function Transactions() {
                         </th>
                       </tr>
                       {g.rows.map(t => {
-                        const amount = amountView(t);
-                        const qty = quantityLine(t);
+                        const amount = amountView(t, unitOf(t));
+                        const qty = quantityLine(t, unitOf(t));
                         return (
                           <tr key={t.id} className="hover:bg-parchment-deep">
                             <td className="!py-2 whitespace-nowrap">{fmtDate(t.date)}</td>
@@ -479,7 +557,10 @@ export default function Transactions() {
                             <td className="!py-2"><Chip>{labelFor(t.type)}</Chip></td>
                             <td className="!py-2 max-w-[200px]"><div className="truncate" title={t.account_name}>{t.account_name}</div></td>
                             <td className="!py-2">{hasCategory(t) ? categorySelect(t, 'w-[150px]') : null}</td>
-                            <td className={`!py-2 num whitespace-nowrap font-serif text-[16px] ${amount.className}`} data-privacy="blur">{amount.text}</td>
+                            <td className="!py-2 num whitespace-nowrap" data-privacy="blur">
+                              <div className={`font-serif text-[16px] ${amount.className}`}>{amount.text}</div>
+                              {amount.detail && <div className="text-[12px] text-ink-muted">{amount.detail}</div>}
+                            </td>
                           </tr>
                         );
                       })}
@@ -538,7 +619,7 @@ export default function Transactions() {
         <SectionBoundary>
           <Section
             title="Import History"
-            actions={<span className="text-[13px] text-ink-muted">{fmtNum(importHistory.length)} {importHistory.length === 1 ? 'import' : 'imports'}</span>}
+            actions={<span className="text-[13px] text-ink-muted">{fmtNum(historyTotal)} {historyTotal === 1 ? 'import' : 'imports'}</span>}
           >
             <ul className="divide-y divide-divider border-t border-divider">
               {(showAllHistory ? importHistory : importHistory.slice(0, 5)).map((entry) => (
@@ -554,10 +635,18 @@ export default function Transactions() {
                   <div className="text-right shrink-0 text-[13px]">
                     <p>
                       <span className={entry.imported > 0 ? 'font-medium text-ink' : 'text-ink-muted'}>{fmtNum(entry.imported)} new</span>
+                      {(entry.updated ?? 0) > 0 && (
+                        <span className="text-ink-muted"> · {fmtNum(entry.updated)} updated</span>
+                      )}
                       {entry.skipped > 0 && (
                         <span className="text-ink-muted"> · {fmtNum(entry.skipped)} skipped</span>
                       )}
                     </p>
+                    {(entry.rsu_vests ?? 0) > 0 && (
+                      <p className="text-ink-muted mt-0.5">
+                        {fmtNum(entry.rsu_vests)} vesting {entry.rsu_vests === 1 ? 'event' : 'events'}
+                      </p>
+                    )}
                     {entry.new_securities && entry.new_securities.length > 0 && (
                       <p className="text-ink-muted mt-0.5">
                         {fmtNum(entry.new_securities.length)} new {entry.new_securities.length === 1 ? 'security' : 'securities'}
@@ -567,16 +656,27 @@ export default function Transactions() {
                 </li>
               ))}
             </ul>
-            {importHistory.length > 5 && (
-              <button
-                type="button"
-                aria-expanded={showAllHistory}
-                onClick={() => setShowAllHistory(v => !v)}
-                className="mt-1 inline-flex items-center min-h-[44px] text-[14px] font-medium text-forest underline"
-              >
-                {showAllHistory ? 'Show fewer imports' : `Show all ${fmtNum(importHistory.length)} imports`}
-              </button>
-            )}
+            <div className="flex flex-wrap gap-x-5">
+              {importHistory.length > 5 && (
+                <button
+                  type="button"
+                  aria-expanded={showAllHistory}
+                  onClick={() => setShowAllHistory(v => !v)}
+                  className="mt-1 inline-flex items-center min-h-[44px] text-[14px] font-medium text-forest underline"
+                >
+                  {showAllHistory ? 'Show fewer imports' : `Show all ${fmtNum(historyTotal)} imports`}
+                </button>
+              )}
+              {showAllHistory && importHistory.length < historyTotal && (
+                <button
+                  type="button"
+                  onClick={loadMoreHistory}
+                  className="mt-1 inline-flex items-center min-h-[44px] text-[14px] font-medium text-forest underline"
+                >
+                  Load {fmtNum(Math.min(HISTORY_PAGE, historyTotal - importHistory.length))} older imports
+                </button>
+              )}
+            </div>
           </Section>
         </SectionBoundary>
       )}

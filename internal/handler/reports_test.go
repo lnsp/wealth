@@ -11,15 +11,19 @@ import (
 //   - Frontend computes prevMonth = new Date(now.year, now.month-1, 1), then
 //     posts {report_type:"monthly", year, month=prevMonth.month+1}.
 //   - Backend validates: report_type ∈ {monthly, annual}; year ∈ [2020,2100];
-//     monthly→month ∈ [1,12]; rejects existing periods with 409.
+//     monthly→month ∈ [1,12]; an existing period is regenerated (200),
+//     a new one inserted (201).
 //   - Period boundaries:
 //        monthly: start=first-of-month, end=last-day-of-month, label "YYYY-MM"
 //        annual:  start=Jan 1, end=Dec 31, label "YYYY"
-//   - Aggregation: nwStart=oldest snapshot in range, nwEnd=newest in range;
-//     change=end-start; pct=change/start*100 (zero-safe); dividends=sum of
-//     dividend-type txns in [start,end]; per-ISIN holdings with
-//     weight=value/total*100 and returnPct=(value-cost)/cost*100; top
-//     gainer/loser by returnPct.
+//   - Aggregation (buildReportData, tested in calc_audit_transactions_test.go):
+//     nwStart=last snapshot before the period (previous close), nwEnd=newest
+//     in range; change=end-start split into net deposits and market;
+//     pct=change/start*100 (zero-safe); dividends gross/withheld/net in
+//     [start,end] at the payment-date FX; per-ISIN holdings with
+//     weight=value/total*100 and returnPct=(value-cost)/cost*100; best and
+//     weakest holding by returnPct when there are at least two.
+//   - GET and PDF recompute the figures from current data on every read.
 //   - PDF route: Content-Type application/pdf, filename "wealth-report-{label}.pdf".
 
 // computePeriodBounds mirrors lines 128-140 of reports.go.

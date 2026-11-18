@@ -66,6 +66,18 @@ function pctError(text: string): string | undefined {
   return Number.isFinite(n) && n >= 0 && n <= 100 ? undefined : 'Enter a percentage between 0 and 100';
 }
 
+/**
+ * Morgan Stanley files never name the stock, so imports into such an account take
+ * it from here and are refused without it (vests would otherwise book as cash).
+ */
+function isinError(text: string, required: boolean): string | undefined {
+  const v = text.trim().toUpperCase();
+  if (!v) return required ? 'Enter the ISIN of the employer stock, e.g. US02079K1079' : undefined;
+  return /^[A-Z]{2}[A-Z0-9]{9}[0-9]$/.test(v) ? undefined : 'Enter a 12-character ISIN, e.g. US02079K1079';
+}
+
+const STOCK_ISIN_HINT = 'The employer stock held in this account. Morgan Stanley files don’t name it, so imports need it.';
+
 function AddAccountForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => void }) {
   const [name, setName] = useState('');
   const [institution, setInstitution] = useState('sparkasse');
@@ -80,12 +92,14 @@ function AddAccountForm({ onDone, onCancel }: { onDone: () => void; onCancel: ()
 
   const nameErr = submitted && !name.trim() ? 'Enter a name for the account' : undefined;
   const matchErr = submitted && tax === 'bav' ? pctError(match) : undefined;
+  const isMS = institution === 'morgan_stanley';
+  const isinErr = submitted && isMS ? isinError(isin, false) : undefined;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setSubmitted(true);
     setError('');
-    if (!name.trim() || (tax === 'bav' && pctError(match))) return;
+    if (!name.trim() || (tax === 'bav' && pctError(match)) || (isMS && isinError(isin, false))) return;
     setSaving(true);
     try {
       await api.createAccount({
@@ -95,7 +109,7 @@ function AddAccountForm({ onDone, onCancel }: { onDone: () => void; onCancel: ()
         iban: iban.trim() || undefined,
         tax_treatment: tax,
         employer_match_pct: tax === 'bav' ? parsePct(match) : undefined,
-        import_security_isin: institution === 'morgan_stanley' ? isin.trim() || undefined : undefined,
+        import_security_isin: isMS ? isin.trim().toUpperCase() || undefined : undefined,
       });
       onDone();
     } catch (err) {
@@ -123,8 +137,8 @@ function AddAccountForm({ onDone, onCancel }: { onDone: () => void; onCancel: ()
         {tax === 'bav' && (
           <Field label="Employer match" unit="%" inputMode="decimal" hint="Optional. Share of your contribution the employer adds." value={match} onChange={e => setMatch(e.target.value)} error={matchErr} />
         )}
-        {institution === 'morgan_stanley' && (
-          <Field label="Stock ISIN" hint="The ISIN of the employer stock held in this account." value={isin} onChange={e => setIsin(e.target.value)} autoComplete="off" spellCheck={false} />
+        {isMS && (
+          <Field label="Stock ISIN" hint={STOCK_ISIN_HINT} value={isin} onChange={e => setIsin(e.target.value)} error={isinErr} autoComplete="off" spellCheck={false} />
         )}
       </div>
       <InlineError>{error}</InlineError>
@@ -141,18 +155,22 @@ function EditAccountForm({ acc, onDone, onCancel }: { acc: Account; onDone: () =
   const [tax, setTax] = useState(acc.tax_treatment || 'taxable');
   const [match, setMatch] = useState(acc.employer_match_pct != null ? String(acc.employer_match_pct).replace('.', ',') : '');
   const [currency, setCurrency] = useState(acc.currency || 'EUR');
+  const [isin, setIsin] = useState(acc.import_security_isin ?? '');
   const [submitted, setSubmitted] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
+  const isMS = acc.institution === 'morgan_stanley';
   const nameErr = submitted && !name.trim() ? 'Enter a name for the account' : undefined;
   const matchErr = submitted && tax === 'bav' ? pctError(match) : undefined;
+  const isinErr = submitted && isMS ? isinError(isin, true) : undefined;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setSubmitted(true);
     setError('');
-    if (!name.trim() || (tax === 'bav' && pctError(match))) return;
+    if (!name.trim() || (tax === 'bav' && pctError(match)) || (isMS && isinError(isin, true))) return;
+    const nextISIN = isin.trim().toUpperCase();
     setSaving(true);
     try {
       await api.updateAccount(acc.id, {
@@ -160,6 +178,7 @@ function EditAccountForm({ acc, onDone, onCancel }: { acc: Account; onDone: () =
         tax_treatment: tax,
         employer_match_pct: tax === 'bav' ? parsePct(match) : undefined,
         currency: currency !== acc.currency ? currency : undefined,
+        import_security_isin: isMS && nextISIN !== (acc.import_security_isin ?? '') ? nextISIN : undefined,
       });
       onDone();
     } catch (err) {
@@ -181,6 +200,9 @@ function EditAccountForm({ acc, onDone, onCancel }: { acc: Account; onDone: () =
         </SelectField>
         {tax === 'bav' && (
           <Field label="Employer match" unit="%" inputMode="decimal" value={match} onChange={e => setMatch(e.target.value)} error={matchErr} />
+        )}
+        {isMS && (
+          <Field label="Stock ISIN" hint={STOCK_ISIN_HINT} value={isin} onChange={e => setIsin(e.target.value)} error={isinErr} autoComplete="off" spellCheck={false} />
         )}
       </div>
       <InlineError>{error}</InlineError>
@@ -257,6 +279,9 @@ function AccountsSection() {
                       <Chip tone={acc.is_active ? 'success' : 'neutral'}>{acc.is_active ? 'Active' : 'Inactive'}</Chip>
                       {acc.tax_treatment && acc.tax_treatment !== 'taxable' && (
                         <Chip>{TAX_SHORT[acc.tax_treatment] || labelFor(acc.tax_treatment)}</Chip>
+                      )}
+                      {acc.institution === 'morgan_stanley' && !acc.import_security_isin?.trim() && (
+                        <Chip tone="warning">No stock ISIN</Chip>
                       )}
                     </p>
                     <p className="text-[13px] text-ink-muted mt-0.5">

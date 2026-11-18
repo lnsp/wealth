@@ -4097,8 +4097,27 @@ func (h *AnalysisHandler) HandleDataQuality(w http.ResponseWriter, r *http.Reque
 		secMap[s.ISIN] = s
 	}
 
-	// --- 1. Stale Prices ---
+	// Holdings come per account; the price and dividend checks are about the
+	// security, so they run once per ISIN on the summed value (otherwise one
+	// ISIN held in two depots is reported twice).
+	type isinHolding struct {
+		security db.Security
+		value    float64
+	}
+	var byISIN []*isinHolding
+	isinIdx := make(map[string]*isinHolding)
 	for _, eh := range enriched {
+		ih := isinIdx[eh.security.ISIN]
+		if ih == nil {
+			ih = &isinHolding{security: eh.security}
+			isinIdx[eh.security.ISIN] = ih
+			byISIN = append(byISIN, ih)
+		}
+		ih.value += eh.value
+	}
+
+	// --- 1. Stale Prices ---
+	for _, eh := range byISIN {
 		if eh.value <= 0 {
 			continue
 		}
@@ -4136,7 +4155,7 @@ func (h *AnalysisHandler) HandleDataQuality(w http.ResponseWriter, r *http.Reque
 			}
 		}
 	}
-	for _, eh := range enriched {
+	for _, eh := range byISIN {
 		sec := eh.security
 		if sec.AssetClass != "etf" || eh.value < 1000 {
 			continue

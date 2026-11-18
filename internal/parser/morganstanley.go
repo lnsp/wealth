@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
 	"strings"
 	"time"
@@ -21,7 +22,8 @@ import (
 //
 // The Withdrawals Report contains two row flavours: GSU sales (negative
 // quantity, positive net amount) and Cash wire-outs (negative quantity, plan
-// "Cash"). Each share sale emits a sell + matching withdrawal so the cash
+// "Cash"). Each share sale emits a sell (gross proceeds plus the deducted fee,
+// see msSaleGrossAndFee) + a withdrawal of the net amount so the cash
 // proceeds are immediately treated as auto-wired (MS RSU accounts are modeled
 // as securities-only — no cash sits here). Cash wire-out rows are skipped to
 // avoid double-counting the same flow.
@@ -242,6 +244,7 @@ func (p *MorganStanleyParser) parseWithdrawals(records [][]string, accountID uui
 
 		price := parseMoneyOrFloat(getField(record, priceCol))
 		qty := abs(parseMoneyOrFloat(getField(record, qtyCol)))
+		gross, fee := msSaleGrossAndFee(qty, price, amount)
 
 		txns = append(txns, Transaction{
 			AccountID:    accountID,
@@ -249,13 +252,16 @@ func (p *MorganStanleyParser) parseWithdrawals(records [][]string, accountID uui
 			Type:         "sell",
 			Quantity:     qty,
 			Price:        price,
-			Amount:       amount,
+			Amount:       gross,
+			Fee:          fee,
 			Currency:     "USD",
 			Counterparty: plan,
 			Reference:    order,
 			ImportHash:   fmt.Sprintf("ms-sell-%s-%s", accountID, order),
 		})
-		// Auto-wire the proceeds so the MS account stays cash-neutral.
+		// Auto-wire the net proceeds so the MS account stays cash-neutral
+		// (sell gross − fee − wire = 0). The wire carries no quantity or price;
+		// the importer stores both as NULL.
 		txns = append(txns, Transaction{
 			AccountID:    accountID,
 			Date:         date,
@@ -309,6 +315,49 @@ func (p *MorganStanleyParser) parseUnvested(records [][]string, accountID uuid.U
 		})
 	}
 	return nil, vests, nil
+}
+
+// msSaleGrossAndFee splits a Withdrawals Report sale into gross proceeds
+// (quantity × price, rounded to cents) and the fee Morgan Stanley deducted
+// (gross − net amount). The report only carries the net amount; storing it
+// as the sale amount with no fee hid the commission and made "N shares at
+// price" disagree with the amount shown next to it.
+//
+// The product is computed exactly on the 8-decimal quantity and price the
+// database stores and rounded half away from zero, so it equals
+// ROUND(quantity * price, 2) in SQL (migration 032 rewrites rows imported
+// before this split the same way, which keeps similarity-based dedup working
+// for re-imports). When the gross does not exceed the net amount (rounding
+// noise in the export) the sale keeps the net amount and no fee.
+func msSaleGrossAndFee(qty, price, net float64) (gross, fee float64) {
+	q, okQ := new(big.Rat).SetString(fmt.Sprintf("%.8f", qty))
+	p, okP := new(big.Rat).SetString(fmt.Sprintf("%.8f", price))
+	n, okN := new(big.Rat).SetString(fmt.Sprintf("%.4f", net))
+	if !okQ || !okP || !okN || qty <= 0 || price <= 0 {
+		return net, 0
+	}
+	g := roundRatHalfAway(new(big.Rat).Mul(q, p), 2)
+	if g.Cmp(n) <= 0 {
+		return net, 0
+	}
+	gf, _ := g.Float64()
+	ff, _ := new(big.Rat).Sub(g, n).Float64()
+	return gf, ff
+}
+
+// roundRatHalfAway rounds r to `places` decimals, half away from zero (the
+// rounding PostgreSQL's ROUND(numeric, n) uses).
+func roundRatHalfAway(r *big.Rat, places int) *big.Rat {
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(places)), nil)
+	scaled := new(big.Rat).Mul(r, new(big.Rat).SetInt(scale))
+	num := new(big.Int).Abs(scaled.Num())
+	den := scaled.Denom()
+	twoNum := new(big.Int).Add(new(big.Int).Lsh(num, 1), den)
+	q := new(big.Int).Quo(twoNum, new(big.Int).Lsh(den, 1))
+	if scaled.Sign() < 0 {
+		q.Neg(q)
+	}
+	return new(big.Rat).SetFrac(q, scale)
 }
 
 // normalizePlan trims surrounding whitespace and parentheses so the same plan

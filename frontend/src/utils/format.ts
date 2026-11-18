@@ -22,11 +22,14 @@ export function formatCurrencySafe(
     cur = cur.toUpperCase() || 'EUR';
   }
   try {
-    return new Intl.NumberFormat('de-DE', {
+    const nf = new Intl.NumberFormat('de-DE', {
       style: 'currency',
       currency: cur,
       ...options,
-    }).format(scaled);
+    });
+    const out = nf.format(scaled);
+    // A value that rounds to zero is shown unsigned ("0,00 €", not "-0,00 €").
+    return /[1-9]/.test(out) ? out : nf.format(0);
   } catch {
     const formatted = scaled.toLocaleString('de-DE', {
       minimumFractionDigits: options?.minimumFractionDigits ?? 2,
@@ -45,13 +48,39 @@ export function formatCurrencySafe(
 export const LOCALE = 'de-DE';
 const MINUS = '−';
 
-function withSign(text: string, value: number, sign: boolean): string {
-  const t = text.replace(/^-/, MINUS);
-  return sign && value > 0 ? `+${t}` : t;
+/**
+ * Formats |value| with `fmt`, then signs the rounded text: a value that rounds
+ * to zero at the shown precision gets no sign ("0,00 €" for −0.004, not
+ * "−0,00 €"; "0,0 %" rather than "+0,0 %").
+ */
+function signed(value: number, fmt: (abs: number) => string, sign: boolean): string {
+  const body = fmt(Math.abs(value));
+  if (!/[1-9]/.test(body)) return body;
+  if (value < 0) return `${MINUS}${body}`;
+  return sign ? `+${body}` : body;
 }
+
+const fixed = (digits: number) => (abs: number) =>
+  abs.toLocaleString(LOCALE, { minimumFractionDigits: digits, maximumFractionDigits: digits });
 
 function finite(n: number | null | undefined): number {
   return typeof n === 'number' && Number.isFinite(n) ? n : 0;
+}
+
+const minorUnitCache = new Map<string, number>();
+
+/** Decimal places a currency is quoted in (ISO 4217 minor units via Intl): 2 for USD, 0 for JPY, 3 for KWD. */
+function minorUnits(currency: string): number {
+  let digits = minorUnitCache.get(currency);
+  if (digits === undefined) {
+    try {
+      digits = new Intl.NumberFormat(LOCALE, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
+    } catch {
+      digits = 2;
+    }
+    minorUnitCache.set(currency, digits);
+  }
+  return digits;
 }
 
 export interface MoneyOptions {
@@ -63,48 +92,69 @@ export interface MoneyOptions {
 
 /** Plain number, German grouping. `digits` fixes the decimals. */
 export function fmtNum(value: number | null | undefined, digits = 0): string {
-  const v = finite(value);
-  return withSign(v.toLocaleString(LOCALE, { minimumFractionDigits: digits, maximumFractionDigits: digits }), v, false);
+  return signed(finite(value), fixed(digits), false);
 }
 
 /** EUR amount: "12.480 €", "−84,30 €". */
 export function fmtEUR(value: number | null | undefined, opts: MoneyOptions = {}): string {
-  const v = finite(value);
-  const d = opts.cents ? 2 : 0;
-  const body = v.toLocaleString(LOCALE, { minimumFractionDigits: d, maximumFractionDigits: d });
-  return `${withSign(body, v, !!opts.sign)} €`;
+  return `${signed(finite(value), fixed(opts.cents ? 2 : 0), !!opts.sign)} €`;
 }
 
-/** Amount in any currency: symbol for EUR, ISO code for everything else ("97,60 USD"). */
+/**
+ * Amount in any currency: symbol for EUR, ISO code for everything else ("97,60 USD").
+ * EUR follows `cents` (whole euros by default). Other currencies show their own
+ * minor units ("97,60 USD", "500 JPY") unless `cents: false` asks for whole units.
+ */
 export function fmtMoney(value: number | null | undefined, currency?: string | null, opts: MoneyOptions = {}): string {
   let cur = (currency || 'EUR').trim();
   let v = finite(value);
   if (cur === 'GBp' || cur === 'GBX') { cur = 'GBP'; v *= 0.01; }
   cur = cur.toUpperCase() || 'EUR';
   if (cur === 'EUR') return fmtEUR(v, opts);
-  const d = opts.cents === false ? 0 : 2;
-  const body = v.toLocaleString(LOCALE, { minimumFractionDigits: d, maximumFractionDigits: d });
-  return `${withSign(body, v, !!opts.sign)} ${cur}`;
+  const d = opts.cents === false ? 0 : minorUnits(cur);
+  return `${signed(v, fixed(d), !!opts.sign)} ${cur}`;
 }
 
 /** Percent from a percent value (7.4 → "7,4 %"). Pass `sign` for changes. */
 export function fmtPct(value: number | null | undefined, opts: { digits?: number; sign?: boolean } = {}): string {
-  const v = finite(value);
-  const d = opts.digits ?? 1;
-  const body = v.toLocaleString(LOCALE, { minimumFractionDigits: d, maximumFractionDigits: d });
-  return `${withSign(body, v, !!opts.sign)} %`;
+  return `${signed(finite(value), fixed(opts.digits ?? 1), !!opts.sign)} %`;
 }
 
-/** Share quantity: up to four decimals, trailing zeros dropped ("1.250", "5,123"). */
+/**
+ * Quantity: up to four decimals, trailing zeros dropped ("1.250", "5,123").
+ * Below 1 it keeps four significant digits, so small crypto amounts don't
+ * round away ("0,00004", "0,1235").
+ */
 export function fmtQty(value: number | null | undefined): string {
   const v = finite(value);
-  return withSign(v.toLocaleString(LOCALE, { minimumFractionDigits: 0, maximumFractionDigits: 4 }), v, false);
+  const a = Math.abs(v);
+  const opts: Intl.NumberFormatOptions = a > 0 && a < 1
+    ? { maximumSignificantDigits: 4 }
+    : { minimumFractionDigits: 0, maximumFractionDigits: 4 };
+  return signed(v, (x) => x.toLocaleString(LOCALE, opts), false);
 }
 
 // Fixed three-letter months: en-GB gives "Sept", which is wider than the rest on chart axes.
 const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+// "2026-11-16", "2026-11", or the API's serialised DATE "2026-11-16T00:00:00Z".
+const DATE_ONLY = /^(\d{4})-(\d{2})(?:-(\d{2}))?(?:T00:00:00(?:\.0+)?(?:Z|[+-]00:?00)?)?$/;
+
+/**
+ * Calendar dates are parsed as local dates. `new Date("2026-11-16")` (and the
+ * API's "…T00:00:00Z") is UTC midnight, which is the previous day west of UTC.
+ */
 function toDate(d: string | number | Date): Date {
+  if (d instanceof Date) return d;
+  if (typeof d === 'string') {
+    const m = DATE_ONLY.exec(d.trim());
+    if (m) return new Date(Number(m[1]), Number(m[2]) - 1, m[3] ? Number(m[3]) : 1);
+  }
+  return new Date(d);
+}
+
+/** Timestamps keep their instant. */
+function toInstant(d: string | number | Date): Date {
   return d instanceof Date ? d : new Date(d);
 }
 
@@ -119,7 +169,7 @@ export function fmtDate(d: string | number | Date | null | undefined): string {
 /** Numeric date with time: "16.11.2026, 08:12". */
 export function fmtDateTime(d: string | number | Date | null | undefined): string {
   if (d === null || d === undefined || d === '') return '—';
-  const dt = toDate(d);
+  const dt = toInstant(d);
   if (Number.isNaN(dt.getTime())) return '—';
   return dt.toLocaleString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
@@ -152,12 +202,12 @@ export function fmtDayMonth(d: string | number | Date): string {
 /** Compact axis label: "340k", "1,2M", "−100k". Lower-case k, upper-case M. */
 export function fmtAxis(value: number | null | undefined): string {
   const v = finite(value);
-  const a = Math.abs(v);
-  const s = v < 0 ? MINUS : '';
   const trim = (n: number) => n.toLocaleString(LOCALE, { maximumFractionDigits: 1 });
-  if (a >= 1_000_000) return `${s}${trim(a / 1_000_000)}M`;
-  if (a >= 1_000) return `${s}${trim(a / 1_000)}k`;
-  return `${s}${trim(a)}`;
+  return signed(v, (a) => {
+    if (a >= 1_000_000) return `${trim(a / 1_000_000)}M`;
+    if (a >= 1_000) return `${trim(a / 1_000)}k`;
+    return trim(a);
+  }, false);
 }
 
 /** Display labels for raw enum values that reach the UI. */

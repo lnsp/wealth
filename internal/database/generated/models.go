@@ -144,6 +144,8 @@ type ImportHistory struct {
 	Imported      int32     `json:"imported"`
 	Skipped       int32     `json:"skipped"`
 	NewSecurities []string  `json:"new_securities"`
+	Updated       int32     `json:"updated"`
+	RsuVests      int32     `json:"rsu_vests"`
 }
 
 type Loan struct {

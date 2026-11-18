@@ -88,6 +88,16 @@ func (p *N26Parser) Parse(records [][]string, accountID uuid.UUID) ([]Transactio
 			txn.Amount = -amount
 		}
 
+		// Negative interest (overdraft interest, Sollzinsen) is a charge:
+		// store it as a fee with a positive amount. The import hash is taken
+		// from the fields as they were before this fix (type interest,
+		// signed amount) so rows imported earlier still match by hash.
+		if amount < 0 && normalizedType == "interest" {
+			txn.ImportHash = computeHash(txn)
+			txn.Type = "fee"
+			txn.Amount = -amount
+		}
+
 		txns = append(txns, txn)
 	}
 

@@ -2,14 +2,23 @@ import { useCallback, useEffect, useState } from 'react';
 import { useThemeColors } from '../../hooks/useThemeColors';
 import EChartWrapper from '../charts/EChartWrapper';
 import { Section, SubHeading, MetricCard, MetricGrid, LoadingState, ErrorState } from '../ui';
-import { fmtEUR, fmtAxis, fmtMonthShort } from '../../utils/format';
+import { fmtEUR, fmtPct, fmtAxis, fmtMonthShort } from '../../utils/format';
 import MoneyLeftOnTable from './MoneyLeftOnTable';
+import { usePlanning } from './PlanningContext';
+import { toNum } from './shared';
+import { RESERVE_MONTHS } from './constants';
 
 type OpportunityCostData = {
-  cash_drag: { total_cash: number; excess_cash: number; annual_cost: number; recommended_reserve: number };
+  cash_drag: {
+    total_cash: number; excess_cash: number; annual_cost: number; recommended_reserve: number;
+    reserve_known?: boolean; reserve_months?: number; expected_return_pct?: number; cash_rate_pct?: number;
+  };
   timing: { avg_invest_day: number; annual_cost: number };
   rebalance: { annual_cost: number };
-  fsa_waste: { unused: number; annual_cost: number };
+  fsa_waste: {
+    unused: number; annual_cost: number;
+    allowance?: number; harvestable?: number; projected_recurring?: number; realised_gains?: number; vorabpauschale?: number;
+  };
   total_annual: number;
   monthly_rollup: { month: string; total: number }[];
 };
@@ -32,20 +41,29 @@ const costTone = (v: number) => (v > 0 ? 'negative' as const : 'neutral' as cons
 
 // "Money left on the table" — one section for both views of it:
 //  1. costs of inaction from GET /api/analysis/opportunity-cost: cash drag
-//     (idle cash above the recommended reserve), timing delay (investing late
-//     in the month), rebalancing drift, and unused Sparer-Pauschbetrag;
+//     (idle cash above the emergency reserve — the Contribution Router's
+//     months of expenses — at the spread over a savings rate), timing delay
+//     (investing late in the month), rebalancing drift, and the unused
+//     Sparer-Pauschbetrag (after dividends, interest, realised gains and the
+//     Vorabpauschale; only as far as there are gains to realise into it);
 //  2. unused tax-advantaged accounts (MoneyLeftOnTable.tsx).
 // Below 50 EUR/yr the first analysis is noise, so it is summarised in a sentence.
 export default function OpportunityCosts() {
   const tc = useThemeColors();
+  const { fireExpenses, joint, churchRate } = usePlanning();
   const [data, setData] = useState<OpportunityCostData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const monthlyExpenses = toNum(fireExpenses) / 12;
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    fetch('/api/analysis/opportunity-cost')
+    const params = new URLSearchParams({ reserve_months: String(RESERVE_MONTHS) });
+    if (monthlyExpenses > 0) params.set('monthly_expenses', String(Math.round(monthlyExpenses)));
+    if (joint) params.set('joint', '1');
+    if (churchRate > 0) params.set('church_rate', String(churchRate));
+    fetch(`/api/analysis/opportunity-cost?${params.toString()}`)
       .then(async r => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const body: unknown = await r.json();
@@ -54,7 +72,7 @@ export default function OpportunityCosts() {
       })
       .catch(e => { setData(null); setError(e instanceof Error ? e.message : 'Request failed'); })
       .finally(() => setLoading(false));
-  }, []);
+  }, [monthlyExpenses, joint, churchRate]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -85,7 +103,9 @@ export default function OpportunityCosts() {
               label="Idle cash"
               tone={costTone(data.cash_drag.annual_cost)}
               value={fmtEUR(data.cash_drag.annual_cost)}
-              sublabel={<><span data-privacy="blur">{fmtEUR(data.cash_drag.excess_cash)}</span> above a reserve of <span data-privacy="blur">{fmtEUR(data.cash_drag.recommended_reserve)}</span> (5 % of your wealth, at least 5.000 €)</>}
+              sublabel={data.cash_drag.reserve_known === false
+                ? 'Enter your annual expenses in the FIRE Calculator to size the emergency reserve'
+                : <><span data-privacy="blur">{fmtEUR(data.cash_drag.excess_cash)}</span> above a reserve of <span data-privacy="blur">{fmtEUR(data.cash_drag.recommended_reserve)}</span> ({RESERVE_MONTHS} months of expenses), at {fmtPct(data.cash_drag.expected_return_pct ?? 7, { digits: 0 })} expected return minus {fmtPct(data.cash_drag.cash_rate_pct ?? 2.5)} savings interest</>}
             />
             <MetricCard
               label="Investing late in the month"
@@ -97,13 +117,13 @@ export default function OpportunityCosts() {
               label="Not rebalancing"
               tone={costTone(data.rebalance.annual_cost)}
               value={fmtEUR(data.rebalance.annual_cost)}
-              sublabel="Assumes 2 % lower return on the part that has drifted from your target weights"
+              sublabel="Assumes 2 % lower return on the amount that would have to move to reach your target weights"
             />
             <MetricCard
               label="Unused tax allowance"
               tone={costTone(data.fsa_waste.annual_cost)}
               value={fmtEUR(data.fsa_waste.annual_cost)}
-              sublabel={<><span data-privacy="blur">{fmtEUR(data.fsa_waste.unused)}</span> of your saver’s allowance (Sparer-Pauschbetrag) is expected to go unused this year</>}
+              sublabel={<><span data-privacy="blur">{fmtEUR(data.fsa_waste.unused)}</span> of your <span data-privacy="blur">{fmtEUR(data.fsa_waste.allowance ?? 1000)}</span> saver’s allowance looks set to go unused this year, after dividends, interest, realised gains and the Vorabpauschale; the cost is the tax on gains you could realise into it tax-free</>}
             />
             <MetricCard
               label="Total per year"

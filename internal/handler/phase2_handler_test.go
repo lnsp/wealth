@@ -120,20 +120,21 @@ func TestAddMonthsClampedAndFirstOfMonth_NoDay31Overflow(t *testing.T) {
 }
 
 func TestComputeMedians_Trailing12MonthsIncome(t *testing.T) {
-	// 60 months of 4,000 EUR/month income -> AnnualGrossIncome must be 48,000 EUR (12 months), NOT 240,000 EUR (60 months).
+	// 60 months of 4,000 EUR/month take-home pay -> AnnualTakeHome must be 48,000 EUR (12 months), NOT 240,000 EUR (60 months).
 	months := make([]monthlyTotals, 60)
 	for i := 0; i < 60; i++ {
 		months[i] = monthlyTotals{
 			Month:    fmt.Sprintf("%04d-%02d", 2025-i/12, 12-i%12),
 			Income:   4000,
+			Salary:   4000,
 			Fixed:    1500,
 			Variable: 500,
 			Net:      2000,
 		}
 	}
 	med := computeMedians(months)
-	if math.Abs(med.AnnualGrossIncome-48000) > 0.01 {
-		t.Fatalf("AnnualGrossIncome = %.2f, want 48000 (12 months)", med.AnnualGrossIncome)
+	if math.Abs(med.AnnualTakeHome-48000) > 0.01 || med.Months != 12 {
+		t.Fatalf("AnnualTakeHome = %.2f over %d months, want 48000 over 12", med.AnnualTakeHome, med.Months)
 	}
 	if math.Abs(med.MonthlySpend-2000) > 0.01 {
 		t.Fatalf("MonthlySpend = %.2f, want 2000", med.MonthlySpend)

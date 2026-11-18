@@ -53,15 +53,19 @@ export interface TransactionRow {
 export interface CashflowMonth {
   month: string; // YYYY-MM
   income: number;
+  salary: number; // take-home pay, part of income
   fixed: number;
   variable: number;
   transfer: number;
+  unclassified: number; // money in that matched no rule: neither income nor spend
   net: number;
+  partial: boolean; // the running month, left out of the medians
+  has_data: boolean;
 }
 export interface CashflowBucket {
   month: string;
   category: string;
-  bucket: 'income' | 'fixed' | 'variable' | 'transfer';
+  bucket: 'income' | 'fixed' | 'variable' | 'transfer' | 'unclassified';
   amount: number;
   count: number;
 }
@@ -70,12 +74,17 @@ export interface CashflowData {
   to: string;
   months: CashflowMonth[];
   buckets: CashflowBucket[];
+  /** Over the last 12 complete months that have income. */
   medians: {
     monthly_income: number;
     monthly_spend: number;
-    monthly_surplus: number;
-    annual_gross_income: number;
+    monthly_surplus: number; // median of monthly net
+    savings_rate_pct: number | null; // Σnet ÷ Σincome × 100
+    annual_take_home: number; // net pay, not gross
+    months: number;
+    window_months: number;
   };
+  unconverted_currencies: string[];
 }
 
 export interface HoldingRow {

@@ -535,14 +535,15 @@ ORDER BY vest_date, grant_number;
 DELETE FROM rsu_vests WHERE account_id = $1 AND vested = false;
 
 -- name: ListCashTransactions :many
--- Cash-account transactions used for cashflow classification. Excludes
--- internal transfers and investment moves — only true income/spend events.
+-- Every transaction on checking and savings accounts, closed (inactive)
+-- accounts included so their history stays in past months. Transfers and
+-- investment moves are returned too; the cashflow classifier keeps them out of
+-- income and spending.
 SELECT t.id, t.date, t.type, t.amount, t.fee, t.currency, t.counterparty, t.reference, t.category,
-       a.name as account_name
+       a.name as account_name, t.tax, a.type AS account_type
 FROM transactions t
 JOIN accounts a ON t.account_id = a.id
 WHERE a.type IN ('checking', 'savings')
-  AND a.is_active = true
   AND t.date >= $1 AND t.date <= $2
   AND t.amount != 0
 ORDER BY t.date DESC, t.id DESC;

@@ -1846,11 +1846,10 @@ func (q *Queries) ListAssets(ctx context.Context) ([]Asset, error) {
 
 const listCashTransactions = `-- name: ListCashTransactions :many
 SELECT t.id, t.date, t.type, t.amount, t.fee, t.currency, t.counterparty, t.reference, t.category,
-       a.name as account_name
+       a.name as account_name, t.tax, a.type AS account_type
 FROM transactions t
 JOIN accounts a ON t.account_id = a.id
 WHERE a.type IN ('checking', 'savings')
-  AND a.is_active = true
   AND t.date >= $1 AND t.date <= $2
   AND t.amount != 0
 ORDER BY t.date DESC, t.id DESC
@@ -1872,10 +1871,14 @@ type ListCashTransactionsRow struct {
 	Reference    pgtype.Text    `json:"reference"`
 	Category     pgtype.Text    `json:"category"`
 	AccountName  string         `json:"account_name"`
+	Tax          pgtype.Numeric `json:"tax"`
+	AccountType  string         `json:"account_type"`
 }
 
-// Cash-account transactions used for cashflow classification. Excludes
-// internal transfers and investment moves — only true income/spend events.
+// Every transaction on checking and savings accounts, closed (inactive)
+// accounts included so their history stays in past months. Transfers and
+// investment moves are returned too; the cashflow classifier keeps them out of
+// income and spending.
 func (q *Queries) ListCashTransactions(ctx context.Context, arg ListCashTransactionsParams) ([]ListCashTransactionsRow, error) {
 	rows, err := q.db.Query(ctx, listCashTransactions, arg.Date, arg.Date_2)
 	if err != nil {
@@ -1896,6 +1899,8 @@ func (q *Queries) ListCashTransactions(ctx context.Context, arg ListCashTransact
 			&i.Reference,
 			&i.Category,
 			&i.AccountName,
+			&i.Tax,
+			&i.AccountType,
 		); err != nil {
 			return nil, err
 		}

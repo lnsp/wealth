@@ -97,6 +97,37 @@ func accountOutsideKAP(a db.Account) bool {
 	return false
 }
 
+// dropPensionWrapperTxns removes ledger rows booked on pension-wrapper
+// accounts (see accountOutsideKAP), so every § 20 view — Overview, loss pots,
+// tax lots, sell simulator, harvest hints, planning — sees the same income as
+// Anlage KAP. On a lookup error the ledger is returned unchanged.
+func dropPensionWrapperTxns(ctx context.Context, q *db.Queries, txns []analytics.TaxTransaction) []analytics.TaxTransaction {
+	accounts, err := q.ListAllAccounts(ctx)
+	if err != nil {
+		return txns
+	}
+	return withoutPensionWrappers(txns, accounts)
+}
+
+func withoutPensionWrappers(txns []analytics.TaxTransaction, accounts []db.Account) []analytics.TaxTransaction {
+	wrapped := map[string]bool{}
+	for _, a := range accounts {
+		if accountOutsideKAP(a) {
+			wrapped[a.ID.String()] = true
+		}
+	}
+	if len(wrapped) == 0 {
+		return txns
+	}
+	out := txns[:0:0]
+	for _, t := range txns {
+		if !wrapped[t.AccountID] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 /* ───────────── Classification ───────────── */
 
 // Realised sales and income come from analytics.RealizedTaxEvents, the same

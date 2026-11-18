@@ -1307,6 +1307,7 @@ func (h *AnalysisHandler) HandleTax(w http.ResponseWriter, r *http.Request) {
 	}
 
 	taxTxns, names, tfsMap, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
+	taxTxns = dropPensionWrapperTxns(ctx, h.queries, taxTxns)
 	curPrices := h.currentUnitPricesEUR(ctx)
 
 	// Vorabpauschalen of completed years: taxed in the following January
@@ -1491,6 +1492,7 @@ func (h *AnalysisHandler) computeYearVorabpauschale(
 		secs = append(secs, s)
 	}
 	taxTxns, _, _, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
+	taxTxns = dropPensionWrapperTxns(ctx, h.queries, taxTxns)
 	curPrices := make(map[string]float64, len(curValByISIN))
 	for isin, v := range curValByISIN {
 		if q := curQtyByISIN[isin]; v > 0 && q > 0 {
@@ -3199,6 +3201,7 @@ func (h *AnalysisHandler) loadTaxLedgerInputs(ctx context.Context) ([]analytics.
 		secMap[s.ISIN] = s
 	}
 	taxTxns, names, tfsMap, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
+	taxTxns = dropPensionWrapperTxns(ctx, h.queries, taxTxns)
 	vpEvents := h.vorabpauschaleEvents(ctx, taxTxns, secMap, tfsMap, histFX, fxRates, 0, time.Now().Year()-1, nil)
 	return analytics.MergeVorabpauschaleEvents(taxTxns, vpEvents), names, equityMap, h.currentUnitPricesEUR(ctx), nil
 }
@@ -4508,6 +4511,7 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 
 	realisedTaxable := 0.0
 	taxTxns, _, _, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
+	taxTxns = dropPensionWrapperTxns(ctx, h.queries, taxTxns)
 	if summary := analytics.ComputeTaxSummary(taxTxns, year, nil); summary != nil {
 		for _, s := range summary.BySecurity {
 			if analytics.IsPrivateSaleAssetClass(secMap[s.ISIN].AssetClass) {

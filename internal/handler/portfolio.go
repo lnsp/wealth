@@ -2741,6 +2741,7 @@ func (h *PortfolioHandler) HandleNextActions(w http.ResponseWriter, r *http.Requ
 
 	// --- 1. Tax-Loss Harvesting (FIFO-based) ---
 	taxTxns, _, _, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
+	taxTxns = dropPensionWrapperTxns(ctx, h.queries, taxTxns)
 
 	prices := make(map[string]float64)
 	for _, hv := range hvs {
@@ -3550,6 +3551,7 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 		assetClass[s.ISIN] = s.AssetClass
 	}
 	taxTxns, names, _, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
+	taxTxns = dropPensionWrapperTxns(ctx, h.queries, taxTxns)
 	holdings, _ := h.queries.ListCurrentHoldings(ctx)
 	pm := h.loadPriceMap(ctx)
 	lotPrices := make(map[string]float64)

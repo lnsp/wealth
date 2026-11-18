@@ -1220,7 +1220,8 @@ type benchmarkPrice struct {
 	price float64
 }
 
-// loadBenchmarkPrices loads benchmark prices from DB, falling back to Yahoo Finance.
+// loadBenchmarkPrices loads benchmark prices in EUR (each converted at its
+// date's ECB rate) from DB, falling back to weekly Yahoo Finance closes.
 func loadBenchmarkPrices(ctx context.Context, q *db.Queries, isin, ticker string) []benchmarkPrice {
 	if isin == "" {
 		isin = benchmarkISIN
@@ -1228,13 +1229,17 @@ func loadBenchmarkPrices(ctx context.Context, q *db.Queries, isin, ticker string
 	if ticker == "" {
 		ticker = benchmarkTicker
 	}
+	fxRates := loadFXRatesMap(ctx, q)
+	histFX := loadHistoricalFXRates(ctx, q)
 	rows, err := q.ListPriceHistory(ctx, isin)
 	if err == nil && len(rows) > 0 {
 		var prices []benchmarkPrice
 		for _, r := range rows {
 			if r.Close.Valid {
 				f, _ := r.Close.Float64Value()
-				prices = append(prices, benchmarkPrice{date: r.Date, price: f.Float64})
+				if p := convertAmountToEURAtDate(f.Float64, r.Currency, r.Date, histFX, fxRates); p > 0 {
+					prices = append(prices, benchmarkPrice{date: r.Date, price: p})
+				}
 			}
 		}
 		if len(prices) > 5 {
@@ -1252,7 +1257,9 @@ func loadBenchmarkPrices(ctx context.Context, q *db.Queries, isin, ticker string
 
 	var prices []benchmarkPrice
 	for _, h := range hist {
-		prices = append(prices, benchmarkPrice{date: h.Date, price: h.Close})
+		if p := convertAmountToEURAtDate(h.Close, h.Currency, h.Date, histFX, fxRates); p > 0 {
+			prices = append(prices, benchmarkPrice{date: h.Date, price: p})
+		}
 	}
 	return prices
 }
@@ -1788,9 +1795,14 @@ func (h *PortfolioHandler) HandleRebalance(w http.ResponseWriter, r *http.Reques
 }
 
 // HandleProjection returns year-by-year projection data for charting.
-// Accepts optional query params: ?contribution=2000&return_pct=7
+// Query params: contribution (€/month), return_pct, horizon_years,
+// contrib_growth (%). The FIRE drawdown is added when expenses > 0:
+// expenses (€/yr in today's money, the spending the portfolio and the pension
+// must cover), swr (%), pension (€/yr after income tax), current_age,
+// pension_age, inflation (%), church_rate (0–0.09) and joint=1.
 func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	q := r.URL.Query()
 
 	// Get goals
 	goals, _ := h.queries.ListFinancialGoals(ctx)
@@ -1803,7 +1815,7 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 			"history":       []any{},
 			"current_value": 0,
 			"contribution":  0,
-			"return_pct":    7,
+			"return_pct":    analytics.PlanningDefaultReturnPct,
 			"target_amount": 0,
 			"target_date":   "",
 		})
@@ -1812,131 +1824,82 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 	// Projections compound at a market return, which a depreciating car
 	// doesn't earn — project investable wealth only.
 	currentValue := investableNetWorth(snaps[0])
+	now := time.Now()
+	startMonth := addMonthsFirstOfMonth(now, 0).Format("2006-01")
 
-	// Get historical net worth (yearly samples)
+	// Historical investable wealth, one point per month. The current month is
+	// the projection's first point, so history stops before it.
 	allSnaps, _ := h.queries.ListNetWorthSnapshots(ctx, 5000)
 	type histPoint struct {
 		Date  string  `json:"date"`
 		Value float64 `json:"value"`
 	}
 	history := make([]histPoint, 0)
-	lastYear := ""
+	lastMonth := ""
 	// Snapshots are newest-first; reverse for chronological
 	for i := len(allSnaps) - 1; i >= 0; i-- {
 		s := allSnaps[i]
-		val := investableNetWorth(s)
 		month := s.Date.Format("2006-01")
-		if month != lastYear {
-			history = append(history, histPoint{Date: month, Value: math.Round(val)})
-			lastYear = month
+		if month >= startMonth {
+			break
+		}
+		if month != lastMonth {
+			history = append(history, histPoint{Date: month, Value: math.Round(investableNetWorth(s))})
+			lastMonth = month
 		}
 	}
 
-	// Compute trailing 12-month average monthly deposit as default contribution
-	historicalMonthlyContrib := 0.0
+	// Default contribution: trailing 12-month net external contribution.
 	fxRates := loadFXRatesMap(ctx, h.queries)
 	histFX := loadHistoricalFXRates(ctx, h.queries)
 	txns, _ := listAllTransactionsRows(ctx, h.queries)
-	if len(txns) > 0 {
-		cutoff := assets.CivilDate(time.Now()).AddDate(-1, 0, 0) // last 12 months
-		totalDeposits := 0.0
-		for _, txn := range txns {
-			if txn.Type == "deposit" && txn.Amount.Valid && txn.Date.After(cutoff) {
-				f, _ := txn.Amount.Float64Value()
-				totalDeposits += convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-			}
-		}
-		monthsElapsed := time.Since(cutoff).Hours() / (24 * 30.44)
-		if monthsElapsed > 1 {
-			historicalMonthlyContrib = totalDeposits / monthsElapsed
-		}
-	}
+	acctTypes := h.accountTypesByID(ctx)
+	trailing := trailingNetContribution(txns, acctTypes, now, histFX, fxRates)
 
-	// Parse what-if overrides
-	monthlyContrib := historicalMonthlyContrib // default to actual savings rate
-	annualReturn := 7.0
+	monthlyContrib := trailing.Monthly
+	annualReturn := analytics.PlanningDefaultReturnPct
+	// The earliest goal is only drawn as a labelled reference line; it no
+	// longer replaces the contribution, return or horizon.
 	targetAmount := 0.0
 	targetDate := ""
-
+	targetGoalName := ""
 	if len(goals) > 0 {
-		if mc := numericToFloat(goals[0].MonthlyContribution); mc > 0 {
-			monthlyContrib = mc
-		}
-		annualReturn = numericToFloat(goals[0].AssumedReturnPct)
 		targetAmount = numericToFloat(goals[0].TargetAmount)
 		targetDate = goals[0].TargetDate.Format("2006-01-02")
+		targetGoalName = goals[0].Name
 	}
 
-	if c := r.URL.Query().Get("contribution"); c != "" {
-		if v, err := parseFiniteFloat(c); err == nil && v >= 0 && v <= 1e9 {
+	if c := q.Get("contribution"); c != "" {
+		if v, err := parseFiniteFloat(c); err == nil && v >= -1e9 && v <= 1e9 {
 			monthlyContrib = v
 		}
 	}
-	if rr := r.URL.Query().Get("return_pct"); rr != "" {
+	if rr := q.Get("return_pct"); rr != "" {
 		if v, err := parseFiniteFloat(rr); err == nil && v >= -50 && v <= 30 {
 			annualReturn = v
 		}
 	}
-	if annualReturn <= -99.99 {
-		annualReturn = -99.99
-	}
-
-	// Drawdown/retirement params
-	annualExpenses := 0.0
-	swr := 3.5
-	marginalRate := 0.26375
-	taxPortion := 0.7
-	if e := r.URL.Query().Get("expenses"); e != "" {
-		if v, err := parseFiniteFloat(e); err == nil && v > 0 && v <= 1e9 {
-			annualExpenses = v
-		}
-	}
-	if s := r.URL.Query().Get("swr"); s != "" {
-		if v, err := parseFiniteFloat(s); err == nil && v > 0 && v <= 10 {
-			swr = v
-		}
-	}
-	if mr := r.URL.Query().Get("marginal_rate"); mr != "" {
-		if v, err := parseFiniteFloat(mr); err == nil && v >= 0 && v <= 1 {
-			marginalRate = v
-		}
-	}
-	if tp := r.URL.Query().Get("tax_portion"); tp != "" {
-		if v, err := parseFiniteFloat(tp); err == nil && v >= 0 && v <= 1 {
-			taxPortion = v
-		}
-	}
 
 	horizonYears := 30
-	if h := r.URL.Query().Get("horizon_years"); h != "" {
-		if v, err := strconv.Atoi(h); err == nil && v >= 1 && v <= 50 {
+	if hy := q.Get("horizon_years"); hy != "" {
+		if v, err := strconv.Atoi(hy); err == nil && v >= 1 && v <= 50 {
 			horizonYears = v
 		}
 	}
 	contribGrowth := 0.0
-	if cg := r.URL.Query().Get("contrib_growth"); cg != "" {
+	if cg := q.Get("contrib_growth"); cg != "" {
 		if v, err := parseFiniteFloat(cg); err == nil && v >= 0 && v <= 20 {
 			contribGrowth = v / 100
 		}
 	}
 
-	// Project forward month-by-month for the requested horizon
-	monthlyReturn := math.Pow(1+annualReturn/100, 1.0/12.0) - 1
-	now := time.Now()
+	monthlyReturn := planMonthlyRate(annualReturn)
 	maxMonths := horizonYears * 12
-	if len(goals) > 0 {
-		monthsToGoal := int(goals[0].TargetDate.Sub(now).Hours() / (24 * 30.44))
-		if monthsToGoal > 0 && (monthsToGoal+24) > maxMonths {
-			maxMonths = monthsToGoal + 24
-		}
-		if maxMonths > 600 {
-			maxMonths = 600
-		}
-	}
 
 	// Compute historical monthly volatility for confidence bands.
-	// allSnaps are daily snapshots (newest-first); scale daily return std dev by
-	// sqrt(21) (or sample monthly if snapshots are monthly) and cap to [0, 0.25].
+	// allSnaps are calendar-daily snapshots (newest-first); scale the daily
+	// return std dev by sqrt(30.44 days per month), or use it as-is when the
+	// snapshots are monthly, and cap to [0, 0.25].
 	monthlyVol := 0.0
 	if len(allSnaps) > 60 {
 		var obsReturns []float64
@@ -1975,7 +1938,7 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 				avgGapDays = lastDate.Sub(firstDate).Hours() / 24.0 / float64(len(allSnaps)-1)
 			}
 			if avgGapDays < 5 {
-				monthlyVol = obsStd * math.Sqrt(21.0)
+				monthlyVol = obsStd * math.Sqrt(30.44)
 			} else {
 				monthlyVol = obsStd
 			}
@@ -1997,13 +1960,9 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 	projP10 := currentValue
 	projP90 := currentValue
 
-	currentContrib := monthlyContrib
 	for m := 0; m <= maxMonths; m++ {
-		if m > 0 && m%12 == 0 && contribGrowth > 0 {
-			currentContrib *= (1 + contribGrowth)
-		}
 		if m > 0 {
-			projMedian = projMedian*(1+monthlyReturn) + currentContrib
+			projMedian = math.Max(0, projMedian*(1+monthlyReturn)+contribForMonth(monthlyContrib, contribGrowth, m))
 		}
 
 		// Confidence bands: log-normal spread around projMedian so growing
@@ -2028,20 +1987,16 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Sensitivity analysis: vary one parameter at a time, project to end
+	// Sensitivity analysis: vary one parameter at a time, project to end.
+	// planProjectFV uses the same contribution timing as the chart.
 	projectFV := func(cv, mc, ar float64, months int) float64 {
-		mr := math.Pow(1+ar/100, 1.0/12.0) - 1
-		v := cv
-		c := mc
-		for m := 0; m < months; m++ {
-			if m > 0 && m%12 == 0 && contribGrowth > 0 {
-				c *= (1 + contribGrowth)
-			}
-			v = v*(1+mr) + c
-		}
-		return v
+		return math.Max(0, planProjectFV(cv, mc, ar, contribGrowth, months))
 	}
 	baselineFV := projectFV(currentValue, monthlyContrib, annualReturn, maxMonths)
+	lowContrib := monthlyContrib - 500
+	if monthlyContrib >= 0 {
+		lowContrib = math.Max(lowContrib, 0)
+	}
 
 	type sensitivityBar struct {
 		Label string  `json:"label"`
@@ -2058,7 +2013,7 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 		},
 		{
 			Label: "Monthly contribution",
-			Low:   math.Round(projectFV(currentValue, math.Max(monthlyContrib-500, 0), annualReturn, maxMonths)),
+			Low:   math.Round(projectFV(currentValue, lowContrib, annualReturn, maxMonths)),
 			High:  math.Round(projectFV(currentValue, monthlyContrib+500, annualReturn, maxMonths)),
 			Base:  math.Round(baselineFV),
 		},
@@ -2070,11 +2025,14 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 		},
 	}
 
-	// Milestone table: key years with projected value, contributions, and growth
+	// Milestone table: key years with projected value, contributions, and growth.
+	// Contributions are the money paid in after today; the starting value is
+	// reported separately, so value = starting value + contributions + growth.
 	type milestone struct {
-		Year          int     `json:"year"`
-		YearsFromNow  int    `json:"years_from_now"`
+		Year           int     `json:"year"`
+		YearsFromNow   int     `json:"years_from_now"`
 		ProjectedValue float64 `json:"projected_value"`
+		StartingValue  float64 `json:"starting_value"`
 		Contributions  float64 `json:"contributions"`
 		Growth         float64 `json:"growth"`
 		RealValue      float64 `json:"real_value"` // inflation-adjusted at 2%
@@ -2088,206 +2046,147 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 			break
 		}
 		fv := projectFV(currentValue, monthlyContrib, annualReturn, months)
-		// Total contributions reflect annual contrib growth: sum of monthly
-		// deposits over y years where year-N deposit = monthlyContrib*(1+g)^N.
-		// Closed form: monthlyContrib*12 * ((1+g)^y − 1) / g (or *12*y if g=0).
+		// Sum of contribForMonth over y years: monthlyContrib*12 per year,
+		// growing by g each year → monthlyContrib*12*((1+g)^y − 1)/g.
 		var totalDeposits float64
 		if contribGrowth > 0 {
 			totalDeposits = monthlyContrib * 12 * (math.Pow(1+contribGrowth, float64(y)) - 1) / contribGrowth
 		} else {
 			totalDeposits = monthlyContrib * float64(months)
 		}
-		totalContrib := currentValue + totalDeposits
-		growth := fv - totalContrib
-		realValue := fv / math.Pow(1.02, float64(y)) // 2% annual inflation
+		growth := fv - currentValue - totalDeposits
+		realValue := fv / math.Pow(1+analytics.PlanningDefaultInflationPct/100, float64(y))
 		milestones = append(milestones, milestone{
 			Year:           currentYear + y,
 			YearsFromNow:   y,
 			ProjectedValue: math.Round(fv),
-			Contributions:  math.Round(totalContrib),
+			StartingValue:  math.Round(currentValue),
+			Contributions:  math.Round(totalDeposits),
 			Growth:         math.Round(growth),
 			RealValue:      math.Round(realValue),
 		})
 	}
 
-	// Drawdown phase: simulate retirement withdrawal after reaching FIRE number
-	type drawdownPoint struct {
-		Date  string  `json:"date"`
-		Value float64 `json:"value"`
+	// FIRE: accumulate until the portfolio covers the tax-grossed-up spending
+	// gap at the withdrawal rate, then draw an inflation-indexed withdrawal.
+	var drawdown map[string]any
+	annualExpenses := 0.0
+	if e := q.Get("expenses"); e != "" {
+		if v, err := parseFiniteFloat(e); err == nil && v > 0 && v <= 1e9 {
+			annualExpenses = v
+		}
 	}
-	type taxYearBreakdown struct {
-		Year           int     `json:"year"`
-		GrossWithdraw  float64 `json:"gross_withdrawal"`
-		EstimatedTax   float64 `json:"estimated_tax"`
-		NetReceived    float64 `json:"net_received"`
-		EffectiveRate  float64 `json:"effective_rate_pct"`
-		RemainingValue float64 `json:"remaining_value"`
-	}
-	type drawdownResult struct {
-		Series       []drawdownPoint   `json:"series"`
-		FIRENumber   float64           `json:"fire_number"`
-		FIREDate     string            `json:"fire_date"`
-		YearsToFIRE  int               `json:"years_to_fire"`
-		LongevityYrs int               `json:"longevity_years"`
-		SuccessRate  float64           `json:"success_rate"`
-		TaxBreakdown []taxYearBreakdown `json:"tax_breakdown,omitempty"`
-		CumulativeTax float64          `json:"cumulative_tax"`
-	}
-	var drawdown *drawdownResult
 	if annualExpenses > 0 {
-		// FIRE number must cover gross withdrawal, not net spend. Effective
-		// tax on each euro withdrawn ≈ marginalRate × taxPortion (the slice
-		// of withdrawal that's taxable, after Teilfreistellung for equity).
-		// grossNeeded = annualExpenses / (1 − effTax); clamp denom > 0 so a
-		// pathological input doesn't divide by zero.
-		effTax := marginalRate * taxPortion
-		if effTax >= 0.99 {
-			effTax = 0.99
+		fp := fireParams{
+			CurrentValue:   currentValue,
+			MonthlyContrib: monthlyContrib,
+			ContribGrowth:  contribGrowth,
+			AnnualReturn:   annualReturn / 100,
+			Inflation:      analytics.PlanningDefaultInflationPct / 100,
+			Expenses:       annualExpenses,
+			SWR:            0.035,
+			MaxMonths:      600,
 		}
-		grossExpenses := annualExpenses / (1 - effTax)
-		fireNumber := grossExpenses / (swr / 100)
-		// Find FIRE date from accumulation projection — same contribGrowth
-		// model as the main projection so the FIRE date matches the chart.
-		fireMonth := -1
-		v := currentValue
-		c := monthlyContrib
-		for m := 1; m <= maxMonths; m++ {
-			if m > 0 && m%12 == 0 && contribGrowth > 0 {
-				c *= (1 + contribGrowth)
-			}
-			v = v*(1+monthlyReturn) + c
-			if v >= fireNumber {
-				fireMonth = m
-				break
+		if s := q.Get("swr"); s != "" {
+			if v, err := parseFiniteFloat(s); err == nil && v > 0 && v <= 10 {
+				fp.SWR = v / 100
 			}
 		}
-		if fireMonth > 0 || currentValue >= fireNumber {
-			if currentValue >= fireNumber {
-				fireMonth = 0
-			}
-			fireDate := addMonthsFirstOfMonth(now, fireMonth)
-			fireValue := projectFV(currentValue, monthlyContrib, annualReturn, fireMonth)
-
-			// Simulate drawdown: monthly withdrawal is the gross amount (net of
-			// pension via the frontend's gap calc, but pre-tax) so the
-			// portfolio cash flow matches what the FIRE-number sizing assumes.
-			monthlyWithdrawal := grossExpenses / 12
-			drawdownReturn := math.Pow(1+annualReturn/100, 1.0/12.0) - 1
-			dv := fireValue
-			var series []drawdownPoint
-			series = append(series, drawdownPoint{Date: fireDate.Format("2006-01"), Value: math.Round(dv)})
-			longevity := 0
-			for m := 1; m <= 480; m++ { // up to 40 years of retirement
-				dv = dv*(1+drawdownReturn) - monthlyWithdrawal
-				if dv <= 0 {
-					dv = 0
-					series = append(series, drawdownPoint{Date: addMonthsFirstOfMonth(fireDate, m).Format("2006-01"), Value: 0})
-					longevity = m / 12
-					break
-				}
-				if m%3 == 0 {
-					series = append(series, drawdownPoint{Date: addMonthsFirstOfMonth(fireDate, m).Format("2006-01"), Value: math.Round(dv)})
-				}
-				longevity = m / 12
-			}
-			successRate := 100.0
-			if longevity < 40 && dv <= 0 {
-				successRate = float64(longevity) / 40 * 100
-			}
-			// Tax-aware year-by-year breakdown consistent with grossExpenses drawdown.series
-			var taxBreakdown []taxYearBreakdown
-			cumulativeTax := 0.0
-			simValue := fireValue
-			costBasisRatio := currentValue / math.Max(fireValue, 1) // approximate
-			if costBasisRatio > 1 {
-				costBasisRatio = 0.8
-			}
-			for y := 0; y < longevity && y < 40; y++ {
-				gross := grossExpenses
-				gainPortion := gross * (1 - costBasisRatio)
-				if gainPortion < 0 {
-					gainPortion = 0
-				}
-				taxableGain := gainPortion * 0.7
-				taxableAfterFrei := math.Max(taxableGain-analytics.Sparerpauschbetrag, 0)
-				tax := taxableAfterFrei * analytics.EffectiveTaxRate
-				net := gross - tax
-				for m := 0; m < 12; m++ {
-					simValue = simValue*(1+drawdownReturn) - monthlyWithdrawal
-				}
-				if simValue < 0 {
-					simValue = 0
-				}
-				cumulativeTax += tax
-				costBasisRatio *= 0.97
-
-				effRatePct := 0.0
-				if gross > 0 {
-					effRatePct = math.Round(tax/gross*10000) / 100
-				}
-				taxBreakdown = append(taxBreakdown, taxYearBreakdown{
-					Year:           fireDate.Year() + y,
-					GrossWithdraw:  math.Round(gross),
-					EstimatedTax:   math.Round(tax*100) / 100,
-					NetReceived:    math.Round(net*100) / 100,
-					EffectiveRate:  effRatePct,
-					RemainingValue: math.Round(simValue),
-				})
-			}
-
-			drawdown = &drawdownResult{
-				Series:        series,
-				FIRENumber:    math.Round(fireNumber),
-				FIREDate:      fireDate.Format("2006-01"),
-				YearsToFIRE:   fireMonth / 12,
-				LongevityYrs:  longevity,
-				SuccessRate:   math.Round(successRate*10) / 10,
-				TaxBreakdown:  taxBreakdown,
-				CumulativeTax: math.Round(cumulativeTax),
+		if pv := q.Get("pension"); pv != "" {
+			if v, err := parseFiniteFloat(pv); err == nil && v >= 0 && v <= 1e9 {
+				fp.Pension = v
 			}
 		}
+		if ca := q.Get("current_age"); ca != "" {
+			if v, err := strconv.Atoi(ca); err == nil && v > 0 && v < 120 {
+				fp.CurrentAge = v
+			}
+		}
+		if pa := q.Get("pension_age"); pa != "" {
+			if v, err := strconv.Atoi(pa); err == nil && v > 0 && v < 120 {
+				fp.PensionAge = v
+			}
+		}
+		if inf := q.Get("inflation"); inf != "" {
+			if v, err := parseFiniteFloat(inf); err == nil && v >= -5 && v <= 20 {
+				fp.Inflation = v / 100
+			}
+		}
+		churchRate := 0.0
+		if cr := q.Get("church_rate"); cr != "" {
+			if v, err := parseFiniteFloat(cr); err == nil && v >= 0 && v <= 0.09 {
+				churchRate = v
+			}
+		}
+		joint := q.Get("joint") == "1"
+		fp.TaxRate = analytics.CapitalIncomeTaxRate(churchRate)
+		fp.TFS = h.portfolioTFS(ctx, fxRates)
+		fp.Allowance = analytics.SparerPauschbetragForYear(now.Year(), joint)
+		drawdown = fireDrawdownJSON(fp, simulateFIRE(fp, now), now)
 	}
 
-	// Projection accuracy: compare what 12-month-ago projection would have predicted vs actual
+	// Projection accuracy: what the default projection would have shown 12
+	// months ago — the investable value then, the trailing net contribution
+	// as of then and the default return — against today's value. Today's
+	// slider settings play no part.
 	type projAccuracy struct {
-		MonthsAgo      int     `json:"months_ago"`
-		PastValue      float64 `json:"past_value"`
-		ProjectedValue float64 `json:"projected_value"`
-		ActualValue    float64 `json:"actual_value"`
-		DiffEUR        float64 `json:"diff_eur"`
-		DiffPct        float64 `json:"diff_pct"`
+		MonthsAgo           int     `json:"months_ago"`
+		PastValue           float64 `json:"past_value"`
+		ProjectedValue      float64 `json:"projected_value"`
+		ActualValue         float64 `json:"actual_value"`
+		DiffEUR             float64 `json:"diff_eur"`
+		DiffPct             float64 `json:"diff_pct"`
+		Basis               string  `json:"basis"`
+		AssumedContribution float64 `json:"assumed_contribution"`
+		AssumedReturnPct    float64 `json:"assumed_return_pct"`
 	}
 	var accuracy *projAccuracy
-	if len(history) > 12 {
-		// Value 12 months ago
-		idx := len(history) - 13
-		if idx >= 0 {
-			pastVal := history[idx].Value
-			// What the projection would have predicted: pastVal growing at annualReturn for 12 months + 12*monthlyContrib
-			projected := projectFV(pastVal, monthlyContrib, annualReturn, 12)
-			diffEUR := currentValue - projected
-			diffPct := 0.0
-			if projected > 0 {
-				diffPct = (diffEUR / projected) * 100
-			}
-			accuracy = &projAccuracy{
-				MonthsAgo:      12,
-				PastValue:      math.Round(pastVal),
-				ProjectedValue: math.Round(projected),
-				ActualValue:    math.Round(currentValue),
-				DiffEUR:        math.Round(diffEUR),
-				DiffPct:        math.Round(diffPct*10) / 10,
-			}
+	pastCutoff := assets.CivilDate(now).AddDate(-1, 0, 0)
+	for _, s := range allSnaps { // newest first: the first on or before the cutoff
+		if s.Date.After(pastCutoff) {
+			continue
 		}
+		pastVal := investableNetWorth(s)
+		if pastVal <= 0 {
+			break
+		}
+		then := trailingNetContribution(txns, acctTypes, s.Date, histFX, fxRates)
+		projected := math.Max(0, planProjectFV(pastVal, then.Monthly, analytics.PlanningDefaultReturnPct, 0, 12))
+		diffEUR := currentValue - projected
+		diffPct := 0.0
+		if projected > 0 {
+			diffPct = (diffEUR / projected) * 100
+		}
+		accuracy = &projAccuracy{
+			MonthsAgo:           12,
+			PastValue:           math.Round(pastVal),
+			ProjectedValue:      math.Round(projected),
+			ActualValue:         math.Round(currentValue),
+			DiffEUR:             math.Round(diffEUR),
+			DiffPct:             math.Round(diffPct*10) / 10,
+			Basis:               "default_projection_then",
+			AssumedContribution: math.Round(then.Monthly),
+			AssumedReturnPct:    analytics.PlanningDefaultReturnPct,
+		}
+		break
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"history":             history,
-		"projection":          projection,
-		"current_value":       math.Round(currentValue),
-		"target_amount":       targetAmount,
-		"target_date":         targetDate,
-		"contribution":        monthlyContrib,
+		"history":              history,
+		"projection":           projection,
+		"current_value":        math.Round(currentValue),
+		"target_amount":        targetAmount,
+		"target_date":          targetDate,
+		"target_goal_name":     targetGoalName,
+		"contribution":         monthlyContrib,
+		"default_contribution": math.Round(trailing.Monthly*100) / 100,
+		"contribution_basis": map[string]any{
+			"kind":           "trailing_12m_net",
+			"months_covered": math.Round(trailing.MonthsCovered*10) / 10,
+			"deposits":       math.Round(trailing.Deposits),
+			"withdrawals":    math.Round(trailing.Withdrawals),
+			"in_kind":        math.Round(trailing.InKind),
+		},
 		"return_pct":          annualReturn,
 		"horizon_years":       horizonYears,
 		"contrib_growth_pct":  math.Round(contribGrowth*1000) / 10, // back to %, 1 decimal
@@ -3267,8 +3166,14 @@ func (h *PortfolioHandler) HandleSavingsPlans(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// HandleLifeEvents simulates life events' impact on net worth projection.
-// POST body: { "events": [...], "contribution": 1000, "return_pct": 7 }
+// HandleLifeEvents simulates life events' impact on the investable-wealth
+// projection (property bought and loans taken are not part of it).
+// POST body: { "events": [...], "contribution": 1000, "return_pct": 7,
+// "expenses": 36000, "swr": 3.5, "pension": 12000, "current_age": 35,
+// "pension_age": 67, "inflation_pct": 2 }. contribution and return_pct may be
+// omitted (trailing 12-month net contribution, 7 %); 0 is a valid value.
+// The independence shift uses the FIRE calculator's target and is only
+// reported when expenses are given.
 func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -3285,16 +3190,26 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 
 	var req struct {
 		Events       []lifeEvent `json:"events"`
-		Contribution float64     `json:"contribution"`
-		ReturnPct    float64     `json:"return_pct"`
+		Contribution *float64    `json:"contribution"`
+		ReturnPct    *float64    `json:"return_pct"`
+		Expenses     float64     `json:"expenses"`
+		SWR          float64     `json:"swr"`
+		Pension      float64     `json:"pension"`
+		CurrentAge   int         `json:"current_age"`
+		PensionAge   int         `json:"pension_age"`
+		InflationPct *float64    `json:"inflation_pct"`
+		ChurchRate   float64     `json:"church_rate"`
+		Joint        bool        `json:"joint"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
 		return
 	}
 	isFinite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
-	if !isFinite(req.Contribution) || !isFinite(req.ReturnPct) {
-		writeError(w, http.StatusBadRequest, "contribution and return_pct must be finite numbers")
+	finitePtr := func(p *float64) bool { return p == nil || isFinite(*p) }
+	if !finitePtr(req.Contribution) || !finitePtr(req.ReturnPct) || !finitePtr(req.InflationPct) ||
+		!isFinite(req.Expenses) || !isFinite(req.SWR) || !isFinite(req.Pension) || !isFinite(req.ChurchRate) {
+		writeError(w, http.StatusBadRequest, "contribution, return_pct and the FIRE inputs must be finite numbers")
 		return
 	}
 	for _, ev := range req.Events {
@@ -3313,193 +3228,111 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 	currentValue := investableNetWorth(snaps[0])
 	fxRates := loadFXRatesMap(ctx, h.queries)
 	histFX := loadHistoricalFXRates(ctx, h.queries)
-
-	// Defaults
-	monthlyContrib := req.Contribution
-	if monthlyContrib <= 0 {
-		// Use trailing 12-month average
-		txns, _ := listAllTransactionsRows(ctx, h.queries)
-		cutoff := assets.CivilDate(time.Now()).AddDate(-1, 0, 0)
-		totalDep := 0.0
-		for _, txn := range txns {
-			if txn.Type == "deposit" && txn.Amount.Valid && txn.Date.After(cutoff) {
-				f, _ := txn.Amount.Float64Value()
-				totalDep += convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-			}
-		}
-		elapsed := time.Since(cutoff).Hours() / (24 * 30.44)
-		if elapsed > 1 {
-			monthlyContrib = totalDep / elapsed
-		}
-	}
-	annualReturn := req.ReturnPct
-	if annualReturn == 0 {
-		annualReturn = 7.0
-	}
-	if annualReturn <= -99.99 {
-		annualReturn = -99.99
-	} else if annualReturn > 50 {
-		annualReturn = 50
-	}
-
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
 	now := time.Now()
-	maxMonths := 360 // 30 years
-	monthlyReturn := math.Pow(1+annualReturn/100, 1.0/12.0) - 1
 
-	// Parse event dates into month offsets
-	type parsedEvent struct {
-		lifeEvent
-		monthOffset int
+	monthlyContrib := 0.0
+	if req.Contribution != nil {
+		monthlyContrib = *req.Contribution
+	} else {
+		monthlyContrib = trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates).Monthly
 	}
-	var parsed []parsedEvent
+	annualReturn := analytics.PlanningDefaultReturnPct
+	if req.ReturnPct != nil {
+		annualReturn = math.Max(-99.99, math.Min(50, *req.ReturnPct))
+	}
+
+	const chartMonths = 360 // 30 years on the chart
+	const fireMonths = 600  // independence is searched for up to 50 years
+	monthlyReturn := planMonthlyRate(annualReturn)
+
+	// Event dates ("YYYY-MM") become whole calendar-month offsets from this month.
+	var parsed []lifeEventSim
 	for _, e := range req.Events {
-		// Parse YYYY-MM date
 		t, err := time.Parse("2006-01", e.Date)
 		if err != nil {
 			continue
 		}
-		offset := int(t.Sub(now).Hours() / (24 * 30.44))
-		if offset < 0 {
-			offset = 0
-		}
-		parsed = append(parsed, parsedEvent{lifeEvent: e, monthOffset: offset})
+		parsed = append(parsed, lifeEventSim{
+			MonthOffset:    monthsBetween(now, t),
+			CashImpact:     e.CashImpact,
+			TaxImpact:      e.TaxImpact,
+			ContribChange:  e.ContribChange,
+			RecurringCost:  e.RecurringCost,
+			DurationMonths: e.DurationMonths,
+		})
 	}
 
-	// Project baseline (no events)
+	baseVals, baseBasis := simulateLifeEvents(currentValue, monthlyContrib, monthlyReturn, nil, fireMonths)
+	evVals, evBasis := simulateLifeEvents(currentValue, monthlyContrib, monthlyReturn, parsed, fireMonths)
+
 	type projPoint struct {
 		Date  string  `json:"date"`
 		Value float64 `json:"value"`
 	}
-	var baseline []projPoint
-	bv := currentValue
-	for m := 0; m <= maxMonths; m++ {
-		if m > 0 {
-			bv = bv*(1+monthlyReturn) + monthlyContrib
-		}
-		if m%3 == 0 {
-			baseline = append(baseline, projPoint{
-				Date:  addMonthsFirstOfMonth(now, m).Format("2006-01"),
-				Value: math.Round(bv),
-			})
-		}
+	baseline := make([]projPoint, 0, chartMonths/3+1)
+	withEvents := make([]projPoint, 0, chartMonths/3+1)
+	for m := 0; m <= chartMonths; m += 3 {
+		date := addMonthsFirstOfMonth(now, m).Format("2006-01")
+		baseline = append(baseline, projPoint{Date: date, Value: math.Round(baseVals[m])})
+		withEvents = append(withEvents, projPoint{Date: date, Value: math.Round(evVals[m])})
 	}
 
-	// Project with events
-	var withEvents []projPoint
-	ev := currentValue
-	activeContrib := monthlyContrib
-	recurringCosts := make(map[int]int)
-
-	for m := 0; m <= maxMonths; m++ {
-		for i, pe := range parsed {
-			if pe.monthOffset == m {
-				ev += pe.CashImpact
-				ev -= pe.TaxImpact
-				activeContrib += pe.ContribChange
-				if pe.RecurringCost != 0 {
-					dur := pe.DurationMonths
-					if dur <= 0 {
-						dur = -1 // permanent
-					}
-					recurringCosts[i] = dur
-				}
-			}
+	// Independence shift against the FIRE calculator's target.
+	fireKnown := req.Expenses > 0
+	baselineFIRE, eventsFIRE, fireShift := -1, -1, 0
+	fireTarget := 0.0
+	if fireKnown {
+		fp := fireParams{
+			CurrentValue: currentValue,
+			AnnualReturn: annualReturn / 100,
+			Inflation:    analytics.PlanningDefaultInflationPct / 100,
+			Expenses:     req.Expenses,
+			Pension:      math.Max(0, req.Pension),
+			CurrentAge:   req.CurrentAge,
+			PensionAge:   req.PensionAge,
+			SWR:          0.035,
+			TaxRate:      analytics.CapitalIncomeTaxRate(req.ChurchRate),
+			TFS:          h.portfolioTFS(ctx, fxRates),
+			Allowance:    analytics.SparerPauschbetragForYear(now.Year(), req.Joint),
 		}
-
-		totalRecurring := 0.0
-		for i, remaining := range recurringCosts {
-			totalRecurring += parsed[i].RecurringCost
-			if remaining > 0 {
-				recurringCosts[i]--
-				if recurringCosts[i] <= 0 {
-					delete(recurringCosts, i)
-				}
-			}
+		if req.SWR > 0 && req.SWR <= 10 {
+			fp.SWR = req.SWR / 100
 		}
-
-		if m > 0 {
-			ev = ev*(1+monthlyReturn) + activeContrib - totalRecurring
-		} else {
-			ev = ev - totalRecurring
+		if req.InflationPct != nil && *req.InflationPct >= -5 && *req.InflationPct <= 20 {
+			fp.Inflation = *req.InflationPct / 100
 		}
-		if ev < 0 {
-			ev = 0
+		baselineFIRE = fireMonthOnPath(fp, baseVals, baseBasis)
+		eventsFIRE = fireMonthOnPath(fp, evVals, evBasis)
+		if baselineFIRE >= 0 && eventsFIRE >= 0 {
+			fireShift = eventsFIRE - baselineFIRE // positive = delayed
 		}
-
-		if m%3 == 0 {
-			withEvents = append(withEvents, projPoint{
-				Date:  addMonthsFirstOfMonth(now, m).Format("2006-01"),
-				Value: math.Round(ev),
-			})
+		if baselineFIRE >= 0 {
+			t, _ := fp.targetAt(baselineFIRE, baseVals[baselineFIRE], baseBasis[baselineFIRE])
+			fireTarget = t / fp.inflator(float64(baselineFIRE))
 		}
-	}
-
-	// Compute FIRE date shift
-	fireExpenses := 36000.0 // default annual expenses
-	fireSWR := 3.5
-	fireNumber := fireExpenses / (fireSWR / 100)
-
-	baselineFIRE := -1
-	bv2 := currentValue
-	for m := 1; m <= maxMonths; m++ {
-		bv2 = bv2*(1+monthlyReturn) + monthlyContrib
-		if bv2 >= fireNumber {
-			baselineFIRE = m
-			break
-		}
-	}
-
-	eventsFIRE := -1
-	ev2 := currentValue
-	ac2 := monthlyContrib
-	rc2 := make(map[int]int)
-	for m := 1; m <= maxMonths; m++ {
-		for i, pe := range parsed {
-			if pe.monthOffset == m {
-				ev2 += pe.CashImpact - pe.TaxImpact
-				ac2 += pe.ContribChange
-				if pe.RecurringCost != 0 {
-					dur := pe.DurationMonths
-					if dur <= 0 { dur = -1 }
-					rc2[i] = dur
-				}
-			}
-		}
-		tr2 := 0.0
-		for i, remaining := range rc2 {
-			tr2 += parsed[i].RecurringCost
-			if remaining > 0 {
-				rc2[i]--
-				if rc2[i] <= 0 { delete(rc2, i) }
-			}
-		}
-		ev2 = ev2*(1+monthlyReturn) + ac2 - tr2
-		if ev2 >= fireNumber && eventsFIRE < 0 {
-			eventsFIRE = m
-		}
-	}
-
-	fireShift := 0
-	if baselineFIRE > 0 && eventsFIRE > 0 {
-		fireShift = (eventsFIRE - baselineFIRE) // positive = delayed
 	}
 
 	// Impact summary
 	finalBaseline := 0.0
 	finalEvents := 0.0
-	if len(baseline) > 0 { finalBaseline = baseline[len(baseline)-1].Value }
-	if len(withEvents) > 0 { finalEvents = withEvents[len(withEvents)-1].Value }
+	if len(baseline) > 0 {
+		finalBaseline = baseline[len(baseline)-1].Value
+	}
+	if len(withEvents) > 0 {
+		finalEvents = withEvents[len(withEvents)-1].Value
+	}
 
 	// Event templates for the frontend
 	type eventTemplate struct {
-		Type           string  `json:"type"`
-		Label          string  `json:"label"`
-		Description    string  `json:"description"`
-		DefaultCash    float64 `json:"default_cash_impact"`
-		DefaultContrib float64 `json:"default_contrib_change"`
-		DefaultRecur   float64 `json:"default_recurring_cost"`
-		DefaultDuration int    `json:"default_duration_months"`
-		Icon           string  `json:"icon"`
+		Type            string  `json:"type"`
+		Label           string  `json:"label"`
+		Description     string  `json:"description"`
+		DefaultCash     float64 `json:"default_cash_impact"`
+		DefaultContrib  float64 `json:"default_contrib_change"`
+		DefaultRecur    float64 `json:"default_recurring_cost"`
+		DefaultDuration int     `json:"default_duration_months"`
+		Icon            string  `json:"icon"`
 	}
 	templates := []eventTemplate{
 		{Type: "home_purchase", Label: "Home Purchase", Description: "Down payment + mortgage", DefaultCash: -80000, DefaultContrib: 0, DefaultRecur: 1500, DefaultDuration: 300, Icon: "🏠"},
@@ -3512,24 +3345,15 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 	}
 
 	// --- Execution Plan ---
-	// For cash-need events: tax-minimized liquidation order
+	// For cash-need events: FIFO-respecting, tax-minimised liquidation order
 	// For windfall events: lump-sum vs DCA comparison
-	type sellStep struct {
-		ISIN        string  `json:"isin"`
-		Name        string  `json:"name"`
-		BuyDate     string  `json:"buy_date"`
-		SellAmount  float64 `json:"sell_amount"`
-		TaxDue      float64 `json:"tax_due"`
-		NetProceeds float64 `json:"net_proceeds"`
-		EffRate     float64 `json:"effective_rate_pct"`
-	}
 	type executionPlan struct {
-		Type          string     `json:"type"` // "liquidation" or "invest"
-		EventLabel    string     `json:"event_label"`
-		CashNeeded    float64    `json:"cash_needed,omitempty"`
-		SellOrder     []sellStep `json:"sell_order,omitempty"`
-		TotalTax      float64    `json:"total_tax"`
-		TotalProceeds float64    `json:"total_proceeds"`
+		Type          string            `json:"type"` // "liquidation" or "invest"
+		EventLabel    string            `json:"event_label"`
+		CashNeeded    float64           `json:"cash_needed,omitempty"`
+		SellOrder     []liquidationStep `json:"sell_order,omitempty"`
+		TotalTax      float64           `json:"total_tax"`
+		TotalProceeds float64           `json:"total_proceeds"`
 		// For windfall invest comparison
 		WindfallAmount float64 `json:"windfall_amount,omitempty"`
 		LumpSum10Y     float64 `json:"lump_sum_10y,omitempty"`
@@ -3539,8 +3363,11 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 	var plans []executionPlan
 
 	// Load tax lots for liquidation planning
-	txns, _ := listAllTransactionsRows(ctx, h.queries)
 	secs, _ := h.queries.ListSecurities(ctx)
+	assetClass := make(map[string]string, len(secs))
+	for _, s := range secs {
+		assetClass[s.ISIN] = s.AssetClass
+	}
 	taxTxns, names, _, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
 	holdings, _ := h.queries.ListCurrentHoldings(ctx)
 	pm := h.loadPriceMap(ctx)
@@ -3553,52 +3380,21 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	allLots := analytics.ComputeTaxLots(taxTxns, lotPrices, names, equityMap)
+	capRate := analytics.CapitalIncomeTaxRate(req.ChurchRate)
 
 	for _, ev := range req.Events {
 		if ev.CashImpact < -1000 {
-			// Cash-need event: build tax-minimized sell order
 			cashNeeded := math.Abs(ev.CashImpact)
-
-			// Sort lots by effective tax rate ascending (sell tax-efficient lots first)
-			sortedLots := make([]analytics.TaxLot, len(allLots))
-			copy(sortedLots, allLots)
-			sort.Slice(sortedLots, func(i, j int) bool {
-				// Prefer loss lots (negative tax), then lowest effective rate
-				if sortedLots[i].TaxIfSold <= 0 && sortedLots[j].TaxIfSold > 0 { return true }
-				if sortedLots[i].TaxIfSold > 0 && sortedLots[j].TaxIfSold <= 0 { return false }
-				return sortedLots[i].EffectiveRate < sortedLots[j].EffectiveRate
-			})
-
-			var steps []sellStep
-			remaining := cashNeeded
-			totalTax := 0.0
-			totalProceeds := 0.0
-			for _, lot := range sortedLots {
-				if remaining <= 0 || lot.CurrentValue <= 0 { break }
-				sellAmt := math.Min(lot.CurrentValue, remaining)
-				fraction := sellAmt / lot.CurrentValue
-				tax := lot.TaxIfSold * fraction
-				if tax < 0 { tax = 0 } // losses don't generate tax
-				net := sellAmt - tax
-				steps = append(steps, sellStep{
-					ISIN: lot.ISIN, Name: lot.Name, BuyDate: lot.BuyDate,
-					SellAmount: math.Round(sellAmt), TaxDue: math.Round(tax*100) / 100,
-					NetProceeds: math.Round(net*100) / 100,
-					EffRate: math.Round(lot.EffectiveRate*100) / 100,
-				})
-				remaining -= net
-				totalTax += tax
-				totalProceeds += net
-			}
+			plan := planLiquidation(allLots, assetClass, cashNeeded, capRate, now)
 			plans = append(plans, executionPlan{
 				Type: "liquidation", EventLabel: ev.Label,
-				CashNeeded: cashNeeded, SellOrder: steps,
-				TotalTax: math.Round(totalTax), TotalProceeds: math.Round(totalProceeds),
+				CashNeeded: cashNeeded, SellOrder: plan.Steps,
+				TotalTax: math.Round(plan.TotalTax), TotalProceeds: math.Round(plan.TotalProceeds),
 			})
 		} else if ev.CashImpact > 1000 {
 			// Windfall event: lump-sum vs DCA comparison
 			amount := ev.CashImpact
-			mr := math.Pow(1+annualReturn/100, 1.0/12.0) - 1
+			mr := planMonthlyRate(annualReturn)
 			months := 120 // 10 year comparison
 
 			// Lump sum: invest all immediately
@@ -3610,71 +3406,78 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 			// DCA: spread over 12 months
 			dca := 0.0
 			monthly := amount / 12
-			uninvested := amount
 			for m := 0; m < months; m++ {
 				if m < 12 {
-					invest := monthly
-					uninvested -= invest
-					dca += invest // add this month's portion
+					dca += monthly // add this month's portion
 				}
 				dca *= (1 + mr) // grow everything invested so far
 			}
 
 			edge := 0.0
-			if dca > 0 { edge = (lumpSum - dca) / dca * 100 }
+			if dca > 0 {
+				edge = (lumpSum - dca) / dca * 100
+			}
 
 			plans = append(plans, executionPlan{
 				Type: "invest", EventLabel: ev.Label,
 				WindfallAmount: amount,
-				LumpSum10Y: math.Round(lumpSum), DCA10Y: math.Round(dca),
+				LumpSum10Y:     math.Round(lumpSum), DCA10Y: math.Round(dca),
 				LumpSumEdge: math.Round(edge*10) / 10,
 			})
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"baseline":          baseline,
-		"with_events":       withEvents,
-		"current_value":     math.Round(currentValue),
-		"final_baseline":    finalBaseline,
-		"final_with_events": finalEvents,
-		"net_impact":        math.Round(finalEvents - finalBaseline),
-		"fire_shift_months": fireShift,
-		"templates":         templates,
-		"contribution":      monthlyContrib,
-		"return_pct":        annualReturn,
-		"execution_plans":   plans,
+		"baseline":               baseline,
+		"with_events":            withEvents,
+		"current_value":          math.Round(currentValue),
+		"final_baseline":         finalBaseline,
+		"final_with_events":      finalEvents,
+		"net_impact":             math.Round(finalEvents - finalBaseline),
+		"fire_shift_months":      fireShift,
+		"fire_target_known":      fireKnown,
+		"fire_baseline_month":    baselineFIRE,
+		"fire_with_events_month": eventsFIRE,
+		"fire_target":            math.Round(fireTarget),
+		"scope":                  "investable",
+		"templates":              templates,
+		"contribution":           monthlyContrib,
+		"return_pct":             annualReturn,
+		"execution_plans":        plans,
 	})
 }
 
 // HandlePensionGap computes the Rentenlücke (pension gap) from configured sources.
-// POST body: { sources: [...], retirement_age: 67, monthly_need: 3000 }
+// POST body: { sources: [...], retirement_age: 67, current_age: 35,
+// monthly_need: 3000, monthly_contrib: 0, return_pct: 7, swr: 3.5,
+// inflation_pct: 2, children: 1, church_rate: 0, joint: false }.
+// Every amount in the response is monthly and in today's euros: the portfolio
+// is projected nominally and deflated, pensions and the need are entered in
+// today's money and taxed with the 2026 tariff (assumed to rise with prices).
 func (h *PortfolioHandler) HandlePensionGap(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	type pensionSource struct {
-		Type           string  `json:"type"`            // gesetzliche, bav, riester, ruerup, private, other
-		Label          string  `json:"label"`
-		MonthlyGross   float64 `json:"monthly_gross"`   // expected monthly gross payout at retirement
-		Rentenpunkte   float64 `json:"rentenpunkte"`     // only for gesetzliche Rente
-		StartAge       int     `json:"start_age"`        // when payouts begin (default: retirement_age)
-		TaxPortion     float64 `json:"tax_portion_pct"`  // % of payout that is taxable (varies by source/year)
-	}
-
 	var req struct {
-		Sources        []pensionSource `json:"sources"`
-		RetirementAge  int             `json:"retirement_age"`
-		MonthlyNeed    float64         `json:"monthly_need"` // desired monthly net income in retirement
-		CurrentAge     int             `json:"current_age"`
-		MonthlyContrib float64         `json:"monthly_contrib"` // override for monthly investment contribution
+		Sources        []pensionSourceInput `json:"sources"`
+		RetirementAge  int                  `json:"retirement_age"`
+		MonthlyNeed    float64              `json:"monthly_need"` // desired monthly net income in retirement
+		CurrentAge     int                  `json:"current_age"`
+		MonthlyContrib float64              `json:"monthly_contrib"` // > 0 overrides the trailing net contribution
+		ReturnPct      *float64             `json:"return_pct"`      // nominal; default 7
+		SWR            float64              `json:"swr"`             // %; default 3.5
+		InflationPct   *float64             `json:"inflation_pct"`   // default 2
+		Children       *int                 `json:"children"`        // 0 = childless (higher Pflege rate)
+		ChurchRate     float64              `json:"church_rate"`     // 0, 0.08 or 0.09
+		Joint          bool                 `json:"joint"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
 		return
 	}
 	isFinite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
-	if !isFinite(req.MonthlyNeed) || !isFinite(req.MonthlyContrib) {
-		writeError(w, http.StatusBadRequest, "monthly_need and monthly_contrib must be finite numbers")
+	if !isFinite(req.MonthlyNeed) || !isFinite(req.MonthlyContrib) || !isFinite(req.SWR) || !isFinite(req.ChurchRate) ||
+		(req.ReturnPct != nil && !isFinite(*req.ReturnPct)) || (req.InflationPct != nil && !isFinite(*req.InflationPct)) {
+		writeError(w, http.StatusBadRequest, "monthly_need, monthly_contrib and the rates must be finite numbers")
 		return
 	}
 	for _, src := range req.Sources {
@@ -3685,7 +3488,7 @@ func (h *PortfolioHandler) HandlePensionGap(w http.ResponseWriter, r *http.Reque
 	}
 
 	if req.RetirementAge <= 0 {
-		req.RetirementAge = 67
+		req.RetirementAge = analytics.Regelaltersgrenze
 	}
 	if req.CurrentAge <= 0 {
 		req.CurrentAge = 35
@@ -3693,259 +3496,106 @@ func (h *PortfolioHandler) HandlePensionGap(w http.ResponseWriter, r *http.Reque
 	if req.MonthlyNeed <= 0 {
 		req.MonthlyNeed = 3000
 	}
-
-	// German pension constants (2026)
-	const rentenwertWest = 39.32 // EUR per Rentenpunkt/month (as of Jul 2025)
-
-	// For each source, compute monthly gross, tax, and net
-	type sourceResult struct {
-		Type         string  `json:"type"`
-		Label        string  `json:"label"`
-		MonthlyGross float64 `json:"monthly_gross"`
-		MonthlyTax   float64 `json:"monthly_tax"`
-		MonthlyNet   float64 `json:"monthly_net"`
-		AnnualGross  float64 `json:"annual_gross"`
-		AnnualNet    float64 `json:"annual_net"`
-		StartAge     int     `json:"start_age"`
+	annualReturn := analytics.PlanningDefaultReturnPct / 100
+	if req.ReturnPct != nil && *req.ReturnPct >= -50 && *req.ReturnPct <= 30 {
+		annualReturn = *req.ReturnPct / 100
 	}
-	var results []sourceResult
-	totalMonthlyGross := 0.0
-	totalMonthlyNet := 0.0
-
-	for _, src := range req.Sources {
-		gross := src.MonthlyGross
-		if src.Type == "gesetzliche" && src.Rentenpunkte > 0 {
-			gross = src.Rentenpunkte * rentenwertWest
-		}
-		if gross <= 0 {
-			continue
-		}
-
-		startAge := src.StartAge
-		if startAge <= 0 {
-			startAge = req.RetirementAge
-		}
-
-		// Tax portion defaults by source type
-		taxPortion := src.TaxPortion
-		if taxPortion <= 0 {
-			switch src.Type {
-			case "gesetzliche":
-				// Besteuerungsanteil depends on retirement year
-				// Retiring 2040+: 100% taxable. 2026: ~86%
-				retYear := time.Now().Year() + (req.RetirementAge - req.CurrentAge)
-				if retYear >= 2058 {
-					taxPortion = 100
-				} else {
-					taxPortion = math.Min(100, 50+float64(retYear-2005)*0.5*2)
-					if taxPortion < 50 {
-						taxPortion = 50
-					}
-				}
-			case "bav":
-				taxPortion = 100 // fully taxable as income
-			case "riester":
-				taxPortion = 100 // fully taxable as income
-			case "ruerup":
-				taxPortion = 100 // fully taxable as income (Basisrente)
-			case "private":
-				taxPortion = 18 // Ertragsanteil at age 67
-			default:
-				taxPortion = 0
-			}
-		}
-
-		// Estimate tax: apply marginal tax rate to taxable portion
-		// Simplified: assume ~25% average tax rate on pension income
-		taxableMonthly := gross * taxPortion / 100
-		// Progressive tax estimate: ~14% on first 1000, ~25% on 1000-3000, ~35% on 3000+
-		annualTaxable := taxableMonthly * 12
-		var tax float64
-		if annualTaxable <= 11604 { // Grundfreibetrag 2026
-			tax = 0
-		} else {
-			excess := annualTaxable - 11604
-			if excess <= 15000 {
-				tax = excess * 0.20
-			} else if excess <= 45000 {
-				tax = 15000*0.20 + (excess-15000)*0.30
-			} else {
-				tax = 15000*0.20 + 30000*0.30 + (excess-45000)*0.42
-			}
-		}
-		monthlyTax := tax / 12
-		// Also ~5.5% Soli on tax (if > Freigrenze) + ~15% health insurance on gross
-		healthInsurance := gross * 0.077 // ~7.7% KVdR for retirees
-		monthlyTax += healthInsurance
-		net := gross - monthlyTax
-
-		label := src.Label
-		if label == "" {
-			switch src.Type {
-			case "gesetzliche":
-				label = "Gesetzliche Rente"
-			case "bav":
-				label = "Betriebliche Altersvorsorge"
-			case "riester":
-				label = "Riester-Rente"
-			case "ruerup":
-				label = "Rürup / Basisrente"
-			case "private":
-				label = "Private Rentenversicherung"
-			default:
-				label = "Sonstige Einkünfte"
-			}
-		}
-
-		results = append(results, sourceResult{
-			Type: src.Type, Label: label,
-			MonthlyGross: math.Round(gross*100) / 100,
-			MonthlyTax:   math.Round(monthlyTax*100) / 100,
-			MonthlyNet:   math.Round(net*100) / 100,
-			AnnualGross:  math.Round(gross * 12),
-			AnnualNet:    math.Round(net * 12),
-			StartAge:     startAge,
-		})
-		totalMonthlyGross += gross
-		totalMonthlyNet += net
+	swr := 0.035
+	if req.SWR > 0 && req.SWR <= 10 {
+		swr = req.SWR / 100
 	}
+	inflation := analytics.PlanningDefaultInflationPct / 100
+	if req.InflationPct != nil && *req.InflationPct >= -5 && *req.InflationPct <= 20 {
+		inflation = *req.InflationPct / 100
+	}
+	churchRate := math.Min(0.09, math.Max(0, req.ChurchRate))
+	now := time.Now()
+	pc := pensionContext{
+		CurrentAge: req.CurrentAge,
+		NowYear:    now.Year(),
+		Joint:      req.Joint,
+		ChurchRate: churchRate,
+		Childless:  req.Children != nil && *req.Children == 0,
+	}
+
+	// Pensions paid at the retirement age, and once every source has started.
+	results, totalMonthlyGross, totalMonthlyNet := pensionsAt(req.Sources, req.RetirementAge, req.RetirementAge, false, pc)
+	_, _, netAllStarted := pensionsAt(req.Sources, req.RetirementAge, 200, false, pc)
 
 	// Portfolio withdrawal component
-	portfolioMonthly := 0.0
-	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 1)
 	currentValue := 0.0
-	if len(snaps) > 0 {
+	if snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 1); len(snaps) > 0 {
 		currentValue = investableNetWorth(snaps[0])
 	}
-	// Project portfolio value to retirement
-	yearsToRetirement := req.RetirementAge - req.CurrentAge
-	if yearsToRetirement < 0 {
-		yearsToRetirement = 0
-	}
-	// Get monthly contribution
 	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-	txns, _ := listAllTransactionsRows(ctx, h.queries)
-	cutoff := assets.CivilDate(time.Now()).AddDate(-1, 0, 0)
-	totalDep := 0.0
-	for _, txn := range txns {
-		if txn.Type == "deposit" && txn.Amount.Valid && txn.Date.After(cutoff) {
-			f, _ := txn.Amount.Float64Value()
-			totalDep += convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-		}
+	monthlyContrib := req.MonthlyContrib // user override
+	if monthlyContrib <= 0 {
+		histFX := loadHistoricalFXRates(ctx, h.queries)
+		txns, _ := listAllTransactionsRows(ctx, h.queries)
+		monthlyContrib = trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates).Monthly
 	}
-	elapsed := time.Since(cutoff).Hours() / (24 * 30.44)
-	monthlyContrib := 0.0
-	if req.MonthlyContrib > 0 {
-		monthlyContrib = req.MonthlyContrib // user override
-	} else if elapsed > 1 {
-		monthlyContrib = totalDep / elapsed
-	}
+	taxRate := analytics.CapitalIncomeTaxRate(churchRate)
+	tfs := h.portfolioTFS(ctx, fxRates)
+	allowance := analytics.SparerPauschbetragForYear(now.Year(), req.Joint)
+	monthsTo := func(age int) int { return int(math.Max(0, float64(age-req.CurrentAge))) * 12 }
 
-	annualReturn := 7.0
-	monthlyReturn := math.Pow(1+annualReturn/100, 1.0/12.0) - 1
-	projectedPortfolio := currentValue
-	for m := 0; m < yearsToRetirement*12; m++ {
-		projectedPortfolio = projectedPortfolio*(1+monthlyReturn) + monthlyContrib
-	}
-	// SWR-based withdrawal
-	swr := 3.5
-	portfolioMonthly = projectedPortfolio * (swr / 100) / 12
-	// After-tax (Abgeltungssteuer on gains portion)
-	costBasisRatio := (currentValue + monthlyContrib*float64(yearsToRetirement*12)) / math.Max(projectedPortfolio, 1)
-	if costBasisRatio > 1 {
-		costBasisRatio = 0.8
-	}
-	gainPortion := portfolioMonthly * (1 - costBasisRatio)
-	taxOnPortfolio := gainPortion * 0.7 * analytics.EffectiveTaxRate // after Teilfreistellung
-	portfolioNet := portfolioMonthly - taxOnPortfolio
+	draw := portfolioAtRetirement(currentValue, monthlyContrib, annualReturn, inflation, swr, taxRate, tfs, allowance, monthsTo(req.RetirementAge))
 
 	// Gap calculation
-	gap := req.MonthlyNeed - totalMonthlyNet - portfolioNet
-	gapAnnual := gap * 12
+	gap := req.MonthlyNeed - totalMonthlyNet - draw.NetMonthly
+	gapAll := req.MonthlyNeed - netAllStarted - draw.NetMonthly
 
-	// Sparplan recommendation to close gap
-	sparplanMonthly := 0.0
-	if gap > 0 && yearsToRetirement > 0 {
-		// How much extra monthly investment is needed to generate gap×12/swr at retirement?
-		additionalNeeded := gap * 12 / (swr / 100)
-		// Solve for PMT: FV = PMT * ((1+r)^n - 1) / r
-		months := float64(yearsToRetirement * 12)
-		factor := (math.Pow(1+monthlyReturn, months) - 1) / monthlyReturn
-		if factor > 0 {
-			sparplanMonthly = additionalNeeded / factor
-		}
-	}
+	// Extra monthly saving (after tax on its own gains) that closes the gap.
+	sparplanMonthly := extraSavingsToClose(gap, annualReturn, inflation, swr, taxRate, tfs, monthsTo(req.RetirementAge))
 
-	// Retirement age sensitivity
+	// Retirement age sensitivity. The statutory pension is claimed at the
+	// retirement age with the § 77 SGB VI factor, but never before 63; other
+	// sources pay from their own start age.
 	type ageSensitivity struct {
-		Age       int     `json:"age"`
-		PensionNet float64 `json:"pension_net"`
+		Age          int     `json:"age"`
+		PensionNet   float64 `json:"pension_net"`
 		PortfolioNet float64 `json:"portfolio_net"`
-		TotalNet  float64 `json:"total_net"`
-		Gap       float64 `json:"gap"`
+		TotalNet     float64 `json:"total_net"`
+		Gap          float64 `json:"gap"`
 	}
 	sensitivity := make([]ageSensitivity, 0)
 	for age := 55; age <= 70; age++ {
-		ytr := age - req.CurrentAge
-		if ytr < 0 {
-			ytr = 0
+		if age < req.CurrentAge {
+			continue
 		}
-		// Adjust gesetzliche Rente for Abschläge (0.3% per month before 67)
-		adjPensionNet := totalMonthlyNet
-		if age < 67 {
-			abschlag := float64(67-age) * 12 * 0.003 // 0.3% per month
-			for _, res := range results {
-				if res.Type == "gesetzliche" {
-					adjPensionNet -= res.MonthlyNet * abschlag
-				}
-			}
-		} else if age > 67 {
-			zuschlag := float64(age-67) * 12 * 0.005 // 0.5% per month bonus
-			for _, res := range results {
-				if res.Type == "gesetzliche" {
-					adjPensionNet += res.MonthlyNet * zuschlag
-				}
-			}
-		}
-
-		pv := currentValue
-		for m := 0; m < ytr*12; m++ {
-			pv = pv*(1+monthlyReturn) + monthlyContrib
-		}
-		pNet := pv * (swr / 100) / 12
-		cbr := (currentValue + monthlyContrib*float64(ytr*12)) / math.Max(pv, 1)
-		if cbr > 1 { cbr = 0.8 }
-		gp := pNet * (1 - cbr)
-		tax := gp * 0.7 * analytics.EffectiveTaxRate
-		pNet -= tax
-
-		total := adjPensionNet + pNet
-		g := req.MonthlyNeed - total
-
+		_, _, pNet := pensionsAt(req.Sources, age, age, true, pc)
+		d := portfolioAtRetirement(currentValue, monthlyContrib, annualReturn, inflation, swr, taxRate, tfs, allowance, monthsTo(age))
+		total := pNet + d.NetMonthly
 		sensitivity = append(sensitivity, ageSensitivity{
-			Age: age, PensionNet: math.Round(adjPensionNet),
-			PortfolioNet: math.Round(pNet), TotalNet: math.Round(total),
-			Gap: math.Round(g),
+			Age: age, PensionNet: math.Round(pNet),
+			PortfolioNet: math.Round(d.NetMonthly), TotalNet: math.Round(total),
+			Gap: math.Round(req.MonthlyNeed - total),
 		})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"sources":              results,
-		"total_monthly_gross":  math.Round(totalMonthlyGross*100) / 100,
-		"total_monthly_net":    math.Round(totalMonthlyNet*100) / 100,
-		"portfolio_monthly":    math.Round(portfolioMonthly*100) / 100,
-		"portfolio_net":        math.Round(portfolioNet*100) / 100,
-		"projected_portfolio":  math.Round(projectedPortfolio),
-		"monthly_contrib":     math.Round(monthlyContrib),
-		"monthly_need":         req.MonthlyNeed,
-		"gap":                  math.Round(gap*100) / 100,
-		"gap_annual":           math.Round(gapAnnual),
-		"sparplan_to_close":    math.Round(sparplanMonthly),
-		"retirement_age":       req.RetirementAge,
-		"current_age":          req.CurrentAge,
-		"sensitivity":          sensitivity,
-		"rentenwert":           rentenwertWest,
+		"sources":                     results,
+		"total_monthly_gross":         math.Round(totalMonthlyGross*100) / 100,
+		"total_monthly_net":           math.Round(totalMonthlyNet*100) / 100,
+		"portfolio_monthly":           math.Round(draw.GrossMonthly*100) / 100,
+		"portfolio_net":               math.Round(draw.NetMonthly*100) / 100,
+		"projected_portfolio":         math.Round(draw.ValueReal),
+		"projected_portfolio_nominal": math.Round(draw.ValueNominal),
+		"monthly_contrib":             math.Round(monthlyContrib),
+		"monthly_need":                req.MonthlyNeed,
+		"gap":                         math.Round(gap*100) / 100,
+		"gap_annual":                  math.Round(gap * 12),
+		"gap_after_all_pensions":      math.Round(gapAll*100) / 100,
+		"sparplan_to_close":           math.Round(sparplanMonthly),
+		"retirement_age":              req.RetirementAge,
+		"current_age":                 req.CurrentAge,
+		"sensitivity":                 sensitivity,
+		"rentenwert":                  analytics.AktuellerRentenwert,
+		"return_pct":                  math.Round(annualReturn*10000) / 100,
+		"swr_pct":                     math.Round(swr*10000) / 100,
+		"inflation_pct":               math.Round(inflation*10000) / 100,
+		"teilfreistellung_pct":        math.Round(tfs*1000) / 10,
+		"in_todays_euros":             true,
 	})
 }
 
@@ -3960,22 +3610,8 @@ func (h *PortfolioHandler) HandleSparplanStreak(w http.ResponseWriter, r *http.R
 	fxRates := loadFXRatesMap(ctx, h.queries)
 	histFX := loadHistoricalFXRates(ctx, h.queries)
 
-	// Find months with savings_plan or regular deposit transactions
-	monthlyInvest := make(map[string]float64) // YYYY-MM -> total invested
-	for _, txn := range txns {
-		if txn.Type != "savings_plan" && txn.Type != "buy" {
-			continue
-		}
-		amt := 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-		}
-		month := txn.Date.Format("2006-01")
-		monthlyInvest[month] += amt
-	}
-
-	if len(monthlyInvest) == 0 {
+	st := computeSparplanStreak(sparplanMonthlyAmounts(txns, histFX, fxRates), time.Now().UTC())
+	if st.TotalMonths == 0 {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"current_streak":  0,
 			"longest_streak":  0,
@@ -3985,94 +3621,141 @@ func (h *PortfolioHandler) HandleSparplanStreak(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Build sorted month list from first to last
+	writeJSON(w, http.StatusOK, map[string]any{
+		"current_streak":     st.CurrentStreak,
+		"longest_streak":     st.LongestStreak,
+		"total_months":       st.TotalMonths,
+		"active_months":      st.ActiveMonths,
+		"missed_months":      st.MissedMonths,
+		"consistency_pct":    math.Round(st.ConsistencyPct*10) / 10,
+		"avg_monthly":        math.Round(st.AvgMonthly*100) / 100,
+		"missed_cost":        math.Round(st.MissedCost),
+		"assumed_return_pct": sparplanAssumedReturn * 100,
+		"total_invested":     math.Round(st.TotalInvested*100) / 100,
+		"first_month":        st.FirstMonth,
+		"last_month":         st.LastMonth,
+		"history":            st.History,
+	})
+}
+
+// sparplanAssumedReturn is the annual return used to estimate what missed
+// Sparplan months would have earned. It is an assumption, shown as such.
+const sparplanAssumedReturn = 0.07
+
+// sparplanMonthlyAmounts sums savings-plan executions per month (YYYY-MM) in
+// EUR. One-off buys are not part of a savings plan and are not counted.
+func sparplanMonthlyAmounts(txns []db.ListTransactionsRow, histFX []market.HistoricalFXRate, fxRates map[string]float64) map[string]float64 {
+	monthly := make(map[string]float64)
+	for _, txn := range txns {
+		if txn.Type != "savings_plan" {
+			continue
+		}
+		amt := math.Abs(convertAmountToEURAtDate(numericToFloat(txn.Amount), txn.Currency, txn.Date, histFX, fxRates))
+		monthly[txn.Date.Format("2006-01")] += amt
+	}
+	return monthly
+}
+
+type sparplanMonth struct {
+	Month  string  `json:"month"`
+	Amount float64 `json:"amount"`
+	Active bool    `json:"active"`
+}
+
+type sparplanStreak struct {
+	CurrentStreak, LongestStreak            int
+	TotalMonths, ActiveMonths, MissedMonths int
+	ConsistencyPct                          float64
+	AvgMonthly, MissedCost, TotalInvested   float64
+	FirstMonth, LastMonth                   string
+	History                                 []sparplanMonth
+}
+
+// computeSparplanStreak measures a savings plan from its first execution up
+// to today: the current month counts once it has an execution, otherwise the
+// range ends with the last complete month, so a plan that stopped shows its
+// missed months and a current streak of 0. AvgMonthly is the average
+// execution over the active months of the last 12 months of the range (the
+// whole history if none fall in it), and MissedCost is what that amount
+// would have earned at sparplanAssumedReturn from each missed month to now.
+func computeSparplanStreak(monthly map[string]float64, now time.Time) sparplanStreak {
+	var st sparplanStreak
 	var months []string
-	for m := range monthlyInvest {
-		months = append(months, m)
+	for m, amt := range monthly {
+		if amt > 0 {
+			months = append(months, m)
+		}
+	}
+	if len(months) == 0 {
+		return st
 	}
 	sort.Strings(months)
 
 	firstMonth, _ := time.Parse("2006-01", months[0])
-	lastMonth, _ := time.Parse("2006-01", months[len(months)-1])
+	curMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	endMonth := addMonthsFirstOfMonth(curMonth, -1)
+	if monthly[curMonth.Format("2006-01")] > 0 || endMonth.Before(firstMonth) {
+		endMonth = curMonth
+	}
+	if lastExec, _ := time.Parse("2006-01", months[len(months)-1]); lastExec.After(endMonth) {
+		endMonth = lastExec // executions dated in the future
+	}
 
-	// Generate all months in range
 	var allMonths []string
-	for m := firstMonth; !m.After(lastMonth); m = addMonthsFirstOfMonth(m, 1) {
+	for m := firstMonth; !m.After(endMonth); m = addMonthsFirstOfMonth(m, 1) {
 		allMonths = append(allMonths, m.Format("2006-01"))
 	}
 
-	// Compute streaks
-	currentStreak := 0
-	longestStreak := 0
 	streak := 0
-	activeMonths := 0
 	for _, m := range allMonths {
-		if monthlyInvest[m] > 0 {
+		amt := monthly[m]
+		if amt > 0 {
 			streak++
-			activeMonths++
-			if streak > longestStreak {
-				longestStreak = streak
+			st.ActiveMonths++
+			st.TotalInvested += amt
+			if streak > st.LongestStreak {
+				st.LongestStreak = streak
 			}
 		} else {
 			streak = 0
 		}
+		st.History = append(st.History, sparplanMonth{Month: m, Amount: math.Round(amt*100) / 100, Active: amt > 0})
 	}
-	currentStreak = streak // streak at the end of the range
+	st.CurrentStreak = streak
+	st.TotalMonths = len(allMonths)
+	st.MissedMonths = st.TotalMonths - st.ActiveMonths
+	st.ConsistencyPct = float64(st.ActiveMonths) / float64(st.TotalMonths) * 100
+	st.FirstMonth, st.LastMonth = allMonths[0], allMonths[len(allMonths)-1]
 
-	// Consistency percentage
-	consistencyPct := 0.0
-	if len(allMonths) > 0 {
-		consistencyPct = float64(activeMonths) / float64(len(allMonths)) * 100
+	recent := allMonths
+	if len(recent) > 12 {
+		recent = recent[len(recent)-12:]
 	}
-
-	// Compute cost of missed months (opportunity cost)
-	totalInvested := 0.0
-	for _, amt := range monthlyInvest {
-		totalInvested += amt
-	}
-	avgMonthly := 0.0
-	if activeMonths > 0 {
-		avgMonthly = totalInvested / float64(activeMonths)
-	}
-	missedMonths := len(allMonths) - activeMonths
-
-	// Opportunity cost: missed_months × avg_monthly × portfolio_return_since
-	missedCost := 0.0
-	if missedMonths > 0 {
-		annualReturn := 0.07
-		monthlyReturn := math.Pow(1+annualReturn, 1.0/12.0) - 1
-		// Each missed month's contribution would have grown
-		for i := 0; i < missedMonths; i++ {
-			// Average remaining months after a missed investment
-			remainingMonths := float64(len(allMonths)) / 2
-			missedCost += avgMonthly * (math.Pow(1+monthlyReturn, remainingMonths) - 1)
+	sum, n := 0.0, 0
+	for _, m := range recent {
+		if monthly[m] > 0 {
+			sum += monthly[m]
+			n++
 		}
 	}
-
-	// Monthly investment history for chart
-	type monthPoint struct {
-		Month  string  `json:"month"`
-		Amount float64 `json:"amount"`
-		Active bool    `json:"active"`
+	if n == 0 && st.ActiveMonths > 0 {
+		sum, n = st.TotalInvested, st.ActiveMonths
 	}
-	history := make([]monthPoint, 0)
+	if n > 0 {
+		st.AvgMonthly = sum / float64(n)
+	}
+
 	for _, m := range allMonths {
-		amt := monthlyInvest[m]
-		history = append(history, monthPoint{Month: m, Amount: math.Round(amt*100) / 100, Active: amt > 0})
+		if monthly[m] > 0 {
+			continue
+		}
+		missed, _ := time.Parse("2006-01", m)
+		years := now.Sub(missed).Hours() / 24 / 365.25
+		if years > 0 {
+			st.MissedCost += st.AvgMonthly * (math.Pow(1+sparplanAssumedReturn, years) - 1)
+		}
 	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"current_streak":   currentStreak,
-		"longest_streak":   longestStreak,
-		"total_months":     len(allMonths),
-		"active_months":    activeMonths,
-		"missed_months":    missedMonths,
-		"consistency_pct":  math.Round(consistencyPct*10) / 10,
-		"avg_monthly":      math.Round(avgMonthly*100) / 100,
-		"missed_cost":      math.Round(missedCost),
-		"total_invested":   math.Round(totalInvested*100) / 100,
-		"history":          history,
-	})
+	return st
 }
 
 // HandleWealthWaterfall computes a waterfall decomposition of current net worth.

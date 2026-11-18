@@ -206,6 +206,24 @@ func TestClassifyAsset(t *testing.T) {
 
 		// Funds
 		{name: "deka fund", isin: "DE0008474503", secName: "Deka-ImmobilienEuropa", wantClass: "fund"},
+
+		// Broker abbreviations of ETF issuers (audit W2: the seed's
+		// IE00B4L5YC18 was classified as a stock, losing Teilfreistellung).
+		{name: "ishares III abbreviation", isin: "IE00B4L5YC18", secName: "ISHSIII-MSCI EM USD(ACC)", wantClass: "etf"},
+		{name: "ishares plc abbreviation", isin: "IE00B1FZS350", secName: "ISHS-DEV.MKTS PROP.YLD DL", wantClass: "etf"},
+		{name: "ishares VII abbreviation", isin: "IE00B5BMR087", secName: "ISHSVII-CORE S&P500 DL ACC", wantClass: "etf"},
+		{name: "xtrackers abbreviation", isin: "IE00BJ0KDQ92", secName: "XTR.(IE)-MSCI WORLD 1C", wantClass: "etf"},
+		{name: "xtrackers II abbreviation", isin: "LU0290355717", secName: "XTR2-EUROZ.GOV.BD 1C", wantClass: "bond"},
+		{name: "vanguard abbreviation", isin: "IE00BK5BQT80", secName: "VANG.FTSE A.-WO.U.ETF DLA", wantClass: "etf"},
+		{name: "vanguard abbreviation without etf", isin: "IE00B3RBWM25", secName: "VANG.FTSE ALL-WLD", wantClass: "etf"},
+		{name: "amundi index solutions abbreviation", isin: "LU1681043599", secName: "AIS-AM.MSCI WORLD UE-C", wantClass: "etf"},
+		{name: "u.etf suffix", isin: "IE00BFY0GT14", secName: "SPDR MSCI WORLD U.ETF", wantClass: "etf"},
+
+		// Whole-word matching: no false ETF or commodity hits inside names.
+		{name: "netflix is not an etf", isin: "US64110L1061", secName: "NETFLIX INC.", wantClass: "stock"},
+		{name: "evangelische is not vanguard", isin: "DE0000000001", secName: "Evangelische Bank eG", wantClass: "stock"},
+		{name: "goldman sachs is not gold", isin: "US38141G1040", secName: "Goldman Sachs Group Inc.", wantClass: "stock"},
+		{name: "xetra-gold stays a commodity", isin: "DE000A0S9GB0", secName: "Xetra-Gold", wantClass: "commodity"},
 	}
 
 	for _, tt := range tests {

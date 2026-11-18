@@ -1,47 +1,49 @@
 import { usePlanning } from './PlanningContext';
 import { SubHeading, MetricCard, MetricGrid } from '../ui';
 import { fmtEUR, fmtPct } from '../../utils/format';
+import { toNum } from './shared';
+import { BAV_MIN_SUBSIDY_ANNUAL, parsePct, riesterPlan, rurupRoom } from './planningMath';
+import {
+  BAV_MIN_EMPLOYER_SUBSIDY, BAV_SV_FREE_2026, DEFAULT_MARGINAL_RATE_PCT, DEFAULT_RETURN_PCT,
+  RIESTER_GRUNDZULAGE, RIESTER_KINDERZULAGE,
+} from './constants';
 
-const BAV_MAX_ANNUAL = 7248;
-const ASSUMED_MATCH = 0.5;
-const RURUP_MAX_ANNUAL = 27566;
-const COMPOUND_RATE = 0.07;
+const COMPOUND_RATE = DEFAULT_RETURN_PCT / 100;
 
 // Quantifies what's being forfeited by NOT using tax-advantaged accounts:
-// missed bAV employer match, unclaimed Riester Zulagen, missed Rürup
-// deduction (only flagged if marginal rate ≥35% where it really matters).
-// Compounded at 7% over 10/30 years to show the long-tail cost.
+// the statutory minimum bAV employer subsidy and unclaimed Riester
+// allowances, compounded at 7 % over 10/30 years. The Rürup deduction is
+// shown separately: payouts are taxed later, so it is a deferral, not money
+// lost, and it is left out of the totals. 2026 limits are in constants.ts.
 //
 // Rendered as a block inside the "Money Left on the Table" section
 // (OpportunityCosts.tsx) — it has no section header of its own.
 export default function MoneyLeftOnTable() {
-  const { accounts, crMarginalRate, crChildren } = usePlanning();
-  const marginalRate = parseFloat(crMarginalRate) || 42;
-  const numCh = parseInt(crChildren, 10) || 0;
+  const { accounts, crMarginalRate, crChildren, crGrossIncome } = usePlanning();
+  const marginalRate = parsePct(crMarginalRate, DEFAULT_MARGINAL_RATE_PCT);
+  const numCh = Math.max(0, Math.round(toNum(crChildren)));
 
-  const bavAccs = accounts.filter(a => a.tax_treatment === 'bav');
-  const matchPct = bavAccs.length > 0 ? (bavAccs[0].employer_match_pct ?? 0) : 0;
-  const hasBav = bavAccs.length > 0 && matchPct > 0;
+  // Any company pension counts: the 15 % subsidy is owed by law even when no
+  // match is recorded, so nothing is "forfeited" once a bAV exists.
+  const hasBav = accounts.some(a => a.tax_treatment === 'bav');
   const hasRiester = accounts.some(a => a.tax_treatment === 'riester');
   const hasRurup = accounts.some(a => a.tax_treatment === 'rurup');
 
-  const forfeitedMatch = hasBav ? 0 : BAV_MAX_ANNUAL * ASSUMED_MATCH; // 50% employer match assumption when no bAV configured
-  const riesterZulagen = 175 + numCh * 300;
-  const forfeitedRiester = hasRiester ? 0 : riesterZulagen;
-  const rurupDeduction = RURUP_MAX_ANNUAL * (marginalRate / 100);
-  const forfeitedRurup = hasRurup ? 0 : Math.min(rurupDeduction, RURUP_MAX_ANNUAL * 0.42);
+  const forfeitedMatch = hasBav ? 0 : BAV_MIN_SUBSIDY_ANNUAL;
+  const forfeitedRiester = hasRiester ? 0 : riesterPlan(marginalRate, numCh).zulagen;
+  const rurupLimit = rurupRoom(toNum(crGrossIncome));
+  const rurupDeferral = hasRurup ? 0 : rurupLimit * marginalRate / 100;
+  const rurupRelevant = !hasRurup && marginalRate >= 35 && rurupDeferral > 0;
 
   const totalForfeited = forfeitedMatch + forfeitedRiester;
-  const rurupRelevant = !hasRurup && marginalRate >= 35;
-  const totalWithRurup = totalForfeited + (rurupRelevant ? forfeitedRurup : 0);
 
   const compound = (annual: number, years: number) => {
     let total = 0;
     for (let y = 0; y < years; y++) total = (total + annual) * (1 + COMPOUND_RATE);
     return total;
   };
-  const impact10 = compound(totalWithRurup, 10);
-  const impact30 = compound(totalWithRurup, 30);
+  const impact10 = compound(totalForfeited, 10);
+  const impact30 = compound(totalForfeited, 30);
 
   const hasAnyGap = forfeitedMatch > 0 || forfeitedRiester > 0 || rurupRelevant;
 
@@ -50,20 +52,20 @@ export default function MoneyLeftOnTable() {
       <SubHeading>Unused tax-advantaged accounts, per year</SubHeading>
       {!hasAnyGap ? (
         <p className="mt-2 text-[14px] text-ink-body">
-          Nothing flagged: you have a company pension (bAV) with an employer match and a Riester account, and a Rürup deduction is either in use or not worthwhile below a 35 % marginal tax rate.
+          Nothing flagged: you have a company pension (bAV) and a Riester account, and a Rürup deduction is either in use or not worthwhile below a 35 % marginal tax rate.
         </p>
       ) : (
         <>
           <p className="mt-1 text-[13px] text-ink-muted">
-            Upper-bound estimates of what the accounts you don’t have could add each year. Uses the marginal tax rate and children from Your Profile.
+            Estimates of what the accounts you don’t have could add each year. Uses the marginal tax rate, children and gross income from Your Profile.
           </p>
           <MetricGrid className="mt-3">
             {forfeitedMatch > 0 && (
               <MetricCard
-                label="Company pension match"
+                label="Company pension subsidy"
                 tone="negative"
                 value={fmtEUR(forfeitedMatch)}
-                sublabel={`No company pension (bAV) with an employer match is set up. Assumes your employer would add ${fmtPct(ASSUMED_MATCH * 100, { digits: 0 })} on the ${fmtEUR(BAV_MAX_ANNUAL)} yearly maximum.`}
+                sublabel={`No company pension (bAV) is set up. By law your employer adds at least ${fmtPct(BAV_MIN_EMPLOYER_SUBSIDY * 100, { digits: 0 })} of salary converted, on up to ${fmtEUR(BAV_SV_FREE_2026)} a year; many add more.`}
               />
             )}
             {forfeitedRiester > 0 && (
@@ -72,30 +74,33 @@ export default function MoneyLeftOnTable() {
                 tone="negative"
                 value={fmtEUR(forfeitedRiester)}
                 sublabel={numCh > 0
-                  ? `State allowances (Zulagen): 175 € basic plus 300 € for each of ${numCh} ${numCh === 1 ? 'child' : 'children'}. No Riester account.`
-                  : 'State basic allowance (Grundzulage) of 175 €. No Riester account.'}
+                  ? `State allowances (Zulagen): ${fmtEUR(RIESTER_GRUNDZULAGE)} basic plus ${fmtEUR(RIESTER_KINDERZULAGE)} for each of ${numCh} ${numCh === 1 ? 'child' : 'children'}. No Riester account.`
+                  : `State basic allowance (Grundzulage) of ${fmtEUR(RIESTER_GRUNDZULAGE)}. No Riester account.`}
               />
+            )}
+            {totalForfeited > 0 && (
+              <>
+                <MetricCard
+                  label="After 10 years"
+                  tone={impact10 > 0 ? 'negative' : 'neutral'}
+                  value={fmtEUR(impact10)}
+                  sublabel={`The allowances above, invested at ${fmtPct(COMPOUND_RATE * 100, { digits: 0 })} a year`}
+                />
+                <MetricCard
+                  label="After 30 years"
+                  tone={impact30 > 0 ? 'negative' : 'neutral'}
+                  value={fmtEUR(impact30)}
+                  sublabel={`The allowances above, invested at ${fmtPct(COMPOUND_RATE * 100, { digits: 0 })} a year`}
+                />
+              </>
             )}
             {rurupRelevant && (
               <MetricCard
-                label="Rürup tax deduction"
-                tone="negative"
-                value={fmtEUR(forfeitedRurup)}
-                sublabel={`Tax saved by paying in the ${fmtEUR(RURUP_MAX_ANNUAL)} yearly maximum at a ${fmtPct(Math.min(marginalRate, 42), { digits: 0 })} rate. No Rürup account.`}
+                label="Rürup tax deferral"
+                value={fmtEUR(rurupDeferral)}
+                sublabel={`Tax you could defer by paying ${fmtEUR(rurupLimit)} into a Rürup pension at ${fmtPct(marginalRate, { digits: 0 })}. Payouts are taxed in full later, so the gain is the difference to your rate in retirement; not counted in the totals.`}
               />
             )}
-            <MetricCard
-              label="After 10 years"
-              tone={impact10 > 0 ? 'negative' : 'neutral'}
-              value={fmtEUR(impact10)}
-              sublabel={`If the yearly total were invested at ${fmtPct(COMPOUND_RATE * 100, { digits: 0 })} a year`}
-            />
-            <MetricCard
-              label="After 30 years"
-              tone={impact30 > 0 ? 'negative' : 'neutral'}
-              value={fmtEUR(impact30)}
-              sublabel={`If the yearly total were invested at ${fmtPct(COMPOUND_RATE * 100, { digits: 0 })} a year`}
-            />
           </MetricGrid>
         </>
       )}

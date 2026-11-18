@@ -1,54 +1,45 @@
-import { useState } from 'react';
 import { usePlanning } from './PlanningContext';
 import { useThemeColors } from '../../hooks/useThemeColors';
 import EChartWrapper from '../charts/EChartWrapper';
 import { Section, SubHeading, MetricCard, MetricGrid, NumberField, EmptyState } from '../ui';
 import { fmtEUR, fmtAxis } from '../../utils/format';
+import { toNum } from './shared';
+import { humanCapitalCrossover, humanCapitalPV } from './planningMath';
 
-// Human Capital = present value of future earnings, discounted (default 3 %)
-// and grown at a salary growth rate (default 2 %). The crossover chart shows when
-// financial capital (current NW + contributions, default 7 % growth) surpasses the
-// remaining human-capital stream — typically late-40s for a typical career.
-// Income, ages and the monthly budget come from Your Profile.
+// Human Capital = present value of future earnings: this year's gross income,
+// growing at a salary growth rate (default 2 %) from next year on, discounted
+// (default 3 %). The crossover chart shows when financial capital (cash and
+// investments plus the monthly budget, default 7 % growth) overtakes the
+// remaining human capital. The same function and inputs drive the Playbook's
+// milestone. Income, ages and the monthly budget come from Your Profile.
 export default function HumanCapital() {
-  const { totalNetWorth, crGrossIncome, pensionCurrentAge, pensionAge, crBudget } = usePlanning();
+  const {
+    investableNetWorth, crGrossIncome, pensionCurrentAge, pensionAge, crBudget,
+    hcSalaryGrowth: salaryGrowthPct, setHcSalaryGrowth: setSalaryGrowthPct,
+    hcDiscount: discountPct, setHcDiscount: setDiscountPct,
+    hcPortfolioGrowth: portfolioGrowthPct, setHcPortfolioGrowth: setPortfolioGrowthPct,
+  } = usePlanning();
   const tc = useThemeColors();
-  const [salaryGrowthPct, setSalaryGrowthPct] = useState(2);
-  const [discountPct, setDiscountPct] = useState(3);
-  const [portfolioGrowthPct, setPortfolioGrowthPct] = useState(7);
 
-  const grossIncome = parseFloat(crGrossIncome) || 0;
+  const grossIncome = toNum(crGrossIncome);
   const currentAge = pensionCurrentAge;
   const retireAge = pensionAge;
   const yearsToRetire = Math.max(0, retireAge - currentAge);
   const discountRate = discountPct / 100;
   const growthRate = salaryGrowthPct / 100;
-  const monthlyContrib = parseFloat(crBudget) || 0;
+  const monthlyContrib = toNum(crBudget);
 
-  let humanCapital = 0;
-  if (grossIncome > 0 && yearsToRetire > 0) {
-    for (let y = 1; y <= yearsToRetire; y++) {
-      humanCapital += grossIncome * Math.pow(1 + growthRate, y) / Math.pow(1 + discountRate, y);
-    }
-    humanCapital = Math.round(humanCapital);
-  }
-
-  const financialCapital = totalNetWorth;
-  const crossoverData: { age: number; human: number; financial: number }[] = [];
-  if (grossIncome > 0 && yearsToRetire > 0) {
-    let projFinancial = financialCapital;
-    for (let y = 0; y <= yearsToRetire; y++) {
-      let remainingHuman = 0;
-      for (let r = y + 1; r <= yearsToRetire; r++) {
-        remainingHuman += grossIncome * Math.pow(1 + growthRate, r) / Math.pow(1 + discountRate, r - y);
-      }
-      crossoverData.push({ age: currentAge + y, human: Math.round(remainingHuman), financial: Math.round(projFinancial) });
-      projFinancial = (projFinancial + monthlyContrib * 12) * (1 + portfolioGrowthPct / 100);
-    }
-  }
-  const crossoverAge = crossoverData.find(d => d.financial >= d.human)?.age;
   const ready = grossIncome > 0 && yearsToRetire > 0;
-
+  const humanCapital = ready ? Math.round(humanCapitalPV(grossIncome, growthRate, discountRate, yearsToRetire)) : 0;
+  const financialCapital = investableNetWorth;
+  const crossover = ready
+    ? humanCapitalCrossover({
+      income: grossIncome, growth: growthRate, discount: discountRate, years: yearsToRetire,
+      startWealth: financialCapital, monthlyContrib, portfolioGrowth: portfolioGrowthPct / 100,
+    })
+    : { series: [], crossoverIndex: null };
+  const crossoverData = crossover.series.map(d => ({ age: currentAge + d.yearIndex, human: Math.round(d.human), financial: Math.round(d.financial) }));
+  const crossoverAge = crossover.crossoverIndex != null ? currentAge + crossover.crossoverIndex : undefined;
   return (
     <Section
       id="human-capital"
@@ -77,7 +68,7 @@ export default function HumanCapital() {
               value={fmtEUR(humanCapital)}
               sublabel={`Gross earnings over ${yearsToRetire} ${yearsToRetire === 1 ? 'year' : 'years'} to retirement, in today’s value`}
             />
-            <MetricCard label="Financial capital" value={fmtEUR(financialCapital)} sublabel="Your net worth today" />
+            <MetricCard label="Financial capital" value={fmtEUR(financialCapital)} sublabel="Your cash and investments today" />
             <MetricCard
               label="Crossover age"
               money={false}

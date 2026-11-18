@@ -50,6 +50,33 @@ func ComputeEffectiveExposure(holdings []HoldingWithETF) map[string]float64 {
 	return exposure
 }
 
+// ComputeLookThroughExposure returns each underlying holding's share (0-1)
+// of the whole portfolio. Unlike ComputeEffectiveExposure, the denominator is
+// totalValue, the value of every position (direct stocks, funds without
+// constituent data, bonds, ...), not just the funds passed in. A position
+// whose ETFHoldings is nil is a direct holding and counts 100 % towards its
+// own ISIN; a fund contributes MarketValue/totalValue × constituent weight.
+func ComputeLookThroughExposure(holdings []HoldingWithETF, totalValue float64) map[string]float64 {
+	if totalValue <= 0 {
+		return nil
+	}
+	exposure := make(map[string]float64)
+	for _, h := range holdings {
+		if h.MarketValue <= 0 {
+			continue
+		}
+		share := h.MarketValue / totalValue
+		if h.ETFHoldings == nil {
+			exposure[h.ISIN] += share
+			continue
+		}
+		for key, weight := range h.ETFHoldings {
+			exposure[key] += share * weight / 100
+		}
+	}
+	return exposure
+}
+
 // HoldingWithETF represents a portfolio holding with its ETF constituent weights.
 type HoldingWithETF struct {
 	ISIN        string

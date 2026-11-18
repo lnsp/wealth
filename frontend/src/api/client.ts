@@ -286,7 +286,10 @@ export interface AssetsOverview {
 
 export interface ImportResult {
   imported: number;
+  /** Rows already stored unchanged (same hash, or an equivalent older row). */
   skipped: number;
+  /** Rows already stored whose type, security, quantity or price the re-import corrected. */
+  updated?: number;
   new_securities: string[];
   institution: string;
   errors?: string[];
@@ -377,9 +380,68 @@ export interface ConcentrationAlert {
 }
 
 export interface TopHolding {
+  /** Empty for constituents that justETF lists without an ISIN. */
   isin: string;
   name: string;
+  /** Share of the whole portfolio, in percent. */
   exposure_pct: number;
+}
+
+export interface TopHoldingsData {
+  holdings: TopHolding[];
+  total_value?: number;
+  /** Share of the portfolio attributed to named companies (direct stocks + listed fund constituents), in percent. */
+  coverage_pct?: number;
+}
+
+export interface ETFHoldingsData {
+  etf_isin: string;
+  etf_name: string;
+  holdings: ETFHoldingEntry[];
+  /** Sum of the listed constituent weights, in percent of the fund. */
+  coverage_pct?: number;
+}
+
+export interface OverlapData {
+  labels: string[];
+  matrix: number[][];
+  isins?: string[];
+  /** Per fund: sum of the listed constituent weights, in percent. */
+  coverage?: number[];
+  constituent_counts?: number[];
+}
+
+export interface CorrelationData {
+  labels: string[];
+  /** null where two holdings share too little price history. */
+  matrix: (number | null)[][];
+  min_observations?: number;
+}
+
+export interface FundAlternative {
+  isin: string;
+  name: string;
+  index?: string;
+  same_index?: boolean;
+  ter: number;
+  annual_saving: number;
+  ten_year_saving: number;
+  ten_year_net_after_tax?: number | null;
+  breakeven_years?: number | null;
+}
+
+export interface AlternativesData {
+  alternatives: {
+    isin: string;
+    name: string;
+    index?: string;
+    current_ter: number;
+    value: number;
+    unrealized_gain?: number | null;
+    switch_tax?: number | null;
+    alternatives: FundAlternative[];
+  }[];
+  growth_pct?: number;
 }
 
 export interface TreemapNode {
@@ -397,6 +459,10 @@ export interface ImportHistoryEntry {
   total_rows: number;
   imported: number;
   skipped: number;
+  /** Re-imported rows the import corrected (0 for imports before migration 032). */
+  updated?: number;
+  /** RSU vesting rows (vested or scheduled) from Morgan Stanley files. */
+  rsu_vests?: number;
   new_securities: string[];
   account_name: string;
 }
@@ -419,6 +485,8 @@ export interface SectorHistoryPoint {
 export interface DrawdownPoint {
   date: string;
   drawdown: number;
+  /** Level of the return index on that date, for peak-to-trough within a sub-period. */
+  value?: number;
 }
 
 export interface RiskMetrics {
@@ -429,10 +497,15 @@ export interface RiskMetrics {
   max_drawdown_start: string;
   max_drawdown_end: string;
   max_drawdown_days: number;
+  /** One trading day, 95 %, EUR (negative = loss). */
   value_at_risk_95: number;
+  /** % below the return index's peak on `peak_date`. */
   current_drawdown: number;
+  peak_date?: string;
+  /** Highest recorded value (not the index). */
   all_time_high: number;
   ath_date: string;
+  series_start?: string;
   drawdown_series: DrawdownPoint[];
 }
 
@@ -446,6 +519,8 @@ export interface RiskData {
   risk: RiskMetrics;
   benchmark_risk?: RiskMetrics;
   rolling?: Record<string, RollingMetric[]>;
+  /** Average ECB deposit facility rate over the measured window, in %. */
+  risk_free_rate?: number;
 }
 
 export interface TaxBySecurity {
@@ -582,12 +657,27 @@ export interface WealthReportDetail {
   period_start: string;
   period_end: string;
   generated_at: string;
+  /** Figures are recomputed from current data on every read. */
+  computed_at?: string;
   data: {
+    /** false when the period has no net worth history; the net worth figures are then 0. */
+    has_net_worth?: boolean;
+    /** Snapshot the opening value comes from: the previous period's close. Absent = no earlier history (start 0). */
+    start_date?: string;
+    end_date?: string;
     net_worth_start: number;
     net_worth_end: number;
     net_worth_change: number;
     net_worth_change_pct: number;
+    /** External flows in the period: deposits and in-kind receipts (RSU vests) minus withdrawals. */
+    net_deposits?: number;
+    /** net_worth_change − net_deposits: price moves, income, fees, taxes, revaluations. */
+    market_change?: number;
+    /** Net: credited after tax and fees withheld at source, at the payment-date FX. */
     total_dividends: number;
+    dividends_gross?: number;
+    dividends_withheld?: number;
+    warnings?: string[];
     new_transactions: number;
     holdings: { isin: string; name: string; value: number; weight: number; return_pct: number }[];
     top_gainer?: { isin: string; name: string; return_pct: number };
@@ -631,14 +721,20 @@ export interface CostData {
   coverage_pct: number;
   annual_cost: number;
   daily_cost: number;
+  /** Fee drag for years 1–30: future value lost to fund charges, including the growth they would have earned. */
   projection: { year: number; cumulative: number }[];
+  /** Growth before costs assumed by the projection, % a year. */
+  projection_growth_pct?: number;
+  /** Absent when no holding has a charge on record. Computed over funds with a known charge only. */
   benchmark?: {
     avg_ter: number;
     your_ter: number;
+    funds_value?: number;
     grade: string;
     detail: string;
     annual_saving: number;
     ten_year_saving: number;
+    growth_pct?: number;
   };
   total_cost_ownership?: {
     ter_cost: number;
@@ -649,6 +745,8 @@ export interface CostData {
     lifetime_fees: number;
     lifetime_volume: number;
     transaction_count: number;
+    /** Years from the first trade to today (at least 1) that the trading costs are averaged over. */
+    years?: number;
   };
 }
 
@@ -729,14 +827,20 @@ export interface ProjectionData {
   current_value: number;
   target_amount: number;
   target_date: string;
+  /** Name of the goal behind target_amount / target_date (drawn as a reference line only). */
+  target_goal_name?: string;
   contribution: number;
+  /** Trailing 12-month net contribution (deposits − withdrawals + vests) ÷ months covered, regardless of overrides. */
+  default_contribution?: number;
+  contribution_basis?: { kind: string; months_covered: number; deposits: number; withdrawals: number; in_kind: number };
   return_pct: number;
   horizon_years?: number;
   contrib_growth_pct?: number;
   has_confidence?: boolean;
   sensitivity?: SensitivityBar[];
   projection_end?: number;
-  milestones?: { year: number; years_from_now: number; projected_value: number; contributions: number; growth: number; real_value: number }[];
+  /** contributions excludes starting_value: projected_value = starting_value + contributions + growth. */
+  milestones?: { year: number; years_from_now: number; projected_value: number; starting_value?: number; contributions: number; growth: number; real_value: number }[];
   projection_accuracy?: {
     months_ago: number;
     past_value: number;
@@ -744,6 +848,10 @@ export interface ProjectionData {
     actual_value: number;
     diff_eur: number;
     diff_pct: number;
+    /** "default_projection_then": the default projection as of 12 months ago (value then, trailing contribution then, default return). */
+    basis?: string;
+    assumed_contribution?: number;
+    assumed_return_pct?: number;
   };
   drawdown?: {
     series: { date: string; value: number }[];
@@ -754,7 +862,40 @@ export interface ProjectionData {
     success_rate: number;
     tax_breakdown?: { year: number; gross_withdrawal: number; estimated_tax: number; net_received: number; effective_rate_pct: number; remaining_value: number }[];
     cumulative_tax: number;
+    // FIRE model fields (Planning). Amounts are in today's euros.
+    reached?: boolean;
+    fire_number_nominal?: number;
+    months_to_fire?: number;
+    first_year_withdrawal?: number;
+    first_year_tax?: number;
+    spending_gap?: number;
+    bridge_years?: number;
+    bridge_reserve?: number;
+    pension_from_age?: number;
+    gain_share_pct?: number;
+    teilfreistellung_pct?: number;
+    tax_rate_pct?: number;
+    allowance?: number;
+    inflation_pct?: number;
+    swr_pct?: number;
+    in_todays_euros?: boolean;
   };
+}
+
+/** FIRE inputs for the projection endpoint (Planning page). Amounts in today's euros a year. */
+export interface FireProjectionParams {
+  contribution?: number;
+  returnPct?: number;
+  /** Spending the portfolio and the pension must cover (after other income). */
+  expenses?: number;
+  swr?: number;
+  /** Pension after tax, paid from pensionAge. */
+  pension?: number;
+  currentAge?: number;
+  pensionAge?: number;
+  inflationPct?: number;
+  churchRate?: number;
+  joint?: boolean;
 }
 
 export interface RebalanceTrade {
@@ -856,7 +997,8 @@ export const api = {
     if (search) params.set('search', search);
     if (from) params.set('from', from);
     if (to) params.set('to', to);
-    return request<{ transactions: TransactionRow[]; total: number }>(`/transactions?${params}`);
+    /** first_date: the oldest transaction's date ("" when there are none), whatever the filters. */
+    return request<{ transactions: TransactionRow[]; total: number; first_date?: string }>(`/transactions?${params}`);
   },
   updateTransactionCategory: (id: string, category: string) =>
     request<{ ok: boolean }>(`/transactions/${id}/category`, { method: 'PATCH', body: JSON.stringify({ category }) }),
@@ -921,18 +1063,18 @@ export const api = {
   getAllocationSummary: () => request<{ sectors: Record<string, number>; countries: Record<string, number>; currencies: CurrencyExposureEntry[] }>('/analysis/summary'),
   getSectors: () => request<{ sectors: Record<string, number> }>('/analysis/sectors'),
   getCountries: () => request<{ countries: Record<string, number> }>('/analysis/countries'),
-  getOverlap: () => request<{ labels: string[]; matrix: number[][] }>('/analysis/overlap'),
+  getOverlap: () => request<OverlapData>('/analysis/overlap'),
   getAlerts: () => request<{ alerts: ConcentrationAlert[] }>('/analysis/alerts'),
-  getTopHoldings: () => request<{ holdings: TopHolding[] }>('/analysis/top-holdings'),
+  getTopHoldings: () => request<TopHoldingsData>('/analysis/top-holdings'),
   getTreemap: () => request<{ children: TreemapNode[] }>('/analysis/treemap'),
   getSectorHistory: () => request<{ history: SectorHistoryPoint[]; sectors: string[] }>('/analysis/sector-history'),
   getETFHoldings: (isin: string) =>
-    request<{ etf_isin: string; etf_name: string; holdings: ETFHoldingEntry[] }>(`/analysis/etf/${isin}/holdings`),
+    request<ETFHoldingsData>(`/analysis/etf/${isin}/holdings`),
   getRisk: () => request<RiskData>('/analysis/risk'),
   getTax: (year?: number, opts?: TaxFilingOptions) => request<TaxData>(`/analysis/tax${taxQuery(opts, year ? { year } : undefined)}`),
   getCurrency: () => request<{ currencies: CurrencyExposureEntry[] }>('/analysis/currency'),
   getCosts: () => request<CostData>('/analysis/costs'),
-  getAlternatives: () => request<{ alternatives: { isin: string; name: string; current_ter: number; value: number; alternatives: { isin: string; name: string; ter: number; annual_saving: number; ten_year_saving: number }[] }[] }>('/analysis/alternatives'),
+  getAlternatives: () => request<AlternativesData>('/analysis/alternatives'),
   getTaxLots: (opts?: TaxFilingOptions) => request<{ lots: TaxLot[]; sell_all?: SellAllSummary }>(`/analysis/tax-lots${taxQuery(opts)}`),
   simulateSell: (requests: { isin: string; amount_eur: number }[], churchTaxRate?: number, joint?: boolean) => {
     const qs = taxQuery({ churchTax: churchTaxRate, joint });
@@ -950,7 +1092,7 @@ export const api = {
       allowance?: number;
     }>(`/analysis/sell-simulator${qs}`, { method: 'POST', body: JSON.stringify(requests) });
   },
-  getCorrelation: () => request<{ labels: string[]; matrix: number[][] }>('/analysis/correlation'),
+  getCorrelation: () => request<CorrelationData>('/analysis/correlation'),
   getAllocationHistory: () => request<{ history: { date: string; weights: Record<string, number> }[]; holdings: string[] }>('/analysis/allocation-history'),
   getFXHistory: () => request<{ rates: Record<string, { date: string; rate: number }[]> }>('/analysis/fx-history'),
   // Users
@@ -980,13 +1122,15 @@ export const api = {
     transactions: { date: string; type: string; quantity: number; amount: number; running_qty: number }[];
   }>(`/portfolio/security/${isin}`),
   getHealthScore: () => request<{ score: number; subscores: { name: string; score: number; weight: number; status: string; detail: string }[] }>('/analysis/health-score'),
-  getBenchmarkComparison: (isin?: string) => request<{ benchmark_name: string; benchmark_isin?: string; actual_value: number; benchmark_value: number; difference: number; comparison: { date: string; actual: number; benchmark: number }[]; /** false when the benchmark has too few price rows; `have` of `need` rows are loaded. */ available?: boolean; reason?: string; have?: number; need?: number }>(`/analysis/benchmark-comparison${isin ? `?isin=${isin}` : ''}`),
-  getInflation: () => request<{ history: { date: string; nominal: number; real: number }[]; nominal_return?: number; real_return?: number; purchasing_power_lost?: number }>('/analysis/inflation'),
+  getBenchmarkComparison: (isin?: string) => request<{ benchmark_name: string; benchmark_isin?: string; actual_value: number; benchmark_value: number; difference: number; comparison: { date: string; actual: number; benchmark: number }[]; /** false when the benchmark has too few price rows; `have` of `need` rows are loaded. */ available?: boolean; reason?: string; have?: number; need?: number; /** First day both lines share; the benchmark starts with the same value. */ start_date?: string }>(`/analysis/benchmark-comparison${isin ? `?isin=${isin}` : ''}`),
+  /** Cash and securities (property, vehicles and their loans excluded) against the German VPI. Returns are time-weighted over window_start → window_end. */
+  getInflation: () => request<{ history: { date: string; nominal: number; real: number; cpi_index?: number }[]; nominal_return?: number; real_return?: number; inflation_pct?: number; purchasing_power_lost?: number; window_start?: string; window_end?: string }>('/analysis/inflation'),
   getCashFlow: () => request<{ history: { month: string; income: number; expenses: number; net: number }[]; projection: { month: string; income: number; expenses: number; net: number }[]; avg_income: number; avg_expenses: number; avg_net: number }>('/analysis/cash-flow'),
 
   // Settings
   listAllAccounts: () => request<{ accounts: Account[] }>('/settings/accounts'),
-  getImportHistory: () => request<{ history: ImportHistoryEntry[] }>('/import-history'),
+  getImportHistory: (limit = 50, offset = 0) =>
+    request<{ history: ImportHistoryEntry[]; total?: number }>(`/import-history?limit=${limit}&offset=${offset}`),
 
   // Goals
   listGoals: () => request<{ goals: GoalProgress[] }>('/settings/goals'),
@@ -1001,6 +1145,21 @@ export const api = {
     if (taxPortion != null && taxPortion >= 0 && taxPortion <= 1) params.set('tax_portion', String(taxPortion));
     if (horizonYears != null && horizonYears >= 1 && horizonYears <= 50) params.set('horizon_years', String(horizonYears));
     if (contribGrowth != null && contribGrowth >= 0 && contribGrowth <= 20) params.set('contrib_growth', String(contribGrowth));
+    const qs = params.toString();
+    return request<ProjectionData>(`/portfolio/projection${qs ? `?${qs}` : ''}`);
+  },
+  getFireProjection: (p: FireProjectionParams) => {
+    const params = new URLSearchParams();
+    if (p.contribution != null && Number.isFinite(p.contribution)) params.set('contribution', String(p.contribution));
+    if (p.returnPct != null && Number.isFinite(p.returnPct)) params.set('return_pct', String(p.returnPct));
+    if (p.expenses != null && p.expenses > 0) params.set('expenses', String(p.expenses));
+    if (p.swr != null && p.swr > 0) params.set('swr', String(p.swr));
+    if (p.pension != null && p.pension > 0) params.set('pension', String(p.pension));
+    if (p.currentAge != null && p.currentAge > 0) params.set('current_age', String(Math.round(p.currentAge)));
+    if (p.pensionAge != null && p.pensionAge > 0) params.set('pension_age', String(Math.round(p.pensionAge)));
+    if (p.inflationPct != null && Number.isFinite(p.inflationPct)) params.set('inflation', String(p.inflationPct));
+    if (p.churchRate != null && p.churchRate > 0) params.set('church_rate', String(p.churchRate));
+    if (p.joint) params.set('joint', '1');
     const qs = params.toString();
     return request<ProjectionData>(`/portfolio/projection${qs ? `?${qs}` : ''}`);
   },
@@ -1024,8 +1183,9 @@ export const api = {
   // Reports
   listReports: () => request<{ reports: WealthReportSummary[] }>('/settings/reports'),
   getReport: (id: string) => request<WealthReportDetail>(`/settings/reports/${id}`),
+  /** Generates the report for a period, or regenerates it when it exists (regenerated: true). */
   generateReport: (data: { report_type: string; year: number; month?: number }) =>
-    request<{ status: string; period: string }>('/settings/reports', { method: 'POST', body: JSON.stringify(data) }),
+    request<{ status: string; period: string; regenerated?: boolean }>('/settings/reports', { method: 'POST', body: JSON.stringify(data) }),
   listSecurities: () => request<{ securities: Security[] }>('/settings/securities'),
   updateSecuritySymbol: (isin: string, symbol: string) =>
     request<{ status: string }>(`/settings/securities/${isin}/symbol`, {

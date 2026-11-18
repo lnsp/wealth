@@ -7,7 +7,9 @@ import {
   EmptyState, ErrorState, useConfirm,
 } from '../ui';
 import { escapeHtml, fmtEUR, fmtPct, fmtNum, fmtAxis } from '../../utils/format';
-import { ItemCard, RemoveButton, monthLabel } from './shared';
+import { ItemCard, RemoveButton, monthLabel, toNum } from './shared';
+import { parsePct } from './planningMath';
+import { DEFAULT_INFLATION_PCT, DEFAULT_RETURN_PCT } from './constants';
 
 type LifeEvent = {
   type: string; date: string; cash_impact: number; contrib_change: number; recurring_cost: number;
@@ -28,6 +30,10 @@ type LifeEventResult = {
   with_events: { date: string; value: number }[];
   net_impact: number;
   fire_shift_months: number;
+  fire_target_known?: boolean;
+  fire_baseline_month?: number;
+  fire_with_events_month?: number;
+  fire_target?: number;
   execution_plans?: ExecutionPlan[];
 };
 
@@ -54,12 +60,17 @@ function isLifeEventResult(body: unknown): body is LifeEventResult {
 
 // "What-if" event simulator. Each event is (lump_sum, monthly_contrib_change,
 // monthly_recurring_cost, duration_months) and the backend at
-// POST /api/portfolio/life-events overlays them onto the baseline projection.
-// When an event triggers a sell (e.g. home purchase), the response includes
-// an execution_plan with the FIFO sell order and tax estimate; for windfalls
-// (inheritance) it suggests lump-sum vs DCA.
+// POST /api/portfolio/life-events overlays them onto the baseline projection
+// of cash and investments (a home bought or a loan taken is not part of it).
+// The independence shift uses the FIRE Calculator's inputs and target. When
+// an event needs cash (e.g. home purchase), the response includes an
+// execution_plan: oldest lots first within each depot (FIFO), the cheapest
+// depot/security first across them; for windfalls it compares lump-sum vs DCA.
 export default function LifeEventSimulator() {
-  const { projData, projContrib, projReturn } = usePlanning();
+  const {
+    projData, projContrib, projReturn, fireExpenses, otherIncome, pensionIncome, fireSWR, fireInflation,
+    pensionCurrentAge, pensionAge, churchRate, joint,
+  } = usePlanning();
   const tc = useThemeColors();
   const [confirm, confirmDialog] = useConfirm();
   const [events, setEvents] = useState<LifeEvent[]>([]);
@@ -67,8 +78,10 @@ export default function LifeEventSimulator() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const contrib = projData ? (parseFloat(projContrib) || projData.contribution) : 0;
-  const ret = projData ? (parseFloat(projReturn) || projData.return_pct) : 7;
+  // 0 % return and 0 € contributions are valid inputs, not "use the default".
+  const contrib = projData ? parsePct(projContrib, projData.contribution) : 0;
+  const ret = parsePct(projReturn, projData?.return_pct ?? DEFAULT_RETURN_PCT);
+  const fireSpend = Math.max(toNum(fireExpenses) - toNum(otherIncome), 0);
 
   const addEvent = (t: Template) => {
     const now = new Date();
@@ -103,7 +116,19 @@ export default function LifeEventSimulator() {
       }));
       const res = await fetch('/api/portfolio/life-events', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ events: payload, contribution: contrib, return_pct: ret }),
+        body: JSON.stringify({
+          events: payload,
+          contribution: projData ? contrib : undefined, // unknown: the backend uses the trailing 12 months
+          return_pct: ret,
+          expenses: fireSpend,
+          swr: parsePct(fireSWR, 3.5),
+          pension: toNum(pensionIncome),
+          current_age: pensionCurrentAge,
+          pension_age: pensionAge,
+          inflation_pct: parsePct(fireInflation, DEFAULT_INFLATION_PCT),
+          church_rate: churchRate,
+          joint,
+        }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body: unknown = await res.json();
@@ -120,13 +145,24 @@ export default function LifeEventSimulator() {
   const hasResult = !!result && result.baseline.length > 0 && events.length > 0;
   const netImpact = result?.net_impact ?? 0;
   const shift = result?.fire_shift_months ?? 0;
+  const fireKnown = result?.fire_target_known ?? false;
+  const baseFire = result?.fire_baseline_month ?? -1;
+  const eventsFire = result?.fire_with_events_month ?? -1;
+  const fireValue = !fireKnown ? 'Not set'
+    : baseFire < 0 && eventsFire < 0 ? 'Not within 50 years'
+      : baseFire >= 0 && eventsFire < 0 ? 'No longer within 50 years'
+        : baseFire < 0 ? 'Now within 50 years'
+          : shift === 0 ? 'No change' : `${fmtNum(Math.abs(shift))} months ${shift > 0 ? 'later' : 'earlier'}`;
+  const fireTone = !fireKnown ? 'neutral' as const
+    : (baseFire >= 0 && eventsFire < 0) || shift > 0 ? 'negative' as const
+      : (baseFire < 0 && eventsFire >= 0) || shift < 0 ? 'positive' as const : 'neutral' as const;
   const sorted = [...events].sort((a, b) => a.date.localeCompare(b.date));
 
   return (
     <Section
       id="life-events"
       title="Life Event Simulator"
-      subtitle="See how a major life event would change your net worth over the next 30 years."
+      subtitle="See how a major life event would change your cash and investments over the next 30 years."
     >
       <div className="flex flex-wrap gap-2">
         {TEMPLATES.map(t => (
@@ -138,7 +174,7 @@ export default function LifeEventSimulator() {
         <div className="mt-4">
           <EmptyState
             title="No events yet"
-            message="Add an event above, adjust its amounts, then simulate the effect on your net worth."
+            message="Add an event above, adjust its amounts, then simulate the effect on your cash and investments."
             action={{ label: 'Add a home purchase', onClick: () => addEvent(TEMPLATES[0]) }}
           />
         </div>
@@ -214,18 +250,20 @@ export default function LifeEventSimulator() {
               label="Effect after 30 years"
               tone={netImpact > 0 ? 'positive' : netImpact < 0 ? 'negative' : 'neutral'}
               value={fmtEUR(netImpact, { sign: true })}
-              sublabel="Net worth with events minus without"
+              sublabel="Cash and investments with events minus without"
             />
             <MetricCard
               label="Financial independence"
               money={false}
-              tone={shift < 0 ? 'positive' : shift > 0 ? 'negative' : 'neutral'}
-              value={shift === 0 ? 'No change' : `${fmtNum(Math.abs(shift))} months ${shift > 0 ? 'later' : 'earlier'}`}
-              sublabel="Measured against a fixed target of 36.000 € a year at a 3,5 % withdrawal rate"
+              tone={fireTone}
+              value={fireValue}
+              sublabel={fireKnown
+                ? <>Against the FIRE Calculator’s target{(result.fire_target ?? 0) > 0 && <> (<span data-privacy="blur">{fmtEUR(result.fire_target ?? 0)}</span> in today’s money)</>}</>
+                : 'Enter your annual expenses in the FIRE Calculator to see the effect on your independence date'}
             />
           </MetricGrid>
 
-          <SubHeading className="mt-6">Net worth with and without the events</SubHeading>
+          <SubHeading className="mt-6">Cash and investments with and without the events</SubHeading>
           {(() => {
             const dates = result.baseline.map(p => p.date);
             // Events sit between quarterly points: mark the first point on or after the event.
@@ -288,6 +326,7 @@ export default function LifeEventSimulator() {
           })()}
           <p className="mt-2 text-[13px] text-ink-muted">
             Assumes contributions of <span data-privacy="blur">{fmtEUR(contrib)}</span> a month and {fmtPct(ret)} growth a year — the values from the FIRE Calculator.
+            A home or car you buy and the loan for it are not included: a down payment shows as money leaving your cash and investments.
           </p>
 
           {(result.execution_plans ?? []).map((plan, pi) => (
@@ -301,7 +340,7 @@ export default function LifeEventSimulator() {
                         <div className="min-w-0 flex-1 basis-48">
                           <span className="font-medium text-ink break-words">{step.name}</span>
                           <span className="block text-[13px] text-ink-muted">
-                            {step.buy_date ? `Bought ${step.buy_date.slice(0, 4)} · ` : ''}{fmtPct(step.effective_rate_pct)} effective tax
+                            {step.buy_date ? `Bought ${step.buy_date.slice(0, 4)} · ` : ''}{fmtPct(step.effective_rate_pct)} tax on the gain
                           </span>
                         </div>
                         <div className="text-right">
@@ -312,9 +351,13 @@ export default function LifeEventSimulator() {
                     ))}
                   </ul>
                   <MetricGrid className="mt-3">
-                    <MetricCard label="Tax on the sales" value={fmtEUR(plan.total_tax ?? 0)} />
+                    <MetricCard label="Tax on the sales" value={fmtEUR(plan.total_tax ?? 0)} sublabel="Gains and losses netted; share losses only against share gains" />
                     <MetricCard label="Received after tax" value={fmtEUR(plan.total_proceeds ?? 0)} />
                   </MetricGrid>
+                  <p className="mt-2 text-[13px] text-ink-muted">
+                    Within each depot the oldest shares must be sold first (FIFO); across depots and securities the sale with the least tax per euro raised comes first.
+                    The saver’s allowance is not counted, in case it is already used.
+                  </p>
                 </>
               )}
               {plan.type === 'invest' && (

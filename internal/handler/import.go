@@ -7,6 +7,8 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -102,9 +104,18 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Morgan Stanley exports never name the stock: vests and sales only get
+	// a security from the account's Stock ISIN. Without it the vests would be
+	// stored as ISIN-less transfers, which count as cash withdrawals.
+	if result.Institution == "morgan_stanley" && strings.TrimSpace(account.ImportSecurityISIN.String) == "" {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("Account %q has no Stock ISIN. Morgan Stanley files don't name the stock, so set the account's Stock ISIN in Settings > Accounts before importing.", account.Name))
+		return
+	}
+
 	// Resolve ISIN for Morgan Stanley transactions from account's import_security_isin
-	if account.ImportSecurityISIN.Valid && account.ImportSecurityISIN.String != "" {
-		isin := account.ImportSecurityISIN.String
+	if account.ImportSecurityISIN.Valid && strings.TrimSpace(account.ImportSecurityISIN.String) != "" {
+		isin := strings.TrimSpace(account.ImportSecurityISIN.String)
 		for i := range txns {
 			if txns[i].SecurityISIN != "" {
 				continue
@@ -137,12 +148,18 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var imported, skipped, adopted, vestCount int
+	// Amounts are stored as magnitudes with the direction in the type. This
+	// runs after the parser computed the import hashes, so they don't change.
+	for i := range txns {
+		normalizeTxnSigns(&txns[i])
+	}
+
+	var imported, skipped, updated, adopted, vestCount int
 	var newSecurities []string
 
 	if err := withTx(r.Context(), h.queries, func(qtx *db.Queries) error {
 		var txErr error
-		imported, skipped, adopted, newSecurities, txErr = h.insertTransactions(r.Context(), qtx, txns)
+		imported, skipped, updated, adopted, newSecurities, txErr = h.insertTransactions(r.Context(), qtx, result.Institution, txns)
 		if txErr != nil {
 			return txErr
 		}
@@ -159,7 +176,7 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 		if logErr := qtx.InsertImportHistory(r.Context(), db.InsertImportHistoryParams{
 			AccountID: accountID, Institution: result.Institution, Filename: filename,
 			TotalRows: int32(len(txns)), Imported: int32(imported), Skipped: int32(skipped),
-			NewSecurities: secNames,
+			NewSecurities: secNames, Updated: int32(updated), RsuVests: int32(vestCount),
 		}); logErr != nil {
 			return fmt.Errorf("insert import history: %w", logErr)
 		}
@@ -171,6 +188,7 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 
 	result.Imported = imported
 	result.Skipped = skipped
+	result.Updated = updated
 	result.NewSecurities = newSecurities
 	result.RSUVests = vestCount
 	if adopted > 0 {
@@ -201,7 +219,7 @@ func (h *ImportHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (h *ImportHandler) insertTransactions(ctx context.Context, q *db.Queries, txns []parser.Transaction) (imported, skipped, adopted int, newSecurities []string, err error) {
+func (h *ImportHandler) insertTransactions(ctx context.Context, q *db.Queries, institution string, txns []parser.Transaction) (imported, skipped, updated, adopted int, newSecurities []string, err error) {
 	seenSecurities := make(map[string]bool)
 
 	// Hashes of the whole batch: an existing row whose hash appears here is
@@ -228,7 +246,7 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, q *db.Queries, t
 					ISIN: txn.SecurityISIN, WKN: pgtype.Text{}, Symbol: pgtype.Text{},
 					Name: name, AssetClass: parser.ClassifyAsset(txn.SecurityISIN, name), Currency: txn.Currency,
 				}); err != nil {
-					return imported, skipped, adopted, newSecurities, fmt.Errorf("create security %s: %w", txn.SecurityISIN, err)
+					return imported, skipped, updated, adopted, newSecurities, fmt.Errorf("create security %s: %w", txn.SecurityISIN, err)
 				}
 				newSecurities = append(newSecurities, txn.SecurityISIN)
 
@@ -236,7 +254,7 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, q *db.Queries, t
 				if symbol, ok := h.tickerMap[txn.SecurityISIN]; ok {
 					sym := pgtype.Text{String: symbol, Valid: true}
 					if err := q.UpdateSecuritySymbol(ctx, db.UpdateSecuritySymbolParams{ISIN: txn.SecurityISIN, Symbol: sym}); err != nil {
-						return imported, skipped, adopted, newSecurities, fmt.Errorf("update symbol %s: %w", txn.SecurityISIN, err)
+						return imported, skipped, updated, adopted, newSecurities, fmt.Errorf("update symbol %s: %w", txn.SecurityISIN, err)
 					}
 				}
 			}
@@ -250,6 +268,10 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, q *db.Queries, t
 
 		quantity := numericFromFloat(txn.Quantity)
 		price := numericFromFloat(txn.Price)
+		if txn.SecurityISIN == "" {
+			// Cash rows have no quantity or price: store NULL, not 0.
+			quantity, price = nullIfZero(txn.Quantity), nullIfZero(txn.Price)
+		}
 		amount := numericFromFloat(txn.Amount)
 		fee := numericFromFloat(txn.Fee)
 		tax := numericFromFloat(txn.Tax)
@@ -276,12 +298,17 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, q *db.Queries, t
 		}
 
 		// Exact hash already present: re-run the upsert so type reclassification
-		// still applies, but count the row as skipped.
-		if _, hashErr := q.GetTransactionIDByHash(ctx, txn.ImportHash); hashErr == nil {
+		// still applies. Count the row as updated when the upsert changes it,
+		// otherwise as a skipped duplicate.
+		if existing, hashErr := q.GetTransactionImportState(ctx, txn.ImportHash); hashErr == nil {
 			if err := q.InsertTransaction(ctx, insertParams); err != nil {
-				return imported, skipped, adopted, newSecurities, fmt.Errorf("upsert transaction: %w", err)
+				return imported, skipped, updated, adopted, newSecurities, fmt.Errorf("upsert transaction: %w", err)
 			}
-			skipped++
+			if upsertChanges(existing, insertParams) {
+				updated++
+			} else {
+				skipped++
+			}
 			continue
 		}
 
@@ -289,33 +316,134 @@ func (h *ImportHandler) insertTransactions(ctx context.Context, q *db.Queries, t
 		// an older importer version. Adopt the first economically identical row
 		// not accounted for by this batch, upgrading its hash to the current
 		// scheme so future imports dedup directly.
-		similar, simErr := q.ListSimilarTransactions(ctx, db.ListSimilarTransactionsParams{
-			AccountID: txn.AccountID, Date: txn.Date, Type: txn.Type,
-			SecurityISIN: secISIN, Quantity: quantity, Amount: amount,
-			Fee: fee, Tax: tax, Currency: txn.Currency,
-		})
-		if simErr != nil {
-			return imported, skipped, adopted, newSecurities, fmt.Errorf("list similar transactions: %w", simErr)
-		}
-		if id, ok := pickAdoptable(similar, batchHashes, claimed); ok {
-			if updErr := q.UpdateTransactionImportHash(ctx, db.UpdateTransactionImportHashParams{
-				ID: id, ImportHash: txn.ImportHash,
-			}); updErr != nil {
-				return imported, skipped, adopted, newSecurities, fmt.Errorf("adopt legacy transaction %s: %w", id, updErr)
+		// Older parser versions may have stored the row under another type
+		// (e.g. a Scalable tax refund as "fee"); those are tried after the
+		// row's own type, and an adopted row is then reclassified.
+		var adoptedID uuid.UUID
+		found, retyped := false, false
+		for i, typ := range append([]string{txn.Type}, legacyImportTypes(institution, txn.Type)...) {
+			similar, simErr := q.ListSimilarTransactions(ctx, db.ListSimilarTransactionsParams{
+				AccountID: txn.AccountID, Date: txn.Date, Type: typ,
+				SecurityISIN: secISIN, Quantity: quantity, Amount: amount,
+				Fee: fee, Tax: tax, Currency: txn.Currency,
+			})
+			if simErr != nil {
+				return imported, skipped, updated, adopted, newSecurities, fmt.Errorf("list similar transactions: %w", simErr)
 			}
-			claimed[id] = true
+			if adoptedID, found = pickAdoptable(similar, batchHashes, claimed); found {
+				retyped = i > 0
+				break
+			}
+		}
+		if found {
+			if updErr := q.UpdateTransactionImportHash(ctx, db.UpdateTransactionImportHashParams{
+				ID: adoptedID, ImportHash: txn.ImportHash,
+			}); updErr != nil {
+				return imported, skipped, updated, adopted, newSecurities, fmt.Errorf("adopt legacy transaction %s: %w", adoptedID, updErr)
+			}
+			claimed[adoptedID] = true
 			adopted++
-			skipped++
+			if retyped {
+				// The row now carries this hash: the upsert reclassifies it.
+				if err := q.InsertTransaction(ctx, insertParams); err != nil {
+					return imported, skipped, updated, adopted, newSecurities, fmt.Errorf("reclassify adopted transaction: %w", err)
+				}
+				updated++
+			} else {
+				skipped++
+			}
 			continue
 		}
 
 		if err := q.InsertTransaction(ctx, insertParams); err != nil {
-			return imported, skipped, adopted, newSecurities, fmt.Errorf("insert transaction: %w", err)
+			return imported, skipped, updated, adopted, newSecurities, fmt.Errorf("insert transaction: %w", err)
 		}
 		imported++
 	}
 
-	return imported, skipped, adopted, newSecurities, nil
+	return imported, skipped, updated, adopted, newSecurities, nil
+}
+
+// legacyImportTypes lists the types earlier parser versions stored for a row
+// that is now imported as `typ`, so a row kept under an older import hash is
+// still recognised (and reclassified) instead of duplicated. Only the
+// sign-based reclassifications of the 2026-11-18 audit are listed; amounts
+// were already stored as magnitudes for these parsers, so they still match.
+func legacyImportTypes(institution, typ string) []string {
+	if institution != "scalable_capital" {
+		return nil
+	}
+	switch typ {
+	case "tax":
+		return []string{"fee"} // TAX rows were all booked as fees
+	case "deposit":
+		return []string{"fee", "interest"} // tax refunds; cancelled tax rows (fee reversed)
+	case "withdrawal":
+		return []string{"deposit"} // unknown cash sub-types defaulted to deposit
+	case "fee":
+		return []string{"interest", "dividend"} // negative interest or distributions
+	}
+	return nil
+}
+
+// upsertChanges reports whether InsertTransaction's ON CONFLICT clause would
+// change the stored row: it overwrites the type, and the security, quantity
+// and price when the incoming row carries them.
+func upsertChanges(existing db.GetTransactionImportStateRow, in db.InsertTransactionParams) bool {
+	if existing.Type != in.Type {
+		return true
+	}
+	if in.SecurityISIN.Valid && (!existing.SecurityISIN.Valid || existing.SecurityISIN.String != in.SecurityISIN.String) {
+		return true
+	}
+	differs := func(stored, incoming pgtype.Numeric) bool {
+		v := numericToFloat(incoming)
+		if !incoming.Valid || v <= 0 {
+			return false // the upsert keeps the stored value
+		}
+		return !stored.Valid || math.Abs(numericToFloat(stored)-v) > 5e-9
+	}
+	return differs(existing.Quantity, in.Quantity) || differs(existing.Price, in.Price)
+}
+
+// normalizeTxnSigns enforces the stored-amount convention before insert:
+// amount, fee and tax are magnitudes (≥ 0) and the type carries the
+// direction, as txnSignedCashDelta and the SQL cash queries assume. Parsers
+// that pass a signed amount through (e.g. a hand-edited wealth export) would
+// otherwise turn a payment into an inflow. It runs after the parser computed
+// the import hash, so hashes never change. Migration 032 applies the same
+// rules to rows stored before this check existed.
+//
+//   - interest < 0 → fee (a charge such as overdraft interest)
+//   - deposit < 0 → withdrawal; cash_transfer_in < 0 → cash_transfer_out
+//   - dividend < 0 → fee. There is no dividend-reversal type, so a reversal
+//     is booked as a charge: the cash effect is right, but tax figures keep
+//     the original dividend instead of netting the reversal against it.
+//   - every other type keeps its type with the magnitude (a negative
+//     withdrawal is a withdrawal; buy, sell, fee, tax and transfers alike).
+//   - fee and tax always reduce cash, so they are stored as magnitudes.
+func normalizeTxnSigns(t *parser.Transaction) {
+	if t.Amount < 0 {
+		switch t.Type {
+		case "interest", "dividend":
+			t.Type = "fee"
+		case "deposit":
+			t.Type = "withdrawal"
+		case "cash_transfer_in":
+			t.Type = "cash_transfer_out"
+		}
+		t.Amount = -t.Amount
+	}
+	t.Fee = math.Abs(t.Fee)
+	t.Tax = math.Abs(t.Tax)
+}
+
+// nullIfZero stores 0 as NULL: cash rows carry no quantity or price.
+func nullIfZero(f float64) pgtype.Numeric {
+	if f == 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+		return pgtype.Numeric{}
+	}
+	return numericFromFloat(f)
 }
 
 // pickAdoptable returns the first similar existing row that this batch does
@@ -411,4 +539,38 @@ func compatibleImportAccountType(csvType, targetType string) bool {
 		return true
 	}
 	return false
+}
+
+// HandleImportHistory lists past imports, newest first, limited to the
+// caller's accounts (userAccountIDs; nil = household scope, every account),
+// with the total so the client can page beyond the first page.
+// Query: limit (default 50, max 500), offset.
+func (h *ImportHandler) HandleImportHistory(w http.ResponseWriter, r *http.Request) {
+	limit, offset := int32(50), int32(0)
+	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {
+		limit = int32(min(v, 500))
+	}
+	if v, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && v > 0 {
+		offset = int32(v)
+	}
+	accountIDs := userAccountIDs(r.Context(), h.queries.DB())
+
+	history, err := h.queries.ListImportHistory(r.Context(), db.ListImportHistoryParams{
+		AccountIds: accountIDs, Limit: limit, Offset: offset,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list import history: "+err.Error())
+		return
+	}
+	total, err := h.queries.CountImportHistory(r.Context(), accountIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "count import history: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"history": history,
+		"total":   total,
+		"limit":   limit,
+		"offset":  offset,
+	})
 }

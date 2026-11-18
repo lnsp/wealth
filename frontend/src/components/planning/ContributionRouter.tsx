@@ -3,28 +3,26 @@ import { useThemeColors } from '../../hooks/useThemeColors';
 import EChartWrapper from '../charts/EChartWrapper';
 import { Section, SubHeading, EmptyState } from '../ui';
 import { fmtEUR, fmtPct, fmtNum, fmtAxis, fmtDate } from '../../utils/format';
-import { Assumptions, ScrollTable, downloadText } from './shared';
-
-// Limits from §3 Nr. 63 EStG (bAV), §82 EStG (Riester), §10 EStG (Rürup).
-// 2026 values; update annually.
-const BAV_MAX_ANNUAL = 7248;
-const RIESTER_MAX_ANNUAL = 2100;
-const RIESTER_GRUNDZULAGE = 175;
-const RIESTER_KINDERZULAGE = 300;
-const RURUP_MAX_ANNUAL = 27566;
+import { Assumptions, ScrollTable, downloadText, toNum } from './shared';
+import { BAV_MIN_SUBSIDY_ANNUAL, parsePct, riesterPlan, rurupRoom } from './planningMath';
+import {
+  BAV_MIN_EMPLOYER_SUBSIDY, BAV_SV_FREE_2026, BAV_TAX_FREE_2026, DEFAULT_MARGINAL_RATE_PCT, RESERVE_MONTHS, RIESTER_MAX, RUERUP_CAP_2026,
+} from './constants';
 
 // Builds the optimal monthly allocation waterfall: Emergency Reserve →
 // bAV match (free money) → Riester (Zulagen + tax deduction) → Rürup
 // (tax deduction) → Taxable Brokerage. Tier order matters because each
-// step "borrows" from monthlyBudget before the next is sized.
+// step "borrows" from monthlyBudget before the next is sized. 2026 limits
+// are in constants.ts.
 export default function ContributionRouter() {
-  const { accounts, fireExpenses, crBudget, crMarginalRate, crChildren } = usePlanning();
+  const { accounts, fireExpenses, crBudget, crMarginalRate, crChildren, crGrossIncome } = usePlanning();
   const tc = useThemeColors();
 
-  const marginalRate = parseFloat(crMarginalRate) || 42;
-  const numChildren = parseInt(crChildren, 10) || 0;
-  const monthlyBudget = parseFloat(crBudget) || 0;
-  const reserveMonths = 6;
+  const marginalRate = parsePct(crMarginalRate, DEFAULT_MARGINAL_RATE_PCT);
+  const numChildren = Math.max(0, Math.round(toNum(crChildren)));
+  const monthlyBudget = toNum(crBudget);
+  const grossIncome = toNum(crGrossIncome);
+  const reserveMonths = RESERVE_MONTHS;
 
   const totalCash = accounts.reduce((s, a) => {
     if (!a.is_active) return s;
@@ -44,11 +42,12 @@ export default function ContributionRouter() {
   const bavMatchPct = bavAccounts.length > 0 ? (bavAccounts[0].employer_match_pct ?? 0) : 0;
 
   const hasRiester = accounts.some(a => a.tax_treatment === 'riester' && a.is_active);
-  const riesterZulagen = RIESTER_GRUNDZULAGE + numChildren * RIESTER_KINDERZULAGE;
-  const riesterBenefitPct = hasRiester ? Math.round((riesterZulagen / RIESTER_MAX_ANNUAL) * 100 + marginalRate * 0.5) : 0;
+  // The 2.100 € cap includes the allowances: you pay 2.100 € − allowances yourself.
+  const riester = riesterPlan(marginalRate, numChildren);
 
   const hasRurup = accounts.some(a => a.tax_treatment === 'rurup' && a.is_active);
-  const rurupBenefitPct = hasRurup ? Math.round(marginalRate * 0.9) : 0;
+  // 100 % deductible since 2023, within the cap left after statutory pension contributions.
+  const rurupLimit = rurupRoom(grossIncome);
 
   const tiers: { label: string; short: string; monthly: number; benefit: string; liquidity: string; color: string }[] = [];
   let remainingBudget = monthlyBudget;
@@ -64,22 +63,25 @@ export default function ContributionRouter() {
     const alloc = takeFromBudget(desired);
     if (alloc > 0) tiers.push({ label: 'Emergency reserve', short: 'Reserve', monthly: alloc, benefit: 'Safety net', liquidity: 'Anytime', color: tc.slate });
   }
-  if (bavAccounts.length > 0 && bavMatchPct > 0) {
-    const desired = monthlyBudget > 0 ? Math.min(BAV_MAX_ANNUAL / 12, monthlyBudget * 0.3) : BAV_MAX_ANNUAL / 12;
+  if (bavAccounts.length > 0) {
+    const desired = monthlyBudget > 0 ? Math.min(BAV_TAX_FREE_2026 / 12, monthlyBudget * 0.3) : BAV_TAX_FREE_2026 / 12;
     const alloc = takeFromBudget(desired);
-    if (alloc > 0) tiers.push({ label: 'Company pension (bAV)', short: 'Company pension', monthly: alloc, benefit: `Employer adds ${fmtPct(bavMatchPct, { digits: 0 })}`, liquidity: 'From age 62', color: tc.forest });
+    const benefit = bavMatchPct > 0
+      ? `Employer adds ${fmtPct(bavMatchPct, { digits: 0 })}`
+      : `Employer adds at least ${fmtPct(BAV_MIN_EMPLOYER_SUBSIDY * 100, { digits: 0 })} by law`;
+    if (alloc > 0) tiers.push({ label: 'Company pension (bAV)', short: 'Company pension', monthly: alloc, benefit, liquidity: 'From age 62', color: tc.forest });
   }
-  if (hasRiester) {
-    const alloc = takeFromBudget(RIESTER_MAX_ANNUAL / 12);
-    if (alloc > 0) tiers.push({ label: 'Riester pension', short: 'Riester', monthly: alloc, benefit: `About ${fmtPct(riesterBenefitPct, { digits: 0 })} from allowances and tax relief`, liquidity: 'From age 62', color: tc.sage });
+  if (hasRiester && riester.own > 0) {
+    const alloc = takeFromBudget(riester.own / 12);
+    if (alloc > 0) tiers.push({ label: 'Riester pension', short: 'Riester', monthly: alloc, benefit: `About ${fmtPct(riester.supportPct, { digits: 0 })} of the ${fmtEUR(RIESTER_MAX)} a year comes from allowances and tax relief`, liquidity: 'From age 62', color: tc.sage });
   }
-  if (hasRurup) {
-    const alloc = takeFromBudget(RURUP_MAX_ANNUAL / 12);
-    if (alloc > 0) tiers.push({ label: 'Rürup pension', short: 'Rürup', monthly: alloc, benefit: `About ${fmtPct(rurupBenefitPct, { digits: 0 })} tax relief`, liquidity: 'From age 62', color: tc.gold });
+  if (hasRurup && rurupLimit > 0) {
+    const alloc = takeFromBudget(rurupLimit / 12);
+    if (alloc > 0) tiers.push({ label: 'Rürup pension', short: 'Rürup', monthly: alloc, benefit: `${fmtPct(marginalRate, { digits: 0 })} tax relief now; payouts are taxed later`, liquidity: 'From age 62', color: tc.gold });
   }
   const brokerageMonthly = monthlyBudget > 0 ? remainingBudget : 0;
   if (brokerageMonthly > 0 || tiers.length === 0) {
-    tiers.push({ label: 'Brokerage account', short: 'Brokerage', monthly: brokerageMonthly, benefit: 'About 18,5 % tax on gains', liquidity: 'Anytime', color: tc.walnut });
+    tiers.push({ label: 'Brokerage account', short: 'Brokerage', monthly: brokerageMonthly, benefit: 'About 18,5 % tax on the gain in equity funds', liquidity: 'Anytime', color: tc.walnut });
   }
 
   const waterfallOption = {
@@ -170,7 +172,16 @@ export default function ContributionRouter() {
                 : <>. No annual expenses are entered in the FIRE Calculator, so no reserve is planned.</>}
             </p>
             <p>
-              Yearly maximums: company pension {fmtEUR(BAV_MAX_ANNUAL)} (at most 30 % of the budget), Riester {fmtEUR(RIESTER_MAX_ANNUAL)}, Rürup {fmtEUR(RURUP_MAX_ANNUAL)}.
+              Yearly maximums for 2026: company pension {fmtEUR(BAV_TAX_FREE_2026)} tax-free (at most 30 % of the budget; the first {fmtEUR(BAV_SV_FREE_2026)} also free of social security,
+              on which your employer must add at least {fmtEUR(BAV_MIN_SUBSIDY_ANNUAL)}).
+              Riester {fmtEUR(RIESTER_MAX)} including the <span data-privacy="blur">{fmtEUR(riester.zulagen)}</span> of allowances, so you pay <span data-privacy="blur">{fmtEUR(riester.own)}</span>.
+              Rürup {fmtEUR(RUERUP_CAP_2026)}, minus the statutory pension contributions you and your employer pay
+              {grossIncome > 0
+                ? <> (<span data-privacy="blur">{fmtEUR(RUERUP_CAP_2026 - rurupLimit)}</span> on your gross income), leaving <span data-privacy="blur">{fmtEUR(rurupLimit)}</span></>
+                : <> — enter your gross income in Your Profile to subtract them</>}.
+            </p>
+            <p>
+              Tax relief uses your marginal rate without solidarity surcharge or church tax. Rürup and Riester payouts are taxed in full later, so part of the relief is only a deferral.
               Only account types you already have are included; whatever is left goes to the brokerage account.
             </p>
           </Assumptions>

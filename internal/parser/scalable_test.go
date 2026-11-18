@@ -53,7 +53,7 @@ func TestScalableCapitalFullCSV(t *testing.T) {
 		{0, "buy", "IE00BK5BQT80", 10, 1200},
 		{1, "deposit", "", 0, 5000},
 		{2, "dividend", "IE00B4WXJJ64", 0, 50.25},
-		{3, "fee", "", 0, 12.50}, // TAX → fee
+		{3, "tax", "", 0, 12.50}, // TAX paid (negative) → tax; a positive TAX row is a refund (deposit)
 		{4, "interest", "", 0, 3.75},
 		{5, "withdrawal", "", 0, 500},
 		{6, "cash_transfer_out", "", 0, 1000},           // CASH_TRANSFER_OUT

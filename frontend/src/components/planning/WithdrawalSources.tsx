@@ -2,23 +2,25 @@ import { usePlanning } from './PlanningContext';
 import { Section, MetricCard, MetricGrid, NumberField, Chip, EmptyState } from '../ui';
 import { fmtEUR, fmtPct } from '../../utils/format';
 import { toNum } from './shared';
+import { accountTaxClass, type AccountTaxClass } from './planningMath';
+import { PRIVATE_PENSION_EARLIEST_AGE } from './constants';
 
 // German legal terms stay, with a plain-English lead.
-const TAX_LABELS: Record<string, string> = {
-  taxable: 'Flat-rate tax on gains (Abgeltungsteuer, 26,375 %)',
+const TAX_LABELS: Record<Exclude<AccountTaxClass, 'excluded'>, string> = {
+  capital: 'Flat-rate tax on the gain (Abgeltungsteuer, 26,375 %)',
+  private_sale: 'Tax-free once held for a year (crypto, gold)',
   bav: 'Income tax at your marginal rate',
   riester: 'Income tax at your marginal rate',
   rurup: 'Income tax on the taxable share (Besteuerungsanteil)',
-  savings: 'Tax-free',
+  cash: 'Tax-free',
 };
-const AVAILABILITY_AGE: Record<string, number> = {
-  taxable: 0, bav: 62, riester: 62, rurup: 62, savings: 0,
-};
+const LOCKED: AccountTaxClass[] = ['bav', 'riester', 'rurup'];
 
 // Projected per-account value at retirement, with tax-treatment label
-// and accessibility check (bAV/Riester/Rürup are locked until 62).
-// Brokerage accounts grow at one rate, everything else at another — both
-// editable here (defaults 7 % / 2 %) and shared with the Withdrawal Simulation.
+// and accessibility check (bAV/Riester/Rürup pay out from 62, checked
+// against the retirement age). Brokerage, crypto and gold grow at one rate,
+// everything else at another — both editable here (defaults 7 % / 2 %) and
+// shared with the Withdrawal Simulation. Loans and property are not sources.
 export default function WithdrawalSources() {
   const { accounts, pensionAge, pensionCurrentAge, growthBrokerage, setGrowthBrokerage, growthOther, setGrowthOther } = usePlanning();
   const retireAge = pensionAge;
@@ -28,20 +30,23 @@ export default function WithdrawalSources() {
   const otherGrowth = toNum(growthOther);
 
   const sources = accounts
-    .filter(a => a.is_active && (a.balance ?? 0) > 0)
+    .filter(a => a.is_active && (a.balance ?? 0) > 0 && accountTaxClass(a) !== 'excluded')
     .map(a => {
+      const cls = accountTaxClass(a) as Exclude<AccountTaxClass, 'excluded'>;
       const currentVal = a.balance ?? 0;
-      const growth = (a.type === 'brokerage' ? brokerageGrowth : otherGrowth) / 100;
+      const isBrokerage = cls === 'capital' || cls === 'private_sale';
+      const growth = (isBrokerage ? brokerageGrowth : otherGrowth) / 100;
       const projectedVal = currentVal * Math.pow(1 + growth, yearsToRetire);
-      const availableAge = AVAILABILITY_AGE[a.tax_treatment || 'taxable'] || 0;
+      const availableAge = LOCKED.includes(cls) ? PRIVATE_PENSION_EARLIEST_AGE : 0;
       return {
         id: a.id,
         name: a.name,
-        isBrokerage: a.type === 'brokerage',
-        taxLabel: TAX_LABELS[a.tax_treatment || 'taxable'] || 'Flat-rate tax on gains (Abgeltungsteuer)',
+        isBrokerage,
+        taxLabel: TAX_LABELS[cls],
         availableAge,
         projectedValue: Math.round(projectedVal),
-        isAccessible: currentAge >= availableAge,
+        // What matters is whether it is open when you stop working.
+        isAccessible: retireAge >= availableAge,
       };
     })
     .sort((a, b) => b.projectedValue - a.projectedValue);
@@ -68,7 +73,7 @@ export default function WithdrawalSources() {
           </div>
           <p className="mt-2 text-[13px] text-ink-muted">
             Assumes today’s balances grow at these rates for {yearsToRetire} {yearsToRetire === 1 ? 'year' : 'years'} with no further deposits.
-            Company, Riester and Rürup pensions are treated as locked until age 62.
+            Company, Riester and Rürup pensions pay out from age {PRIVATE_PENSION_EARLIEST_AGE} at the earliest.
           </p>
 
           <ul className="mt-4 border-t border-divider">
@@ -81,7 +86,7 @@ export default function WithdrawalSources() {
                   </p>
                   {!src.isAccessible && (
                     <Chip tone="warning" className="mt-1.5">
-                      Locked for {src.availableAge - currentAge} more {src.availableAge - currentAge === 1 ? 'year' : 'years'}
+                      Locked for {src.availableAge - retireAge} {src.availableAge - retireAge === 1 ? 'year' : 'years'} after you retire
                     </Chip>
                   )}
                 </div>

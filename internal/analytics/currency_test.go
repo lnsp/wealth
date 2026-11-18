@@ -159,13 +159,16 @@ func TestComputeCurrencyExposure_SortedByValueDesc(t *testing.T) {
 	}
 }
 
-func TestComputeCurrencyExposure_WeightNormalization(t *testing.T) {
-	// Country weights that don't sum to 100 should still work
+// Audit W9: partial country weights used to be scaled up to 100 %, so a fund
+// with only 50 % of its countries on record showed 60 % USD. The unlisted
+// half is now "Unknown".
+func TestComputeCurrencyExposure_PartialWeightsLeaveUnknown(t *testing.T) {
 	result := ComputeCurrencyExposure([]HoldingForCurrency{
 		{
 			ISIN:        "TEST",
 			Currency:    "EUR",
 			MarketValue: 10000,
+			IsFund:      true,
 			CountryWeights: map[string]float64{
 				"United States": 30,
 				"Japan":         20,
@@ -178,12 +181,56 @@ func TestComputeCurrencyExposure_WeightNormalization(t *testing.T) {
 		byCode[e.Currency] = e
 	}
 
-	// Weights sum to 50, so US = 30/50 = 60%, JP = 20/50 = 40%
-	if usd := byCode["USD"]; math.Abs(usd.Pct-60) > 0.5 {
-		t.Errorf("expected USD ~60%% after normalization, got %f%%", usd.Pct)
+	if usd := byCode["USD"]; math.Abs(usd.Pct-30) > 0.01 {
+		t.Errorf("expected USD 30%%, got %f%%", usd.Pct)
 	}
-	if jpy := byCode["JPY"]; math.Abs(jpy.Pct-40) > 0.5 {
-		t.Errorf("expected JPY ~40%% after normalization, got %f%%", jpy.Pct)
+	if jpy := byCode["JPY"]; math.Abs(jpy.Pct-20) > 0.01 {
+		t.Errorf("expected JPY 20%%, got %f%%", jpy.Pct)
+	}
+	if unk := byCode[CurrencyUnknown]; math.Abs(unk.Pct-50) > 0.01 {
+		t.Errorf("expected Unknown 50%%, got %f%%", unk.Pct)
+	}
+	if _, ok := byCode["EUR"]; ok {
+		t.Error("a fund's trading currency must not absorb the unlisted weight")
+	}
+}
+
+func TestComputeCurrencyExposure_RoundingAbove100IsNormalised(t *testing.T) {
+	result := ComputeCurrencyExposure([]HoldingForCurrency{
+		{ISIN: "TEST", Currency: "EUR", MarketValue: 1000, IsFund: true,
+			CountryWeights: map[string]float64{"United States": 70.2, "Japan": 30}},
+	})
+	sum := 0.0
+	for _, e := range result {
+		if e.Currency == CurrencyUnknown {
+			t.Errorf("no Unknown bucket expected for weights summing to 100.2, got %+v", e)
+		}
+		sum += e.Pct
+	}
+	if math.Abs(sum-100) > 1e-9 {
+		t.Errorf("percentages sum to %f, want 100", sum)
+	}
+}
+
+// Audit W9: an ETF without country data was counted 100 % in its trading
+// currency (a EUR-listed world ETF showed as all EUR).
+func TestComputeCurrencyExposure_FundWithoutCountriesIsUnknown(t *testing.T) {
+	result := ComputeCurrencyExposure([]HoldingForCurrency{
+		{ISIN: "IE00BK5BQT80", Currency: "EUR", MarketValue: 10000, IsFund: true},
+		{ISIN: "US02079K1079", Currency: "USD", MarketValue: 5000},
+	})
+	byCode := make(map[string]CurrencyExposureEntry)
+	for _, e := range result {
+		byCode[e.Currency] = e
+	}
+	if unk := byCode[CurrencyUnknown]; math.Abs(unk.Value-10000) > 0.01 {
+		t.Errorf("fund without countries: Unknown = %f, want 10000", unk.Value)
+	}
+	if usd := byCode["USD"]; math.Abs(usd.Value-5000) > 0.01 {
+		t.Errorf("stock: USD = %f, want 5000 (trading currency)", usd.Value)
+	}
+	if _, ok := byCode["EUR"]; ok {
+		t.Error("EUR must not appear: neither holding is exposed to EUR on record")
 	}
 }
 

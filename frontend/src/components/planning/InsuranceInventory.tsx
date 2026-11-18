@@ -6,6 +6,8 @@ import {
 } from '../ui';
 import { fmtEUR, fmtPct } from '../../utils/format';
 import { Assumptions, ItemCard, RemoveButton, readStored, writeStored } from './shared';
+import { parsePct } from './planningMath';
+import { DEFAULT_MARGINAL_RATE_PCT } from './constants';
 
 type Policy = { type: string; provider: string; annual_cost: number; coverage: number; renewal_date: string };
 
@@ -116,7 +118,7 @@ export default function InsuranceInventory() {
       {/* Coverage Analysis */}
       {insurancePolicies.length > 0 && (() => {
         const grossIncome = parseFloat(crGrossIncome) || 0;
-        const marginalRate = parseFloat(crMarginalRate) || 42;
+        const marginalRate = parsePct(crMarginalRate, DEFAULT_MARGINAL_RATE_PCT);
         const netIncome = grossIncome * (1 - marginalRate / 100);
 
         const gapRules: { type: string; label: string; need: number; unit: string; explanation: string }[] = [

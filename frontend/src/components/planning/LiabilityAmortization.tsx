@@ -4,17 +4,24 @@ import { usePlanning } from './PlanningContext';
 import { Section, SubHeading, MetricCard, MetricGrid, NumberField, LoadingState, ErrorState, EmptyState } from '../ui';
 import { fmtEUR, fmtPct, fmtNum, fmtMonth } from '../../utils/format';
 
-function estimateRemainingInterest(balance: number, annualRate: number, monthlyPayment: number): { interest: number; payoffLabel: string; interestOnly: boolean } {
+/**
+ * Interest until payoff at the current payment. After the fixed-rate period (`fixedMonths`),
+ * the follow-up rate applies when one is recorded.
+ */
+function estimateRemainingInterest(
+  balance: number, annualRate: number, monthlyPayment: number, fixedMonths?: number | null, followupRate?: number | null,
+): { interest: number; payoffLabel: string; interestOnly: boolean } {
   if (balance <= 0) return { interest: 0, payoffLabel: 'Paid off', interestOnly: false };
   const monthlyRate = annualRate / 12;
-  if (monthlyPayment <= balance * monthlyRate) {
-    return { interest: balance * annualRate * 25, payoffLabel: 'Never at this payment', interestOnly: true };
+  const rateAt = (m: number) => (followupRate != null && fixedMonths != null && m >= fixedMonths ? followupRate / 12 : monthlyRate);
+  if (monthlyPayment <= balance * Math.max(monthlyRate, rateAt(600))) {
+    return { interest: balance * Math.max(annualRate, followupRate ?? 0) * 25, payoffLabel: 'Never at this payment', interestOnly: true };
   }
   let rem = balance;
   let totalInt = 0;
   let months = 0;
   while (rem > 0.01 && months < 600) {
-    const intPart = rem * monthlyRate;
+    const intPart = rem * rateAt(months);
     const pay = Math.min(monthlyPayment, rem + intPart);
     totalInt += intPart;
     rem -= (pay - intPart);
@@ -73,7 +80,7 @@ export default function LiabilityAmortization() {
           const futureScheduleInterest = loan.yearly
             ? loan.yearly.filter(y => y.year >= currentYear).reduce((s, y) => s + y.interest, 0)
             : null;
-          const est = estimateRemainingInterest(loan.balance, loan.nominal_rate, loan.monthly_payment);
+          const est = estimateRemainingInterest(loan.balance, loan.nominal_rate, loan.monthly_payment, loan.months_left_fixed, loan.followup_rate);
           const fromSchedule = futureScheduleInterest != null && futureScheduleInterest > 0;
           const remainingInterest = fromSchedule ? futureScheduleInterest : est.interest;
           const payoffLabel = loan.payoff_date ? fmtMonth(loan.payoff_date) : est.payoffLabel;
@@ -94,7 +101,9 @@ export default function LiabilityAmortization() {
                     ? `From ${currentYear} on, per the loan’s repayment schedule`
                     : est.interestOnly
                       ? 'Over 25 years: the payment only covers interest'
-                      : 'At the current rate and payment until paid off'}
+                      : loan.followup_rate != null && loan.months_left_fixed != null
+                        ? `At the current payment; ${fmtPct(loan.followup_rate * 100, { digits: 2 })} after the fixed-rate period`
+                        : 'At the current rate and payment until paid off'}
                 />
                 <MetricCard
                   label="Paid off"

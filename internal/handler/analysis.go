@@ -18,16 +18,45 @@ import (
 	"github.com/lnsp/wealth/data"
 	"github.com/lnsp/wealth/internal/analytics"
 	"github.com/lnsp/wealth/internal/assets"
+	"github.com/lnsp/wealth/internal/cashflow"
 	db "github.com/lnsp/wealth/internal/database/generated"
 	"github.com/lnsp/wealth/internal/market"
 )
 
-// holdingKey returns a matching key for an ETF constituent holding.
+// holdingKey returns a matching key for an ETF constituent holding. Real
+// ISINs key by ISIN; synthetic IDs (empty, "SYNTH:" or legacy "XX_") key by
+// the normalised name, because older SYNTH rows hashed the ETF ISIN into the
+// ID and so differ per fund for the same company.
 func holdingKey(isin, name string) string {
-	if isin != "" && !strings.HasPrefix(isin, "XX_") {
+	if !market.IsSyntheticConstituentID(isin) {
 		return isin
 	}
-	return "name:" + strings.ToLower(strings.TrimSpace(name))
+	return "name:" + market.ConstituentNameKey(name)
+}
+
+// aggregateByISIN merges positions in the same security held in several
+// accounts into one row (values summed), so per-fund views list each fund
+// once and never compare a fund with itself.
+func aggregateByISIN(enriched []enrichedHolding) []enrichedHolding {
+	idx := make(map[string]int, len(enriched))
+	out := make([]enrichedHolding, 0, len(enriched))
+	for _, eh := range enriched {
+		if i, ok := idx[eh.security.ISIN]; ok {
+			out[i].value += eh.value
+			out[i].costValue += eh.costValue
+			continue
+		}
+		idx[eh.security.ISIN] = len(out)
+		out = append(out, eh)
+	}
+	return out
+}
+
+// isLookThroughFund reports whether a security is a fund whose constituents
+// may be on record: ETFs, other funds and bond funds (the metadata job
+// fetches fund data for all three).
+func isLookThroughFund(assetClass string) bool {
+	return assetClass == "etf" || assetClass == "fund" || assetClass == "bond"
 }
 
 type securityMap map[string]db.Security
@@ -152,10 +181,26 @@ func buildTaxTransactions(
 	return taxTxns, names, tfsMap, equityMap
 }
 
-// buildExternalFlowsForRisk loads portfolio-level external cashflows (+deposit/in-kind
-// contribution, -withdrawal, plus implicit cash clamp deltas) in EUR so risk and
-// volatility endpoints neutralize deposit/withdrawal jumps via BuildCashflowAdjustedSeries.
+// buildExternalFlowsForRisk loads external cashflows at total-net-worth scope
+// (+deposit/in-kind contribution, -withdrawal, plus implicit cash clamp deltas)
+// in EUR, for series of snapshot totals. Transactions linked to a tracked asset
+// or loan are skipped: at net-worth scope they swap cash for equity. The Risk
+// tab, volatility callout and benchmark replay measure the investable scope and
+// use buildInvestableFlowsForRisk instead.
 func (h *AnalysisHandler) buildExternalFlowsForRisk(ctx context.Context) []analytics.CashFlow {
+	return h.loadRiskFlows(ctx, false)
+}
+
+// buildInvestableFlowsForRisk loads the external cashflows of the investable
+// scope (cash + securities = snapshot cash_component + investment_component,
+// see investableRiskSeries). It is buildExternalFlowsForRisk plus every payment
+// to or from a tracked asset or loan, because that money leaves or enters the
+// scope.
+func (h *AnalysisHandler) buildInvestableFlowsForRisk(ctx context.Context) []analytics.CashFlow {
+	return h.loadRiskFlows(ctx, true)
+}
+
+func (h *AnalysisHandler) loadRiskFlows(ctx context.Context, investable bool) []analytics.CashFlow {
 	txns, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil || len(txns) == 0 {
 		return nil
@@ -163,11 +208,28 @@ func (h *AnalysisHandler) buildExternalFlowsForRisk(ctx context.Context) []analy
 	fxRates := loadFXRatesMap(ctx, h.queries)
 	histFX := loadHistoricalFXRates(ctx, h.queries)
 	accts, _ := h.queries.ListAccounts(ctx)
-	physHoldings, _ := assets.Load(ctx, h.queries)
-	linkedIDs := physHoldings.LinkedIDs()
+	var skip map[uuid.UUID]bool
+	if !investable {
+		physHoldings, _ := assets.Load(ctx, h.queries)
+		skip = physHoldings.LinkedIDs()
+	}
+	txnsChrono := make([]db.ListTransactionsRow, len(txns))
+	for i := range txns {
+		txnsChrono[i] = txns[len(txns)-1-i]
+	}
+	return externalRiskFlows(txnsChrono, accts, histFX, fxRates, skip)
+}
 
+// externalRiskFlows turns chronological transactions into external cashflows
+// in EUR: deposits and in-kind receipts (RSU vests, transfers from untracked
+// depots) at +value, withdrawals and unmatched outgoing depot transfers at
+// -value, plus implicit cash clamp deltas. Own-depot transfer pairs and the
+// transaction IDs in skip are left out. Amounts are taken as magnitudes and
+// the sign comes from the type, because some imports store withdrawals as
+// negative amounts.
+func externalRiskFlows(txnsChrono []db.ListTransactionsRow, accts []db.Account, histFX []market.HistoricalFXRate, fxRates map[string]float64, skip map[uuid.UUID]bool) []analytics.CashFlow {
 	var inkind []analytics.InKindTransfer
-	for _, t := range txns {
+	for _, t := range txnsChrono {
 		if t.SecurityISIN.Valid && (t.Type == "transfer" || t.Type == "transfer_out") {
 			inkind = append(inkind, analytics.InKindTransfer{
 				ID: t.ID, Date: t.Date, Type: t.Type,
@@ -177,10 +239,6 @@ func (h *AnalysisHandler) buildExternalFlowsForRisk(ctx context.Context) []analy
 	}
 	washed := analytics.MatchInKindTransferPairs(inkind)
 
-	txnsChrono := make([]db.ListTransactionsRow, len(txns))
-	for i := range txns {
-		txnsChrono[i] = txns[len(txns)-1-i]
-	}
 	impEvents := computeImplicitCashClampEvents(accts, txnsChrono, histFX, fxRates)
 
 	var flows []analytics.CashFlow
@@ -191,11 +249,21 @@ func (h *AnalysisHandler) buildExternalFlowsForRisk(ctx context.Context) []analy
 		if _, ok := washed[t.ID]; ok {
 			continue
 		}
-		if linkedIDs[t.ID] {
+		if skip[t.ID] {
 			continue
 		}
-		amt := convertAmountToEURAtDate(numericToFloat(t.Amount), t.Currency, t.Date, histFX, fxRates)
+		amt := math.Abs(convertAmountToEURAtDate(numericToFloat(t.Amount), t.Currency, t.Date, histFX, fxRates))
+		inKind := t.SecurityISIN.Valid && (t.Type == "transfer" || t.Type == "transfer_out")
+		if amt == 0 && inKind {
+			// In-kind move booked without a value: value it at quantity × price.
+			amt = math.Abs(convertAmountToEURAtDate(numericToFloat(t.Quantity)*numericToFloat(t.Price), t.Currency, t.Date, histFX, fxRates))
+		}
 		if amt == 0 {
+			continue
+		}
+		if inKind && t.Type == "transfer_out" {
+			// No matching receipt in another tracked depot: the shares leave.
+			flows = append(flows, analytics.CashFlow{Date: t.Date, Amount: -amt})
 			continue
 		}
 		switch analytics.ClassifyForAttribution(t.Type, t.SecurityISIN.Valid, analytics.ScopePortfolio) {
@@ -294,6 +362,10 @@ func (h *AnalysisHandler) loadEnrichedHoldings(ctx context.Context) ([]enrichedH
 // "Unknown" bucket so each allocation map sums to (essentially) the
 // portfolio's total invested value — the donuts then render the
 // unattributed slice instead of silently understating the rest.
+//
+// Single stocks have no sector source (justETF covers funds only), so their
+// sector stays "Unknown"; their country is taken from the ISIN prefix (the
+// issuer's country) unless the security is a depositary receipt.
 func (h *AnalysisHandler) HandleAllocationSummary(w http.ResponseWriter, r *http.Request) {
 	enriched, err := h.loadEnrichedHoldings(r.Context())
 	if err != nil {
@@ -323,6 +395,11 @@ func (h *AnalysisHandler) HandleAllocationSummary(w http.ResponseWriter, r *http
 		}
 
 		countryWeights := analytics.ParseWeights(eh.security.CountryWeights)
+		if len(countryWeights) == 0 && eh.security.AssetClass == "stock" {
+			if country := stockCountryFromISIN(eh.security.ISIN, eh.security.Name); country != "" {
+				countryWeights = map[string]float64{country: 100}
+			}
+		}
 		countrySum := 0.0
 		for country, pct := range countryWeights {
 			countries[country] += eh.value * pct / 100
@@ -335,6 +412,7 @@ func (h *AnalysisHandler) HandleAllocationSummary(w http.ResponseWriter, r *http
 		currencyHoldings = append(currencyHoldings, analytics.HoldingForCurrency{
 			ISIN: eh.security.ISIN, Currency: eh.security.Currency,
 			MarketValue: eh.value, CountryWeights: countryWeights,
+			IsFund: isLookThroughFund(eh.security.AssetClass),
 		})
 	}
 
@@ -348,6 +426,43 @@ func (h *AnalysisHandler) HandleAllocationSummary(w http.ResponseWriter, r *http
 		"countries":  countries,
 		"currencies": currencies,
 	})
+}
+
+// isinCountries maps ISIN country prefixes to the country names justETF
+// uses (and analytics.CountryToCurrency understands). Offshore domiciles
+// (KY, BM, JE, VG, ...) are left out on purpose: they say little about where
+// the business is, so those stocks stay "Unknown".
+var isinCountries = map[string]string{
+	"US": "United States", "CA": "Canada", "MX": "Mexico", "BR": "Brazil",
+	"DE": "Germany", "FR": "France", "NL": "Netherlands", "IT": "Italy",
+	"ES": "Spain", "BE": "Belgium", "AT": "Austria", "FI": "Finland",
+	"IE": "Ireland", "PT": "Portugal", "LU": "Luxembourg", "GR": "Greece",
+	"GB": "United Kingdom", "CH": "Switzerland", "SE": "Sweden",
+	"DK": "Denmark", "NO": "Norway", "PL": "Poland", "JP": "Japan",
+	"CN": "China", "HK": "Hong Kong", "TW": "Taiwan", "KR": "South Korea",
+	"IN": "India", "SG": "Singapore", "AU": "Australia", "NZ": "New Zealand",
+	"IL": "Israel", "ZA": "South Africa",
+}
+
+// stockCountryFromISIN returns the issuer country of a directly held share
+// from its ISIN prefix, or "" when unknown: synthetic IDs, offshore
+// domiciles, and depositary receipts (an ADR's US ISIN says nothing about
+// the company behind it).
+func stockCountryFromISIN(isin, name string) string {
+	if len(isin) != 12 {
+		return ""
+	}
+	tokens := strings.FieldsFunc(strings.ToUpper(name), func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9')
+	})
+	for _, tok := range tokens {
+		switch {
+		case tok == "ADR" || tok == "ADRS" || tok == "ADS" || tok == "GDR" || tok == "GDRS",
+			strings.HasPrefix(tok, "DEPOSITAR"), strings.HasPrefix(tok, "DEPOSITOR"):
+			return ""
+		}
+	}
+	return isinCountries[strings.ToUpper(isin[:2])]
 }
 
 func (h *AnalysisHandler) HandleSectors(w http.ResponseWriter, r *http.Request) {
@@ -441,8 +556,8 @@ func (h *AnalysisHandler) HandleETFHoldings(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if sec.AssetClass != "etf" {
-		writeError(w, http.StatusBadRequest, "security is not an ETF")
+	if !isLookThroughFund(sec.AssetClass) {
+		writeError(w, http.StatusBadRequest, "security is not a fund")
 		return
 	}
 
@@ -461,6 +576,7 @@ func (h *AnalysisHandler) HandleETFHoldings(w http.ResponseWriter, r *http.Reque
 	}
 
 	holdings := make([]holdingEntry, 0, len(etfHoldings))
+	coverage := 0.0
 	for _, eh := range etfHoldings {
 		weight := 0.0
 		if eh.WeightPct.Valid {
@@ -472,12 +588,17 @@ func (h *AnalysisHandler) HandleETFHoldings(w http.ResponseWriter, r *http.Reque
 			Name:   eh.HoldingName,
 			Weight: weight,
 		}
+		// Synthetic IDs ("SYNTH:<hash>", legacy "XX_") are not ISINs.
+		if market.IsSyntheticConstituentID(entry.ISIN) {
+			entry.ISIN = ""
+		}
 		if eh.Sector.Valid {
 			entry.Sector = eh.Sector.String
 		}
 		if eh.Country.Valid {
 			entry.Country = eh.Country.String
 		}
+		coverage += weight
 		holdings = append(holdings, entry)
 	}
 
@@ -485,9 +606,18 @@ func (h *AnalysisHandler) HandleETFHoldings(w http.ResponseWriter, r *http.Reque
 		"etf_isin": sec.ISIN,
 		"etf_name": sec.Name,
 		"holdings": holdings,
+		// Share of the fund the listed constituents represent (justETF lists
+		// the top 10 only).
+		"coverage_pct": math.Round(coverage*100) / 100,
 	})
 }
 
+// HandleTreemap returns the portfolio → fund → (sector →) company treemap.
+// Each fund node carries its full market value; the part not covered by its
+// listed constituents is a "Rest of fund" tile. justETF's constituent table
+// has no sector column, so the sector level is used only when every listed
+// constituent has a sector on record; otherwise constituents hang directly
+// under the fund instead of all landing in "Other".
 func (h *AnalysisHandler) HandleTreemap(w http.ResponseWriter, r *http.Request) {
 	enriched, err := h.loadEnrichedHoldings(r.Context())
 	if err != nil {
@@ -496,54 +626,63 @@ func (h *AnalysisHandler) HandleTreemap(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var etfs []analytics.ETFForTreemap
-	for _, eh := range enriched {
+	for _, eh := range aggregateByISIN(enriched) {
 		if eh.value <= 0 {
 			continue
 		}
-
-		if eh.security.AssetClass != "etf" {
-			etfs = append(etfs, analytics.ETFForTreemap{
-				Name:        eh.security.Name,
-				MarketValue: eh.value,
-			})
+		leaf := analytics.ETFForTreemap{Name: eh.security.Name, MarketValue: eh.value}
+		if !isLookThroughFund(eh.security.AssetClass) {
+			etfs = append(etfs, leaf)
 			continue
 		}
 
 		etfHoldings, err := h.queries.ListETFHoldings(r.Context(), eh.security.ISIN)
 		if err != nil || len(etfHoldings) == 0 {
-			etfs = append(etfs, analytics.ETFForTreemap{
-				Name:        eh.security.Name,
-				MarketValue: eh.value,
-			})
+			etfs = append(etfs, leaf)
 			continue
 		}
 
-		bySector := make(map[string][]analytics.TreemapNode)
+		type constituent struct {
+			name, sector string
+			value        float64
+		}
+		var order []string
+		byKey := make(map[string]*constituent)
+		allHaveSector := true
 		for _, etfH := range etfHoldings {
-			weight := 0.0
-			if etfH.WeightPct.Valid {
-				f, _ := etfH.WeightPct.Float64Value()
-				weight = f.Float64
-			}
+			weight := numericToFloat(etfH.WeightPct)
 			if weight <= 0 {
 				continue
 			}
-			hValue := eh.value * weight / 100
-			sector := "Other"
-			if etfH.Sector.Valid && etfH.Sector.String != "" {
-				sector = etfH.Sector.String
+			key := holdingKey(etfH.HoldingISIN, etfH.HoldingName)
+			c, ok := byKey[key]
+			if !ok {
+				c = &constituent{name: etfH.HoldingName}
+				byKey[key] = c
+				order = append(order, key)
 			}
-			bySector[sector] = append(bySector[sector], analytics.TreemapNode{
-				Name:  etfH.HoldingName,
-				Value: hValue,
-			})
+			c.value += eh.value * weight / 100
+			if etfH.Sector.Valid && strings.TrimSpace(etfH.Sector.String) != "" {
+				c.sector = etfH.Sector.String
+			} else if c.sector == "" {
+				allHaveSector = false
+			}
 		}
 
-		etfs = append(etfs, analytics.ETFForTreemap{
-			Name:             eh.security.Name,
-			MarketValue:      eh.value,
-			HoldingsBySector: bySector,
-		})
+		item := leaf
+		for _, key := range order {
+			c := byKey[key]
+			node := analytics.TreemapNode{Name: c.name, Value: c.value}
+			if allHaveSector {
+				if item.HoldingsBySector == nil {
+					item.HoldingsBySector = make(map[string][]analytics.TreemapNode)
+				}
+				item.HoldingsBySector[c.sector] = append(item.HoldingsBySector[c.sector], node)
+			} else {
+				item.Constituents = append(item.Constituents, node)
+			}
+		}
+		etfs = append(etfs, item)
 	}
 
 	tree := analytics.BuildAllocationTreemap(etfs)
@@ -553,42 +692,102 @@ func (h *AnalysisHandler) HandleTreemap(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"children": tree})
 }
 
+// constituentSet is one fund's stored constituents keyed for matching.
+type constituentSet struct {
+	weights  map[string]float64 // holdingKey -> weight % of the fund
+	names    map[string]string  // holdingKey -> display name
+	coverage float64            // sum of the listed weights, % of the fund
+	count    int                // number of listed constituents
+}
+
+// loadConstituents reads a fund's stored constituents. directByName maps a
+// directly held stock's ConstituentNameKey to its ISIN, so a name-keyed
+// constituent of the same company merges with the direct position.
+func (h *AnalysisHandler) loadConstituents(ctx context.Context, isin string, directByName map[string]string) (constituentSet, error) {
+	rows, err := h.queries.ListETFHoldings(ctx, isin)
+	if err != nil {
+		return constituentSet{}, err
+	}
+	set := constituentSet{weights: map[string]float64{}, names: map[string]string{}}
+	for _, row := range rows {
+		weight := numericToFloat(row.WeightPct)
+		if weight <= 0 {
+			continue
+		}
+		key := holdingKey(row.HoldingISIN, row.HoldingName)
+		if strings.HasPrefix(key, "name:") {
+			if direct, ok := directByName[strings.TrimPrefix(key, "name:")]; ok {
+				key = direct
+			}
+		}
+		set.weights[key] += weight
+		if _, ok := set.names[key]; !ok {
+			set.names[key] = row.HoldingName
+		}
+		set.coverage += weight
+		set.count++
+	}
+	return set, nil
+}
+
+// HandleTopHoldings ranks the companies with the largest share of the whole
+// portfolio: direct stocks at 100 % of their value plus each fund's listed
+// constituents (justETF lists the top 10) weighted by the fund's value. The
+// denominator is the total value of all positions, so funds without
+// constituent data dilute the shares rather than being ignored.
 func (h *AnalysisHandler) HandleTopHoldings(w http.ResponseWriter, r *http.Request) {
 	enriched, err := h.loadEnrichedHoldings(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "load holdings: "+err.Error())
 		return
 	}
+	positions := aggregateByISIN(enriched)
 
-	var holdingsWithETF []analytics.HoldingWithETF
-	holdingNames := make(map[string]string)
-
-	for _, eh := range enriched {
-		if eh.security.AssetClass != "etf" {
+	totalValue := 0.0
+	directByName := make(map[string]string)
+	for _, eh := range positions {
+		if eh.value <= 0 {
 			continue
 		}
-		etfHoldings, err := h.queries.ListETFHoldings(r.Context(), eh.security.ISIN)
-		if err != nil || len(etfHoldings) == 0 {
-			continue
+		totalValue += eh.value
+		if eh.security.AssetClass == "stock" {
+			directByName[market.ConstituentNameKey(eh.security.Name)] = eh.security.ISIN
 		}
-		weights := make(map[string]float64)
-		for _, etfH := range etfHoldings {
-			if etfH.WeightPct.Valid {
-				f, _ := etfH.WeightPct.Float64Value()
-				key := holdingKey(etfH.HoldingISIN, etfH.HoldingName)
-				weights[key] += f.Float64
-			}
-			holdingNames[holdingKey(etfH.HoldingISIN, etfH.HoldingName)] = etfH.HoldingName
-		}
-		holdingsWithETF = append(holdingsWithETF, analytics.HoldingWithETF{
-			ISIN:        eh.security.ISIN,
-			Name:        eh.security.Name,
-			MarketValue: eh.value,
-			ETFHoldings: weights,
-		})
 	}
 
-	exposure := analytics.ComputeEffectiveExposure(holdingsWithETF)
+	var inputs []analytics.HoldingWithETF
+	holdingNames := make(map[string]string)
+	lookedThrough := 0.0 // portfolio value attributed to named companies
+	for _, eh := range positions {
+		if eh.value <= 0 {
+			continue
+		}
+		if eh.security.AssetClass == "stock" {
+			inputs = append(inputs, analytics.HoldingWithETF{ISIN: eh.security.ISIN, Name: eh.security.Name, MarketValue: eh.value})
+			holdingNames[eh.security.ISIN] = eh.security.Name
+			lookedThrough += eh.value
+			continue
+		}
+		if !isLookThroughFund(eh.security.AssetClass) {
+			continue
+		}
+		set, err := h.loadConstituents(r.Context(), eh.security.ISIN, directByName)
+		if err != nil || len(set.weights) == 0 {
+			continue
+		}
+		for key, name := range set.names {
+			if _, ok := holdingNames[key]; !ok {
+				holdingNames[key] = name
+			}
+		}
+		inputs = append(inputs, analytics.HoldingWithETF{
+			ISIN: eh.security.ISIN, Name: eh.security.Name,
+			MarketValue: eh.value, ETFHoldings: set.weights,
+		})
+		lookedThrough += eh.value * math.Min(set.coverage, 100) / 100
+	}
+
+	exposure := analytics.ComputeLookThroughExposure(inputs, totalValue)
 
 	type topHolding struct {
 		ISIN        string  `json:"isin"`
@@ -597,21 +796,36 @@ func (h *AnalysisHandler) HandleTopHoldings(w http.ResponseWriter, r *http.Reque
 	}
 
 	sorted := make([]topHolding, 0, len(exposure))
-	for isin, pct := range exposure {
-		name := isin
-		if n, ok := holdingNames[isin]; ok && n != "" {
+	for key, pct := range exposure {
+		name := key
+		if n, ok := holdingNames[key]; ok && n != "" {
 			name = n
+		}
+		isin := key
+		if strings.HasPrefix(key, "name:") {
+			isin = ""
 		}
 		sorted = append(sorted, topHolding{ISIN: isin, Name: name, ExposurePct: pct * 100})
 	}
 	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].ExposurePct > sorted[j].ExposurePct
+		if sorted[i].ExposurePct != sorted[j].ExposurePct {
+			return sorted[i].ExposurePct > sorted[j].ExposurePct
+		}
+		return sorted[i].Name < sorted[j].Name
 	})
 	if len(sorted) > 20 {
 		sorted = sorted[:20]
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"holdings": sorted})
+	coveragePct := 0.0
+	if totalValue > 0 {
+		coveragePct = lookedThrough / totalValue * 100
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"holdings":     sorted,
+		"total_value":  math.Round(totalValue*100) / 100,
+		"coverage_pct": math.Round(coveragePct*10) / 10,
+	})
 }
 
 func (h *AnalysisHandler) HandleAlerts(w http.ResponseWriter, r *http.Request) {
@@ -622,12 +836,15 @@ func (h *AnalysisHandler) HandleAlerts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var etfs []analytics.ETFWithHoldings
-	var holdingsWithETF []analytics.HoldingWithETF
 	holdingNames := make(map[string]string)
+	constituents := make(map[string]map[string]float64)
 
 	for _, eh := range enriched {
 		if eh.security.AssetClass != "etf" {
 			continue
+		}
+		if _, done := constituents[eh.security.ISIN]; done {
+			continue // same ETF held in another account
 		}
 		etfHoldings, err := h.queries.ListETFHoldings(r.Context(), eh.security.ISIN)
 		if err != nil || len(etfHoldings) == 0 {
@@ -642,18 +859,14 @@ func (h *AnalysisHandler) HandleAlerts(w http.ResponseWriter, r *http.Request) {
 			}
 			holdingNames[holdingKey(etfH.HoldingISIN, etfH.HoldingName)] = etfH.HoldingName
 		}
+		constituents[eh.security.ISIN] = weights
 		etfs = append(etfs, analytics.ETFWithHoldings{
 			ISIN:     eh.security.ISIN,
 			Name:     eh.security.Name,
 			Holdings: weights,
 		})
-		holdingsWithETF = append(holdingsWithETF, analytics.HoldingWithETF{
-			ISIN:        eh.security.ISIN,
-			Name:        eh.security.Name,
-			MarketValue: eh.value,
-			ETFHoldings: weights,
-		})
 	}
+	holdingsWithETF := concentrationExposureInputs(enriched, constituents, holdingNames)
 
 	alerts := analytics.ComputeConcentrationAlertsWithThresholds(
 		etfs, holdingsWithETF, holdingNames, h.overlapWarnPct, h.concentrationWarnPct,
@@ -665,6 +878,43 @@ func (h *AnalysisHandler) HandleAlerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"alerts": alerts})
 }
 
+// concentrationExposureInputs builds the look-through input for single-name
+// concentration from every security held, so exposure is a share of the
+// total securities value rather than of the ETF sleeve: ETFs with constituent
+// data look through to their constituents, directly held stocks and other
+// single assets count 100 % towards themselves (keyed like an ETF constituent,
+// so a stock held directly and inside an ETF adds up), and funds without
+// constituent data still count in the denominator.
+func concentrationExposureInputs(enriched []enrichedHolding, constituents map[string]map[string]float64, names map[string]string) []analytics.HoldingWithETF {
+	out := make([]analytics.HoldingWithETF, 0, len(enriched))
+	for _, eh := range enriched {
+		if eh.value <= 0 {
+			continue
+		}
+		weights := constituents[eh.security.ISIN]
+		if eh.security.AssetClass != "etf" && eh.security.AssetClass != "fund" {
+			key := holdingKey(eh.security.ISIN, eh.security.Name)
+			weights = map[string]float64{key: 100}
+			if names != nil && names[key] == "" {
+				names[key] = eh.security.Name
+			}
+		}
+		out = append(out, analytics.HoldingWithETF{
+			ISIN:        eh.security.ISIN,
+			Name:        eh.security.Name,
+			MarketValue: eh.value,
+			ETFHoldings: weights,
+		})
+	}
+	return out
+}
+
+// HandleOverlap returns the pairwise overlap of the funds held, one row per
+// fund ISIN. The stored constituents are justETF's top holdings only (about
+// 10 per fund), so each cell is a lower bound on the true overlap: it counts
+// only companies listed for both funds. coverage[i] is the share of fund i
+// that its listed constituents represent; the frontend shows it next to the
+// matrix so a low value reads as "partial data", not "little overlap".
 func (h *AnalysisHandler) HandleOverlap(w http.ResponseWriter, r *http.Request) {
 	enriched, err := h.loadEnrichedHoldings(r.Context())
 	if err != nil {
@@ -673,220 +923,225 @@ func (h *AnalysisHandler) HandleOverlap(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var etfs []analytics.ETFWithHoldings
-	var labels []string
-	for _, eh := range enriched {
-		if eh.security.AssetClass != "etf" {
+	labels := []string{}
+	isins := []string{}
+	coverage := []float64{}
+	counts := []int{}
+	for _, eh := range aggregateByISIN(enriched) {
+		if !isLookThroughFund(eh.security.AssetClass) {
 			continue
 		}
-		etfHoldings, err := h.queries.ListETFHoldings(r.Context(), eh.security.ISIN)
-		if err != nil || len(etfHoldings) == 0 {
+		set, err := h.loadConstituents(r.Context(), eh.security.ISIN, nil)
+		if err != nil || len(set.weights) == 0 {
 			continue
 		}
-		weights := make(map[string]float64)
-		for _, etfH := range etfHoldings {
-			if etfH.WeightPct.Valid {
-				f, _ := etfH.WeightPct.Float64Value()
-				key := holdingKey(etfH.HoldingISIN, etfH.HoldingName)
-				weights[key] += f.Float64
-			}
-		}
-		etfs = append(etfs, analytics.ETFWithHoldings{ISIN: eh.security.ISIN, Name: eh.security.Name, Holdings: weights})
+		etfs = append(etfs, analytics.ETFWithHoldings{ISIN: eh.security.ISIN, Name: eh.security.Name, Holdings: set.weights})
 		labels = append(labels, eh.security.Name)
+		isins = append(isins, eh.security.ISIN)
+		coverage = append(coverage, math.Round(math.Min(set.coverage, 100)*10)/10)
+		counts = append(counts, set.count)
 	}
 
 	// Build overlap matrix via the shared helper — same symmetry + diagonal
 	// guarantees the unit tests in internal/analytics/decomposition_test.go
 	// already cover.
 	if len(etfs) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"labels": []string{}, "matrix": [][]float64{}})
+		writeJSON(w, http.StatusOK, map[string]any{"labels": []string{}, "matrix": [][]float64{}, "isins": []string{}, "coverage": []float64{}, "constituent_counts": []int{}})
 		return
 	}
 	matrix := analytics.BuildOverlapMatrix(etfs)
+	for i := range matrix {
+		for j := range matrix[i] {
+			matrix[i][j] = math.Round(matrix[i][j]*100) / 100
+		}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"labels": labels,
-		"matrix": matrix,
+		"labels":             labels,
+		"isins":              isins,
+		"matrix":             matrix,
+		"coverage":           coverage,
+		"constituent_counts": counts,
 	})
 }
 
+// sectorHistoryTxn is one security transaction for the sector-drift replay.
+type sectorHistoryTxn struct {
+	Date    time.Time
+	Type    string
+	ISIN    string
+	Qty     float64 // units, positive
+	CostEUR float64 // EUR amount at the trade date, positive
+}
+
+// sectorSnapshot is one point of the sector-drift series: sector → % of the
+// portfolio's market value at Date.
+type sectorSnapshot struct {
+	Date    string             `json:"date"`
+	Sectors map[string]float64 `json:"sectors"`
+}
+
+// buildSectorHistory replays security transactions and values the holdings
+// at every month-end from the first trade's month to now (the current,
+// partial month is valued at now). Each position is valued at
+// priceEUR(isin, monthEnd), the last close on or before that date converted
+// at that date's FX; positions without a price fall back to their running
+// EUR cost basis. The share of a position not covered by its sector weights
+// goes to "Unknown", so every point sums to 100 %. Months with no holdings
+// are emitted with no sectors, so the series has no gaps.
+func buildSectorHistory(txns []sectorHistoryTxn, now time.Time, priceEUR func(isin string, at time.Time) (float64, bool), sectorWeights map[string]map[string]float64) []sectorSnapshot {
+	snapshots := []sectorSnapshot{}
+	if len(txns) == 0 {
+		return snapshots
+	}
+	type position struct{ qty, cost float64 }
+	positions := make(map[string]*position)
+	apply := func(t sectorHistoryTxn) {
+		p := positions[t.ISIN]
+		switch t.Type {
+		case "buy", "savings_plan", "transfer":
+			if p == nil {
+				p = &position{}
+				positions[t.ISIN] = p
+			}
+			p.qty += t.Qty
+			p.cost += t.CostEUR
+		case "sell", "transfer_out":
+			if p == nil || p.qty <= 0 {
+				return
+			}
+			sold := math.Min(t.Qty, p.qty)
+			p.cost -= p.cost / p.qty * sold
+			p.qty -= sold
+			if p.qty <= 1e-9 {
+				delete(positions, t.ISIN)
+			}
+		}
+	}
+
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	first := txns[0].Date
+	month := time.Date(first.Year(), first.Month(), 1, 0, 0, 0, 0, time.UTC)
+	next := 0
+	for !month.After(today) {
+		end := time.Date(month.Year(), month.Month()+1, 0, 0, 0, 0, 0, time.UTC)
+		if end.After(today) {
+			end = today
+		}
+		for next < len(txns) && !txns[next].Date.After(end) {
+			apply(txns[next])
+			next++
+		}
+
+		values := make(map[string]float64, len(positions))
+		total := 0.0
+		for isin, p := range positions {
+			if p.qty <= 1e-9 {
+				continue
+			}
+			v := p.cost
+			if price, ok := priceEUR(isin, end); ok && price > 0 {
+				v = p.qty * price
+			}
+			if v <= 0 {
+				continue
+			}
+			values[isin] = v
+			total += v
+		}
+		sectors := make(map[string]float64)
+		if total > 0 {
+			for isin, v := range values {
+				weight := v / total
+				covered := 0.0
+				for sector, pct := range sectorWeights[isin] {
+					if pct <= 0 {
+						continue
+					}
+					sectors[sector] += weight * pct
+					covered += pct
+				}
+				if covered < 100 {
+					sectors["Unknown"] += weight * (100 - covered)
+				}
+			}
+		}
+		snapshots = append(snapshots, sectorSnapshot{Date: end.Format("2006-01-02"), Sectors: sectors})
+		month = addMonthsFirstOfMonth(month, 1)
+	}
+	return snapshots
+}
+
 // HandleSectorHistory computes historical sector allocation by replaying the
-// transaction log and applying each security's sector weights at monthly intervals.
+// transaction log and valuing the holdings at market prices at every
+// month-end up to today (see buildSectorHistory).
 func (h *AnalysisHandler) HandleSectorHistory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	txns, err := listAllTransactionsRows(ctx, h.queries)
+	rows, err := listAllTransactionsRows(ctx, h.queries)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
-		return
-	}
-	if len(txns) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"history": []any{}, "sectors": []string{}})
 		return
 	}
 
 	fxRates := loadFXRatesMap(ctx, h.queries)
 	histFX := loadHistoricalFXRates(ctx, h.queries)
 
-	// Sort chronologically (ListAllTransactions returns DESC)
-	for i, j := 0, len(txns)-1; i < j; i, j = i+1, j-1 {
-		txns[i], txns[j] = txns[j], txns[i]
-	}
-
-	// Cache sector weights per ISIN
-	sectorCache := make(map[string]map[string]float64)
-	getSectorWeights := func(isin string) map[string]float64 {
-		if w, ok := sectorCache[isin]; ok {
-			return w
+	// Chronological security transactions (ListAllTransactions returns DESC).
+	var txns []sectorHistoryTxn
+	for i := len(rows) - 1; i >= 0; i-- {
+		txn := rows[i]
+		if !txn.SecurityISIN.Valid || txn.SecurityISIN.String == "" {
+			continue
 		}
-		sec, err := h.queries.GetSecurity(ctx, isin)
-		if err != nil {
-			sectorCache[isin] = nil
-			return nil
+		switch txn.Type {
+		case "buy", "savings_plan", "transfer", "sell", "transfer_out":
+		default:
+			continue
 		}
-		w := analytics.ParseWeights(sec.SectorWeights)
-		sectorCache[isin] = w
-		return w
-	}
-
-	type holdingState struct {
-		quantity  float64
-		totalCost float64
-	}
-	holdings := make(map[string]*holdingState)
-
-	type sectorSnapshot struct {
-		Date    string             `json:"date"`
-		Sectors map[string]float64 `json:"sectors"`
-	}
-	snapshots := []sectorSnapshot{}
-
-	// Emit a snapshot of sector allocation from current holdings state
-	emitSnapshot := func(date string) {
-		totalValue := 0.0
-		isinValues := make(map[string]float64)
-		for isin, hs := range holdings {
-			if hs.quantity <= 1e-9 {
-				continue
-			}
-			val := hs.totalCost // use EUR cost basis for historical
-			isinValues[isin] = val
-			totalValue += val
+		qty := math.Abs(numericToFloat(txn.Quantity))
+		if qty <= 0 {
+			continue
 		}
-		if totalValue <= 0 {
-			return
-		}
-
-		sectorExposure := make(map[string]float64)
-		for isin, val := range isinValues {
-			weight := val / totalValue
-			sw := getSectorWeights(isin)
-			for sector, pct := range sw {
-				sectorExposure[sector] += weight * pct
-			}
-		}
-		snapshots = append(snapshots, sectorSnapshot{
-			Date:    date,
-			Sectors: sectorExposure,
+		txns = append(txns, sectorHistoryTxn{
+			Date:    txn.Date,
+			Type:    txn.Type,
+			ISIN:    txn.SecurityISIN.String,
+			Qty:     qty,
+			CostEUR: math.Abs(convertAmountToEURAtDate(numericToFloat(txn.Amount), txn.Currency, txn.Date, histFX, fxRates)),
 		})
 	}
+	if len(txns) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"history": []any{}, "sectors": []string{}})
+		return
+	}
 
-	lastMonth := ""
-	for _, txn := range txns {
-		amt := convertAmountToEURAtDate(numericToFloat(txn.Amount), txn.Currency, txn.Date, histFX, fxRates)
-		qty := numericToFloat(txn.Quantity)
-		isin := ""
-		if txn.SecurityISIN.Valid {
-			isin = txn.SecurityISIN.String
-		}
-
-		month := txn.Date.Format("2006-01")
-		if month != lastMonth && lastMonth != "" {
-			emitSnapshot(lastMonth + "-01")
-		}
-		lastMonth = month
-
-		switch txn.Type {
-		case "buy", "savings_plan":
-			if isin != "" {
-				hs, ok := holdings[isin]
-				if !ok {
-					hs = &holdingState{}
-					holdings[isin] = hs
-				}
-				hs.quantity += qty
-				hs.totalCost += amt
-			}
-		case "sell":
-			if isin != "" {
-				hs, ok := holdings[isin]
-				if ok && hs.quantity > 0 {
-					costPerUnit := hs.totalCost / hs.quantity
-					hs.quantity -= qty
-					hs.totalCost -= costPerUnit * qty
-					if hs.quantity <= 1e-9 {
-						delete(holdings, isin)
-					}
-				}
-			}
-		case "transfer":
-			if isin != "" {
-				hs, ok := holdings[isin]
-				if !ok {
-					hs = &holdingState{}
-					holdings[isin] = hs
-				}
-				hs.quantity += qty
-				hs.totalCost += amt
-			}
-		case "transfer_out":
-			if isin != "" {
-				hs, ok := holdings[isin]
-				if ok && hs.quantity > 0 {
-					costPerUnit := hs.totalCost / hs.quantity
-					hs.quantity -= qty
-					hs.totalCost -= costPerUnit * qty
-					if hs.quantity <= 1e-9 {
-						delete(holdings, isin)
-					}
-				}
-			}
+	sectorWeights := make(map[string]map[string]float64)
+	if secs, err := h.queries.ListSecurities(ctx); err == nil {
+		for _, s := range secs {
+			sectorWeights[s.ISIN] = analytics.ParseWeights(s.SectorWeights)
 		}
 	}
 
-	// Final snapshot using EUR market prices where available
-	if lastMonth != "" {
-		totalValue := 0.0
-		isinValues := make(map[string]float64)
-		for isin, hs := range holdings {
-			if hs.quantity <= 1e-9 {
-				continue
-			}
-			val := hs.totalCost
-			if price, err := h.queries.GetLatestPrice(ctx, isin); err == nil && price.Close.Valid {
-				f, _ := price.Close.Float64Value()
-				eurPrice := convertAmountToEUR(f.Float64, price.Currency, fxRates)
-				if eurPrice > 0 {
-					val = hs.quantity * eurPrice
-				}
-			}
-			isinValues[isin] = val
-			totalValue += val
+	// Price history per ISIN, loaded once (ASC by date).
+	priceCache := make(map[string][]db.ListPriceHistoryRow)
+	priceEUR := func(isin string, at time.Time) (float64, bool) {
+		hist, ok := priceCache[isin]
+		if !ok {
+			hist, _ = h.queries.ListPriceHistory(ctx, isin)
+			priceCache[isin] = hist
 		}
-		if totalValue > 0 {
-			sectorExposure := make(map[string]float64)
-			for isin, val := range isinValues {
-				weight := val / totalValue
-				sw := getSectorWeights(isin)
-				for sector, pct := range sw {
-					sectorExposure[sector] += weight * pct
-				}
+		// Last close on or before `at`.
+		i := sort.Search(len(hist), func(i int) bool { return hist[i].Date.After(at) }) - 1
+		for ; i >= 0; i-- {
+			if close := numericToFloat(hist[i].Close); close > 0 {
+				return convertAmountToEURAtDate(close, hist[i].Currency, at, histFX, fxRates), true
 			}
-			snapshots = append(snapshots, sectorSnapshot{
-				Date:    lastMonth + "-01",
-				Sectors: sectorExposure,
-			})
 		}
+		return 0, false
 	}
+
+	snapshots := buildSectorHistory(txns, time.Now(), priceEUR, sectorWeights)
 
 	// Collect all sector names across all snapshots
 	sectorSet := make(map[string]bool)
@@ -907,7 +1162,10 @@ func (h *AnalysisHandler) HandleSectorHistory(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// HandleRisk computes portfolio risk metrics from cashflow-adjusted daily net worth snapshots.
+// HandleRisk computes portfolio risk metrics from the cashflow-adjusted daily
+// value of cash and securities (the investable scope). Property, vehicles and
+// the loans on them are left out: buying a flat or a car, or a new appraisal,
+// is not a market return.
 func (h *AnalysisHandler) HandleRisk(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -916,65 +1174,38 @@ func (h *AnalysisHandler) HandleRisk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "list snapshots: "+err.Error())
 		return
 	}
-	if len(snaps) < 2 {
-		writeJSON(w, http.StatusOK, map[string]any{"risk": analytics.RiskMetrics{}})
-		return
-	}
-
-	// Snapshots are returned newest-first; reverse for chronological order
-	points := make([]analytics.DailyValuation, len(snaps))
-	for i, s := range snaps {
-		val := 0.0
-		if s.Total.Valid {
-			f, _ := s.Total.Float64Value()
-			val = f.Float64
-		}
-		points[len(snaps)-1-i] = analytics.DailyValuation{
-			Date:  s.Date,
-			Value: val,
-		}
-	}
-
-	// Filter out zero-value leading snapshots (before any data)
-	start := 0
-	for start < len(points) && points[start].Value <= 0 {
-		start++
-	}
-	points = points[start:]
+	points := investableRiskSeries(snaps)
 	if len(points) < 2 {
 		writeJSON(w, http.StatusOK, map[string]any{"risk": analytics.RiskMetrics{}})
 		return
 	}
 
-	const riskFreeRate = 0.03 // ECB deposit facility rate (approximate)
-
-	// Compute benchmark risk metrics if available
-	benchPrices := loadBenchmarkPrices(ctx, h.queries, h.benchmarkISIN, h.benchmarkTicker)
-	var benchMetrics *analytics.RiskMetrics
-	if len(benchPrices) > 1 {
-		portfolioStart := points[0].Date
-		portfolioEnd := points[len(points)-1].Date
-		var benchPoints []analytics.DailyValuation
-		for _, bp := range benchPrices {
-			if !bp.date.Before(portfolioStart) && !bp.date.After(portfolioEnd) {
-				benchPoints = append(benchPoints, analytics.DailyValuation{
-					Date:  bp.date,
-					Value: bp.price,
-				})
-			}
-		}
-		if len(benchPoints) > 1 {
-			benchMetrics = analytics.ComputeRiskMetrics(benchPoints, riskFreeRate, benchPoints[len(benchPoints)-1].Value)
-		}
-	}
-
 	currentValue := points[len(points)-1].Value
-	externalFlows := h.buildExternalFlowsForRisk(ctx)
-	adjustedPoints := analytics.BuildCashflowAdjustedSeries(points, externalFlows)
+	adjustedPoints := analytics.BuildCashflowAdjustedSeries(points, h.buildInvestableFlowsForRisk(ctx))
+	prepared := analytics.PrepareRiskSeries(adjustedPoints)
+	if len(prepared) < 2 {
+		writeJSON(w, http.StatusOK, map[string]any{"risk": analytics.RiskMetrics{}})
+		return
+	}
+	windowStart, windowEnd := prepared[0].Date, prepared[len(prepared)-1].Date
+	riskFreeRate := analytics.AverageRiskFreeRate(windowStart, windowEnd)
+
 	metrics := analytics.ComputeRiskMetrics(adjustedPoints, riskFreeRate, currentValue)
+	setRecordedHigh(metrics, points)
 	rolling := analytics.ComputeRollingMetrics(adjustedPoints, riskFreeRate)
 
-	result := map[string]any{"risk": metrics}
+	// Benchmark over the same window, in EUR, annualised at its own sampling
+	// frequency (the Yahoo fallback is weekly).
+	var benchMetrics *analytics.RiskMetrics
+	benchPoints := benchmarkRiskWindow(loadBenchmarkPrices(ctx, h.queries, h.benchmarkISIN, h.benchmarkTicker), windowStart, windowEnd)
+	if len(benchPoints) > 1 {
+		benchMetrics = analytics.ComputeRiskMetrics(benchPoints, riskFreeRate, benchPoints[len(benchPoints)-1].Value)
+	}
+
+	result := map[string]any{
+		"risk":           metrics,
+		"risk_free_rate": math.Round(riskFreeRate*10000) / 100,
+	}
 	if benchMetrics != nil {
 		result["benchmark_risk"] = benchMetrics
 	}
@@ -983,6 +1214,54 @@ func (h *AnalysisHandler) HandleRisk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+// investableRiskSeries turns newest-first snapshots into the chronological
+// value of cash and securities (snapshot total without physical assets and
+// the loans on them, see investableNetWorth), dropping leading all-zero days.
+// Risk, the volatility callout, purchasing power and the benchmark replay are
+// all measured on this series with the flows of buildInvestableFlowsForRisk.
+func investableRiskSeries(snaps []db.NetWorthSnapshot) []analytics.DailyValuation {
+	points := make([]analytics.DailyValuation, 0, len(snaps))
+	for i := len(snaps) - 1; i >= 0; i-- {
+		points = append(points, analytics.DailyValuation{Date: snaps[i].Date, Value: investableNetWorth(snaps[i])})
+	}
+	start := 0
+	for start < len(points) && points[start].Value <= 0 {
+		start++
+	}
+	return points[start:]
+}
+
+// setRecordedHigh replaces the high of the flow-adjusted index (a value the
+// portfolio never had) with the highest value actually recorded.
+func setRecordedHigh(m *analytics.RiskMetrics, raw []analytics.DailyValuation) {
+	if m == nil {
+		return
+	}
+	high, highDate := 0.0, time.Time{}
+	for _, p := range raw {
+		if p.Value > high {
+			high, highDate = p.Value, p.Date
+		}
+	}
+	m.AllTimeHigh = math.Round(high*100) / 100
+	m.ATHDate = ""
+	if !highDate.IsZero() {
+		m.ATHDate = highDate.Format("2006-01-02")
+	}
+}
+
+// benchmarkRiskWindow keeps the benchmark prices inside the window the
+// portfolio metrics cover, so both are measured over the same dates.
+func benchmarkRiskWindow(prices []benchmarkPrice, from, to time.Time) []analytics.DailyValuation {
+	var out []analytics.DailyValuation
+	for _, bp := range prices {
+		if bp.price > 0 && !bp.date.Before(from) && !bp.date.After(to) {
+			out = append(out, analytics.DailyValuation{Date: bp.date, Value: bp.price})
+		}
+	}
+	return out
 }
 
 // HandleTax computes German tax summary for a given year.
@@ -1315,6 +1594,114 @@ func computeLossHarvestHints(
 	return hints
 }
 
+// costProjectionGrowthPct is the growth rate before costs (% a year) assumed
+// when projecting fee drag and the value of switching to a cheaper fund.
+const costProjectionGrowthPct = 5.0
+
+// avgGermanFundTER is the benchmark ongoing charge (%) of a typical German
+// fund investor that the cost grade compares against.
+const avgGermanFundTER = 0.38
+
+// feeDragFV returns what an ongoing charge of terPct % a year costs over
+// `years` on `value`, including the growth the deducted fees would have
+// earned: V·(1+g)^n − V·((1+g)·(1−t))^n with g = growthPct/100, t = terPct/100.
+// Example: 10,000 € at 0.20 % for 30 years at 5 % growth costs 2,519 €, not
+// the 600 € a linear 20 €/year suggests.
+func feeDragFV(value, terPct, growthPct float64, years int) float64 {
+	if value <= 0 || terPct <= 0 || years <= 0 {
+		return 0
+	}
+	g := 1 + growthPct/100
+	n := float64(years)
+	return value*math.Pow(g, n) - value*math.Pow(g*(1-terPct/100), n)
+}
+
+// costGrade grades a fund-weighted ongoing charge (in %), computed over the
+// funds with a known charge only.
+func costGrade(ter float64) (grade, detail string) {
+	switch {
+	case ter > 0.60:
+		return "D", "High — significantly above average, review fund selection"
+	case ter > 0.40:
+		return "C", "Above average — consider lower-cost alternatives"
+	case ter > 0.30:
+		return "B", "Average — close to typical German ETF investor"
+	case ter > 0.20:
+		return "B+", "Good — below average costs"
+	case ter > 0.10:
+		return "A", "Very good — significantly below average"
+	default:
+		return "A+", "Excellent — well below average German ETF investor costs"
+	}
+}
+
+// costBenchmark compares the funds' weighted charge with the German average.
+// It deliberately uses the TER over funds with a known charge (terCovered)
+// and their value (coveredValue): single stocks and funds without a charge on
+// record would otherwise count as 0 % and flatter the grade. The saving is
+// what the funds would cost at the average charge minus what they cost now
+// (negative when the funds are dearer than average).
+func costBenchmark(terCovered, coveredValue float64) map[string]any {
+	grade, detail := costGrade(terCovered)
+	annualSaving := (avgGermanFundTER - terCovered) / 100 * coveredValue
+	tenYearSaving := feeDragFV(coveredValue, avgGermanFundTER, costProjectionGrowthPct, 10) -
+		feeDragFV(coveredValue, terCovered, costProjectionGrowthPct, 10)
+	return map[string]any{
+		"avg_ter":         avgGermanFundTER,
+		"your_ter":        math.Round(terCovered*100) / 100,
+		"funds_value":     math.Round(coveredValue*100) / 100,
+		"grade":           grade,
+		"detail":          detail,
+		"annual_saving":   math.Round(annualSaving*100) / 100,
+		"ten_year_saving": math.Round(tenYearSaving*100) / 100,
+		"growth_pct":      costProjectionGrowthPct,
+	}
+}
+
+// tradingCostInput is one transaction for the total-cost-of-ownership
+// figures, already in EUR.
+type tradingCostInput struct {
+	Date        time.Time
+	Type        string
+	AccountType string
+	AmountEUR   float64
+	FeeEUR      float64
+}
+
+// tradingCosts sums trading volume and fees on investment accounts and
+// averages them per year from the first trade to `now` (at least one year,
+// so a single recent purchase is not extrapolated). Fees are the fee column
+// of trades plus standalone `fee` rows such as custody charges.
+func tradingCosts(txns []tradingCostInput, now time.Time) (volume, fees float64, trades int, years float64, ok bool) {
+	var first time.Time
+	for _, t := range txns {
+		if !isSecuritiesOnlyAccountType(t.AccountType) {
+			continue
+		}
+		switch t.Type {
+		case "buy", "sell", "savings_plan":
+			volume += math.Abs(t.AmountEUR)
+			fees += math.Abs(t.FeeEUR)
+			trades++
+		case "fee":
+			fees += math.Abs(t.AmountEUR) + math.Abs(t.FeeEUR)
+		default:
+			continue
+		}
+		if first.IsZero() || t.Date.Before(first) {
+			first = t.Date
+		}
+	}
+	if first.IsZero() {
+		return 0, 0, 0, 0, false
+	}
+	years = now.Sub(first).Hours() / (365.25 * 24)
+	if years < 1 {
+		years = 1
+	}
+	return volume, fees, trades, years, true
+}
+
 // HandleCosts computes ETF cost analysis from TER data and current holdings.
 func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -1333,19 +1720,22 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 		AnnualCost float64 `json:"annual_cost"`
 	}
 
+	// One row per fund, even when it is held in several accounts.
+	positions := aggregateByISIN(enriched)
 	totalValue := 0.0
-	for _, eh := range enriched {
+	for _, eh := range positions {
 		totalValue += eh.value
 	}
 
 	entries := []costEntry{}
 	totalCost := 0.0
-	weightedTER := 0.0
 	coveredValue := 0.0 // sum of value across holdings with a known TER
+	type charged struct{ value, ter float64 }
+	var funds []charged
 
-	for _, eh := range enriched {
+	for _, eh := range positions {
 		ter := numericToFloat(eh.security.TER)
-		if ter <= 0 {
+		if ter <= 0 || eh.value <= 0 {
 			continue
 		}
 		weight := 0.0
@@ -1354,8 +1744,8 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 		}
 		annualCost := eh.value * ter / 100
 		totalCost += annualCost
-		weightedTER += weight * ter / 100
 		coveredValue += eh.value
+		funds = append(funds, charged{value: eh.value, ter: ter})
 
 		entries = append(entries, costEntry{
 			ISIN:       eh.security.ISIN,
@@ -1368,12 +1758,14 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	coveragePct := 0.0
+	weightedTER := 0.0 // over the whole portfolio, uncharged holdings at 0 %
 	if totalValue > 0 {
 		coveragePct = (coveredValue / totalValue) * 100
+		weightedTER = totalCost / totalValue * 100
 	}
-	weightedTERCovered := 0.0
+	weightedTERCovered := 0.0 // over funds with a known charge only
 	if coveredValue > 0 {
-		weightedTERCovered = weightedTER * (totalValue / coveredValue)
+		weightedTERCovered = totalCost / coveredValue * 100
 	}
 
 	// Sort by annual cost descending
@@ -1381,84 +1773,23 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 		return entries[i].AnnualCost > entries[j].AnnualCost
 	})
 
-	// 30-year milestones projection
+	// Fee drag for every year up to 30: the future-value difference with and
+	// without each fund's charge at the stated growth rate.
 	projection := []map[string]any{}
-	cumulative := 0.0
-	for year := 1; year <= 30; year++ {
-		cumulative += totalCost
-		if year == 1 || year == 5 || year == 10 || year == 20 || year == 30 {
+	if totalCost > 0 {
+		for year := 1; year <= 30; year++ {
+			drag := 0.0
+			for _, f := range funds {
+				drag += feeDragFV(f.value, f.ter, costProjectionGrowthPct, year)
+			}
 			projection = append(projection, map[string]any{
 				"year":       year,
-				"cumulative": math.Round(cumulative*100) / 100,
+				"cumulative": math.Round(drag*100) / 100,
 			})
 		}
 	}
 
-	avgTER := 0.38
-	grade := "A+"
-	gradeDetail := "Excellent — well below average German ETF investor costs"
-	if weightedTER > 0.10 {
-		grade = "A"
-		gradeDetail = "Very good — significantly below average"
-	}
-	if weightedTER > 0.20 {
-		grade = "B+"
-		gradeDetail = "Good — below average costs"
-	}
-	if weightedTER > 0.30 {
-		grade = "B"
-		gradeDetail = "Average — close to typical German ETF investor"
-	}
-	if weightedTER > 0.40 {
-		grade = "C"
-		gradeDetail = "Above average — consider lower-cost alternatives"
-	}
-	if weightedTER > 0.60 {
-		grade = "D"
-		gradeDetail = "High — significantly above average, review fund selection"
-	}
-	annualSaving := (avgTER - weightedTER) / 100 * totalValue
-	tenYearSaving := annualSaving * 10
-
-	// Total cost of ownership: TER + estimated transaction costs + estimated spread (in EUR)
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-	txns, _ := listAllTransactionsRows(ctx, h.queries)
-	totalTxnVolume := 0.0
-	txnCount := 0
-	totalFees := 0.0
-	for _, txn := range txns {
-		if txn.Type == "buy" || txn.Type == "sell" || txn.Type == "savings_plan" {
-			if txn.Amount.Valid {
-				f, _ := txn.Amount.Float64Value()
-				totalTxnVolume += math.Abs(convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates))
-				txnCount++
-			}
-			if txn.Fee.Valid {
-				f, _ := txn.Fee.Float64Value()
-				totalFees += math.Abs(convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates))
-			}
-		}
-	}
-	spreadCostEst := totalTxnVolume * 0.0005
-	years := 1.0
-	if len(txns) > 1 {
-		first := txns[len(txns)-1].Date
-		last := txns[0].Date
-		y := last.Sub(first).Hours() / (365.25 * 24)
-		if y > 0.5 {
-			years = y
-		}
-	}
-	annualTxnCost := totalFees / years
-	annualSpreadCost := spreadCostEst / years
-	totalAnnualCost := totalCost + annualTxnCost + annualSpreadCost
-	totalAnnualPct := 0.0
-	if totalValue > 0 {
-		totalAnnualPct = math.Round(totalAnnualCost/totalValue*10000) / 100
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"holdings":                  entries,
 		"total_value":               math.Round(totalValue*100) / 100,
 		"weighted_ter":              math.Round(weightedTER*100) / 100,
@@ -1467,15 +1798,46 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 		"annual_cost":               math.Round(totalCost*100) / 100,
 		"daily_cost":                math.Round(totalCost/365*100) / 100,
 		"projection":                projection,
-		"benchmark": map[string]any{
-			"avg_ter":         avgTER,
-			"your_ter":        math.Round(weightedTER*100) / 100,
-			"grade":           grade,
-			"detail":          gradeDetail,
-			"annual_saving":   math.Round(annualSaving*100) / 100,
-			"ten_year_saving": math.Round(tenYearSaving*100) / 100,
-		},
-		"total_cost_ownership": map[string]any{
+		"projection_growth_pct":     costProjectionGrowthPct,
+	}
+	if coveredValue > 0 {
+		resp["benchmark"] = costBenchmark(weightedTERCovered, coveredValue)
+	}
+
+	// Total cost of ownership: TER + transaction fees and custody charges +
+	// estimated spread (in EUR), averaged from the first trade to today.
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
+	acctType := make(map[uuid.UUID]string)
+	if accts, err := h.queries.ListAccounts(ctx); err == nil {
+		for _, a := range accts {
+			acctType[a.ID] = a.Type
+		}
+	}
+	inputs := make([]tradingCostInput, 0, len(txns))
+	for _, txn := range txns {
+		inputs = append(inputs, tradingCostInput{
+			Date:        txn.Date,
+			Type:        txn.Type,
+			AccountType: acctType[txn.AccountID],
+			AmountEUR:   convertAmountToEURAtDate(numericToFloat(txn.Amount), txn.Currency, txn.Date, histFX, fxRates),
+			FeeEUR:      convertAmountToEURAtDate(numericToFloat(txn.Fee), txn.Currency, txn.Date, histFX, fxRates),
+		})
+	}
+	totalTxnVolume, totalFees, txnCount, years, hasTrading := tradingCosts(inputs, time.Now())
+	if hasTrading || totalCost > 0 {
+		annualTxnCost, annualSpreadCost := 0.0, 0.0
+		if hasTrading {
+			annualTxnCost = totalFees / years
+			annualSpreadCost = totalTxnVolume * 0.0005 / years
+		}
+		totalAnnualCost := totalCost + annualTxnCost + annualSpreadCost
+		totalAnnualPct := 0.0
+		if totalValue > 0 {
+			totalAnnualPct = math.Round(totalAnnualCost/totalValue*10000) / 100
+		}
+		resp["total_cost_ownership"] = map[string]any{
 			"ter_cost":          math.Round(totalCost*100) / 100,
 			"transaction_fees":  math.Round(annualTxnCost*100) / 100,
 			"spread_estimate":   math.Round(annualSpreadCost*100) / 100,
@@ -1484,11 +1846,85 @@ func (h *AnalysisHandler) HandleCosts(w http.ResponseWriter, r *http.Request) {
 			"lifetime_fees":     math.Round(totalFees*100) / 100,
 			"lifetime_volume":   math.Round(totalTxnVolume),
 			"transaction_count": txnCount,
-		},
-	})
+			"years":             math.Round(years*10) / 10,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// HandleCorrelation computes pairwise price correlation between all held securities.
+// correlationMinObservations is the fewest aligned returns a pair needs
+// before a correlation is reported; with fewer the cell is null ("not enough
+// shared history") rather than 0, which would read as "uncorrelated".
+const correlationMinObservations = 20
+
+// eurPricePoint is one close converted to EUR at its own date.
+type eurPricePoint struct {
+	Date time.Time
+	EUR  float64
+}
+
+// alignedReturnCorrelation computes the Pearson correlation of two EUR price
+// series' returns over their common dates. Returns are taken between
+// consecutive common dates, so both sides of every pair cover the same
+// interval even when one series has gaps. Pairs where either return is
+// ±50 % or more (data errors, splits) are dropped. ok is false when fewer
+// than minObs returns remain.
+func alignedReturnCorrelation(a, b []eurPricePoint, minObs int) (corr float64, n int, ok bool) {
+	bByDate := make(map[string]float64, len(b))
+	for _, p := range b {
+		if p.EUR > 0 {
+			bByDate[p.Date.Format("2006-01-02")] = p.EUR
+		}
+	}
+	var ra, rb []float64
+	prevA, prevB := 0.0, 0.0
+	for _, p := range a {
+		pb, found := bByDate[p.Date.Format("2006-01-02")]
+		if !found || p.EUR <= 0 {
+			continue
+		}
+		if prevA > 0 && prevB > 0 {
+			x := p.EUR/prevA - 1
+			y := pb/prevB - 1
+			if math.Abs(x) < 0.5 && math.Abs(y) < 0.5 {
+				ra = append(ra, x)
+				rb = append(rb, y)
+			}
+		}
+		prevA, prevB = p.EUR, pb
+	}
+	n = len(ra)
+	if n < minObs || n < 2 {
+		return 0, n, false
+	}
+	meanA, meanB := 0.0, 0.0
+	for k := range ra {
+		meanA += ra[k]
+		meanB += rb[k]
+	}
+	meanA /= float64(n)
+	meanB /= float64(n)
+	cov, varA, varB := 0.0, 0.0, 0.0
+	for k := range ra {
+		da, dbv := ra[k]-meanA, rb[k]-meanB
+		cov += da * dbv
+		varA += da * da
+		varB += dbv * dbv
+	}
+	if varA <= 0 || varB <= 0 {
+		return 0, n, false
+	}
+	corr = cov / math.Sqrt(varA*varB)
+	if math.IsNaN(corr) || math.IsInf(corr, 0) {
+		return 0, n, false
+	}
+	return math.Max(-1, math.Min(1, corr)), n, true
+}
+
+// HandleCorrelation computes pairwise price correlation between all held
+// securities, from EUR prices on the dates both securities have a close.
+// Cells with too little shared history are null.
 func (h *AnalysisHandler) HandleCorrelation(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1498,163 +1934,147 @@ func (h *AnalysisHandler) HandleCorrelation(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Deduplicate by ISIN
-	type secInfo struct {
-		isin, name string
-	}
-	seen := make(map[string]bool)
-	var secs []secInfo
-	for _, eh := range enriched {
-		if seen[eh.security.ISIN] {
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+
+	// One series per ISIN, each close converted to EUR at its own date.
+	var labels []string
+	var series [][]eurPricePoint
+	for _, eh := range aggregateByISIN(enriched) {
+		prices, err := h.queries.ListPriceHistory(ctx, eh.security.ISIN)
+		if err != nil || len(prices) <= correlationMinObservations {
 			continue
 		}
-		seen[eh.security.ISIN] = true
-		secs = append(secs, secInfo{isin: eh.security.ISIN, name: eh.security.Name})
-	}
-
-	if len(secs) < 2 {
-		writeJSON(w, http.StatusOK, map[string]any{"labels": []string{}, "matrix": [][]float64{}})
-		return
-	}
-
-	// Load price histories and compute daily returns per ISIN
-	returnsByISIN := make(map[string]map[string]float64) // isin -> date -> return
-
-	for _, sec := range secs {
-		prices, err := h.queries.ListPriceHistory(ctx, sec.isin)
-		if err != nil || len(prices) < 30 {
+		pts := make([]eurPricePoint, 0, len(prices))
+		for _, p := range prices {
+			if close := numericToFloat(p.Close); close > 0 {
+				pts = append(pts, eurPricePoint{Date: p.Date, EUR: convertAmountToEURAtDate(close, p.Currency, p.Date, histFX, fxRates)})
+			}
+		}
+		if len(pts) <= correlationMinObservations {
 			continue
 		}
-		returns := make(map[string]float64)
-		for i := 1; i < len(prices); i++ {
-			if !prices[i-1].Close.Valid || !prices[i].Close.Valid {
-				continue
-			}
-			prev, _ := prices[i-1].Close.Float64Value()
-			cur, _ := prices[i].Close.Float64Value()
-			if prev.Float64 > 0 {
-				r := (cur.Float64 - prev.Float64) / prev.Float64
-				if r > -0.5 && r < 0.5 { // skip outliers
-					returns[prices[i].Date.Format("2006-01-02")] = r
-				}
-			}
-		}
-		if len(returns) > 20 {
-			returnsByISIN[sec.isin] = returns
-		}
+		labels = append(labels, eh.security.Name)
+		series = append(series, pts)
 	}
 
-	// Filter to securities with price data
-	var validSecs []secInfo
-	for _, sec := range secs {
-		if _, ok := returnsByISIN[sec.isin]; ok {
-			validSecs = append(validSecs, sec)
-		}
-	}
-
-	n := len(validSecs)
+	n := len(series)
 	if n < 2 {
-		writeJSON(w, http.StatusOK, map[string]any{"labels": []string{}, "matrix": [][]float64{}})
+		writeJSON(w, http.StatusOK, map[string]any{"labels": []string{}, "matrix": [][]*float64{}, "min_observations": correlationMinObservations})
 		return
 	}
 
-	// Compute pairwise Pearson correlation
-	labels := make([]string, n)
-	matrix := make([][]float64, n)
-	for i := 0; i < n; i++ {
-		labels[i] = validSecs[i].name
-		matrix[i] = make([]float64, n)
-		matrix[i][i] = 1.0
+	matrix := make([][]*float64, n)
+	for i := range matrix {
+		matrix[i] = make([]*float64, n)
+		one := 1.0
+		matrix[i][i] = &one
 	}
-
 	for i := 0; i < n; i++ {
 		for j := i + 1; j < n; j++ {
-			rA := returnsByISIN[validSecs[i].isin]
-			rB := returnsByISIN[validSecs[j].isin]
-
-			// Find common dates
-			var a, b []float64
-			for date, ra := range rA {
-				if rb, ok := rB[date]; ok {
-					a = append(a, ra)
-					b = append(b, rb)
-				}
+			corr, _, ok := alignedReturnCorrelation(series[i], series[j], correlationMinObservations)
+			if !ok {
+				continue
 			}
-
-			corr := 0.0
-			if len(a) > 10 {
-				meanA, meanB := 0.0, 0.0
-				for k := range a {
-					meanA += a[k]
-					meanB += b[k]
-				}
-				meanA /= float64(len(a))
-				meanB /= float64(len(b))
-
-				cov, varA, varB := 0.0, 0.0, 0.0
-				for k := range a {
-					da := a[k] - meanA
-					db := b[k] - meanB
-					cov += da * db
-					varA += da * da
-					varB += db * db
-				}
-				if varA > 0 && varB > 0 {
-					corr = cov / (math.Sqrt(varA) * math.Sqrt(varB))
-					if math.IsNaN(corr) || math.IsInf(corr, 0) {
-						corr = 0
-					} else {
-						corr = math.Max(-1, math.Min(1, corr))
-					}
-				}
-			}
-
-			matrix[i][j] = math.Round(corr*100) / 100
-			matrix[j][i] = matrix[i][j]
+			v := math.Round(corr*100) / 100
+			matrix[i][j] = &v
+			matrix[j][i] = &v
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"labels": labels,
-		"matrix": matrix,
+		"labels":           labels,
+		"matrix":           matrix,
+		"min_observations": correlationMinObservations,
 	})
 }
 
-// HandleFXHistory returns historical exchange rates for major currency pairs.
+// HandleFXHistory returns the exchange-rate history of every foreign currency
+// the user holds securities or cash in.
 func (h *AnalysisHandler) HandleFXHistory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	currencies := []string{"USD", "GBP", "JPY", "CHF"}
-
-	type ratePoint struct {
-		Date string  `json:"date"`
-		Rate float64 `json:"rate"`
-	}
-	result := make(map[string][]ratePoint)
-
-	for _, cur := range currencies {
+	result := make(map[string][]fxRatePoint)
+	for _, cur := range h.heldForeignCurrencies(ctx) {
 		rates, err := h.queries.ListExchangeRateHistory(ctx, cur)
 		if err != nil || len(rates) == 0 {
 			continue
 		}
-		// Sample weekly for chart readability
-		var points []ratePoint
-		for i, r := range rates {
-			if i%7 == 0 || i == len(rates)-1 {
-				rate := numericToFloat(r.Rate)
-				if rate > 0 {
-					points = append(points, ratePoint{
-						Date: r.Date.Format("2006-01-02"),
-						Rate: math.Round(1/rate*10000) / 10000, // convert EUR→X to X per EUR
-					})
-				}
-			}
-		}
-		if len(points) > 0 {
+		if points := fxRatePoints(rates); len(points) > 0 {
 			result[cur] = points
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"rates": result})
+}
+
+type fxRatePoint struct {
+	Date string  `json:"date"`
+	Rate float64 `json:"rate"`
+}
+
+// fxRatePoints samples a rate history weekly for the chart. ECB reference
+// rates are stored as units of the currency per 1 EUR (USD 1.0989 means
+// 1 € buys 1.0989 $), which is exactly what the chart shows, so the rate is
+// passed through unchanged.
+func fxRatePoints(rates []db.ListExchangeRateHistoryRow) []fxRatePoint {
+	var points []fxRatePoint
+	for i, r := range rates {
+		if i%7 == 0 || i == len(rates)-1 {
+			rate := numericToFloat(r.Rate)
+			if rate > 0 {
+				points = append(points, fxRatePoint{
+					Date: r.Date.Format("2006-01-02"),
+					Rate: math.Round(rate*10000) / 10000,
+				})
+			}
+		}
+	}
+	return points
+}
+
+// heldForeignCurrencies lists the non-EUR currencies of held securities,
+// non-zero cash balances and active accounts.
+func (h *AnalysisHandler) heldForeignCurrencies(ctx context.Context) []string {
+	var raw []string
+	if holdings, err := h.queries.ListCurrentHoldings(ctx); err == nil {
+		for _, hd := range holdings {
+			if numericToFloat(hd.Quantity) > 0 {
+				raw = append(raw, hd.Currency)
+			}
+		}
+	}
+	if rows, err := h.queries.ListAllAccountCashByCurrency(ctx); err == nil {
+		for _, row := range rows {
+			if math.Abs(numericToFloat(row.Balance)) >= 0.01 {
+				raw = append(raw, row.Currency)
+			}
+		}
+	}
+	if accts, err := h.queries.ListAccounts(ctx); err == nil {
+		for _, a := range accts {
+			if a.IsActive {
+				raw = append(raw, a.Currency)
+			}
+		}
+	}
+	return foreignCurrencyList(raw)
+}
+
+// foreignCurrencyList normalises currency codes (GBp/GBX → GBP), drops EUR
+// and duplicates, and sorts the rest.
+func foreignCurrencyList(raw []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, c := range raw {
+		norm, _ := normalizeCurrencyAndScale(c)
+		if norm == "EUR" || seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		out = append(out, norm)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // HandleCashFlow computes monthly income/expense summary and forward projection.
@@ -2144,107 +2564,211 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, res.response())
 }
 
-// HandleInflation returns inflation-adjusted net worth data using German HVPI.
+// vpiTable describes the German consumer price index (Destatis
+// Verbraucherpreisindex, VPI: the national index, not the harmonised HVPI).
+type vpiTable struct {
+	// annual is the annual average change in % per year.
+	annual map[int]float64
+	// monthly holds published monthly index values (2020 = 100) for the
+	// months the annual averages do not cover yet.
+	monthly map[string]float64
+}
+
+// germanVPI sources: Destatis press release 019/2026 of 16 Jan 2026 (annual
+// averages 2021 +3.1, 2022 +6.9, 2023 +5.9, 2024 +2.2, 2025 +2.2); Destatis'
+// 2021 annual release (2020 +0.5); monthly 2026 values from Destatis press
+// release 392/2026 (Oct 2026: 126.5) and the IHK Ostwestfalen VPI table
+// (Jan–Sep 2026). 2026 +2.5 is provisional: the Jan–Oct average (124.97)
+// over the 2025 average (121.9). Update both in January.
+var germanVPI = vpiTable{
+	annual: map[int]float64{
+		2020: 0.5, 2021: 3.1, 2022: 6.9, 2023: 5.9, 2024: 2.2, 2025: 2.2, 2026: 2.5,
+	},
+	monthly: map[string]float64{
+		"2026-01": 122.8, "2026-02": 123.1, "2026-03": 124.5, "2026-04": 125.2, "2026-05": 125.0,
+		"2026-06": 124.6, "2026-07": 125.6, "2026-08": 125.8, "2026-09": 126.6, "2026-10": 126.5,
+	},
+}
+
+// vpiFallbackRate is used for years outside the table (the ECB's 2 % target).
+const vpiFallbackRate = 2.0
+
+func (t vpiTable) rate(year int) float64 {
+	if r, ok := t.annual[year]; ok {
+		return r
+	}
+	return vpiFallbackRate
+}
+
+// annualAverage chains the annual rates into an annual average level
+// (2020 = 100).
+func (t vpiTable) annualAverage(year int) float64 {
+	level := 100.0
+	for y := 2021; y <= year; y++ {
+		level *= 1 + t.rate(y)/100
+	}
+	for y := 2020; y > year; y-- {
+		level /= 1 + t.rate(y)/100
+	}
+	return level
+}
+
+// level returns the index level (2020 = 100) of the month containing m:
+// the published value if there is one; after the latest published month,
+// that value grown at the year's rate; otherwise a geometric interpolation
+// between the annual averages, each placed at mid-year. (Treating an annual
+// average change as the change within that year would overstate the
+// 2022→2026 price rise by about 1.5 points, because 2023's average still
+// carried the late-2022 surge.)
+func (t vpiTable) level(m time.Time) float64 {
+	key := m.Format("2006-01")
+	if v, ok := t.monthly[key]; ok {
+		return v
+	}
+	lastKey := ""
+	for k := range t.monthly {
+		if k > lastKey {
+			lastKey = k
+		}
+	}
+	if lastKey != "" && key > lastKey {
+		last, _ := time.Parse("2006-01", lastKey)
+		months := (m.Year()-last.Year())*12 + int(m.Month()) - int(last.Month())
+		return t.monthly[lastKey] * math.Pow(1+t.rate(m.Year())/100, float64(months)/12)
+	}
+	pos := float64(m.Year()) + (float64(m.Month())-0.5)/12 - 0.5
+	y0 := int(math.Floor(pos))
+	a0, a1 := t.annualAverage(y0), t.annualAverage(y0+1)
+	return a0 * math.Pow(a1/a0, pos-float64(y0))
+}
+
+type inflationPoint struct {
+	Date     string  `json:"date"`
+	Nominal  float64 `json:"nominal"`
+	Real     float64 `json:"real"`
+	CpiIndex float64 `json:"cpi_index"`
+}
+
+// inflationSummary is the Purchasing Power section: month-end values in
+// nominal and today's euros, and the last 12 months (or the history, if
+// shorter) as a return and a euro amount.
+type inflationSummary struct {
+	History     []inflationPoint
+	HasWindow   bool
+	WindowStart time.Time
+	WindowEnd   time.Time
+	// NominalReturn is the time-weighted return in % (deposits and
+	// withdrawals excluded); RealReturn deflates it by InflationPct.
+	NominalReturn float64
+	RealReturn    float64
+	InflationPct  float64
+	// PurchasingPowerLost is what consumer-price inflation over the window
+	// took from the value held at its start, in today's euros (start value in
+	// today's euros minus start value as recorded).
+	PurchasingPowerLost float64
+}
+
+// monthlyCPILevels returns the consumer-price level of every month from
+// first to last, rebased so the last month is 100 ("today's euros").
+func monthlyCPILevels(first, last time.Time, vpi vpiTable) map[string]float64 {
+	month := time.Date(first.Year(), first.Month(), 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(last.Year(), last.Month(), 1, 0, 0, 0, 0, time.UTC)
+	base := vpi.level(end)
+	levels := make(map[string]float64)
+	for ; !month.After(end); month = month.AddDate(0, 1, 0) {
+		levels[month.Format("2006-01")] = 100 * vpi.level(month) / base
+	}
+	return levels
+}
+
+// valueOnOrBefore returns the last value dated on or before d, and whether
+// there is one.
+func valueOnOrBefore(series []analytics.DailyValuation, d time.Time) (analytics.DailyValuation, bool) {
+	i := sort.Search(len(series), func(i int) bool { return series[i].Date.After(d) })
+	if i == 0 {
+		return analytics.DailyValuation{}, false
+	}
+	return series[i-1], true
+}
+
+// computeInflation measures the chronological values in raw (leading zeros
+// already dropped) against German consumer prices. adjusted is the
+// flow-adjusted index of the same series, used for the window's return so
+// that deposits do not count as growth.
+func computeInflation(raw, adjusted []analytics.DailyValuation, vpi vpiTable) inflationSummary {
+	var out inflationSummary
+	out.History = []inflationPoint{}
+	if len(raw) == 0 {
+		return out
+	}
+	end := raw[len(raw)-1]
+	cpi := monthlyCPILevels(raw[0].Date, end.Date, vpi)
+
+	// One point per month at its last snapshot (the latest one for the
+	// current month).
+	for i, p := range raw {
+		month := p.Date.Format("2006-01")
+		if i+1 < len(raw) && raw[i+1].Date.Format("2006-01") == month {
+			continue
+		}
+		level := cpi[month]
+		out.History = append(out.History, inflationPoint{
+			Date:     p.Date.Format("2006-01-02"),
+			Nominal:  math.Round(p.Value),
+			Real:     math.Round(p.Value * 100 / level),
+			CpiIndex: math.Round(level*10) / 10,
+		})
+	}
+
+	base, ok := valueOnOrBefore(raw, end.Date.AddDate(-1, 0, 0))
+	if !ok {
+		base = raw[0]
+	}
+	if !base.Date.Before(end.Date) || base.Value <= 0 {
+		return out
+	}
+	out.HasWindow = true
+	out.WindowStart, out.WindowEnd = base.Date, end.Date
+	out.InflationPct = (cpi[end.Date.Format("2006-01")]/cpi[base.Date.Format("2006-01")] - 1) * 100
+	idxStart, okStart := valueOnOrBefore(adjusted, base.Date)
+	idxEnd, okEnd := valueOnOrBefore(adjusted, end.Date)
+	if okStart && okEnd && idxStart.Value > 0 {
+		out.NominalReturn = (idxEnd.Value/idxStart.Value - 1) * 100
+	}
+	out.RealReturn = ((1+out.NominalReturn/100)/(1+out.InflationPct/100) - 1) * 100
+	out.PurchasingPowerLost = base.Value * out.InflationPct / 100
+	return out
+}
+
+// HandleInflation returns the value of cash and securities in nominal and
+// today's euros, deflated with the German consumer price index (VPI).
+// Property, vehicles and their loans are left out like on the Risk tab.
 func (h *AnalysisHandler) HandleInflation(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	cpiRates := map[int]float64{
-		2020: 0.5, 2021: 3.1, 2022: 6.9, 2023: 5.9, 2024: 2.2, 2025: 2.0, 2026: 2.0,
-	}
-
 	snaps, err := h.queries.ListNetWorthSnapshots(ctx, 5000)
-	if err != nil || len(snaps) < 2 {
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list snapshots: "+err.Error())
+		return
+	}
+	raw := investableRiskSeries(snaps)
+	if len(raw) < 2 {
 		writeJSON(w, http.StatusOK, map[string]any{"history": []any{}})
 		return
 	}
+	adjusted := analytics.BuildCashflowAdjustedSeries(raw, h.buildInvestableFlowsForRisk(ctx))
+	s := computeInflation(raw, adjusted, germanVPI)
 
-	type inflPoint struct {
-		Date     string  `json:"date"`
-		Nominal  float64 `json:"nominal"`
-		Real     float64 `json:"real"`
-		CpiIndex float64 `json:"cpi_index"`
+	resp := map[string]any{"history": s.History}
+	if s.HasWindow {
+		resp["nominal_return"] = math.Round(s.NominalReturn*10) / 10
+		resp["real_return"] = math.Round(s.RealReturn*10) / 10
+		resp["inflation_pct"] = math.Round(s.InflationPct*10) / 10
+		resp["purchasing_power_lost"] = math.Round(s.PurchasingPowerLost)
+		resp["window_start"] = s.WindowStart.Format("2006-01-02")
+		resp["window_end"] = s.WindowEnd.Format("2006-01-02")
 	}
-
-	cpiIndex := make(map[string]float64)
-	now := snaps[0].Date
-	cpiIndex[now.Format("2006-01")] = 100.0
-	for m := 1; m < len(snaps); m++ {
-		d := snaps[m].Date
-		month := d.Format("2006-01")
-		if _, exists := cpiIndex[month]; exists {
-			continue
-		}
-		yr := d.Year()
-		annualRate := cpiRates[yr]
-		if annualRate == 0 {
-			annualRate = 2.0
-		}
-		if annualRate <= -99.99 {
-			annualRate = -99.99
-		}
-		monthsFromNow := now.Sub(d).Hours() / (24 * 30.44)
-		denom := math.Pow(1+annualRate/100, monthsFromNow/12)
-		if denom <= 0 || math.IsNaN(denom) || math.IsInf(denom, 0) {
-			cpiIndex[month] = 100.0
-		} else {
-			cpiIndex[month] = 100.0 / denom
-		}
-	}
-
-	history := []inflPoint{}
-	lastMonth := ""
-	for i := len(snaps) - 1; i >= 0; i-- {
-		s := snaps[i]
-		month := s.Date.Format("2006-01")
-		if month == lastMonth {
-			continue
-		}
-		lastMonth = month
-		nominal := 0.0
-		if s.Total.Valid {
-			f, _ := s.Total.Float64Value()
-			nominal = f.Float64
-		}
-		cpi := cpiIndex[month]
-		if cpi <= 0 || math.IsNaN(cpi) || math.IsInf(cpi, 0) {
-			cpi = 100
-		}
-		real := nominal * (100.0 / cpi)
-		history = append(history, inflPoint{
-			Date:     month,
-			Nominal:  math.Round(nominal),
-			Real:     math.Round(real),
-			CpiIndex: math.Round(cpi*10) / 10,
-		})
-	}
-
-	if len(history) > 1 {
-		last := history[len(history)-1]
-		baseIdx := 0
-		if len(history) > 12 {
-			baseIdx = len(history) - 13
-		}
-		base := history[baseIdx]
-		nominalReturn := 0.0
-		realReturn := 0.0
-		if base.Nominal > 1000 {
-			nominalReturn = ((last.Nominal - base.Nominal) / base.Nominal) * 100
-		}
-		if base.Real > 1000 {
-			realReturn = ((last.Real - base.Real) / base.Real) * 100
-		}
-		erosion := last.Nominal - last.Real
-
-		writeJSON(w, http.StatusOK, map[string]any{
-			"history":               history,
-			"nominal_return":        math.Round(nominalReturn*10) / 10,
-			"real_return":           math.Round(realReturn*10) / 10,
-			"purchasing_power_lost": math.Round(erosion),
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"history": history})
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // HandleBenchmarkComparison replays user's deposit history through a benchmark
@@ -2278,153 +2802,133 @@ func (h *AnalysisHandler) HandleBenchmarkComparison(w http.ResponseWriter, r *ht
 		writeJSON(w, http.StatusOK, benchmarkInsufficientResponse(benchISIN, benchName, have))
 		return
 	}
-	priceByDate := make(map[string]float64, len(benchPrices))
+	prices := make([]benchmarkPrice, 0, len(benchPrices))
 	for _, p := range benchPrices {
 		if p.Close.Valid {
 			f, _ := p.Close.Float64Value()
 			eurP := convertAmountToEURAtDate(f.Float64, p.Currency, p.Date, histFX, fxRates)
 			if eurP > 0 {
-				priceByDate[p.Date.Format("2006-01-02")] = eurP
+				prices = append(prices, benchmarkPrice{date: p.Date, price: eurP})
 			}
 		}
 	}
-	latestBenchPrice := 0.0
-	lastRow := benchPrices[len(benchPrices)-1]
-	if lastRow.Close.Valid {
-		f, _ := lastRow.Close.Float64Value()
-		latestBenchPrice = convertAmountToEUR(f.Float64, lastRow.Currency, fxRates)
-	}
 
-	closestPrice := func(date time.Time) float64 {
-		for d := 0; d < 14; d++ {
-			key := date.AddDate(0, 0, -d).Format("2006-01-02")
-			if p, ok := priceByDate[key]; ok {
-				return p
-			}
-		}
-		return 0
+	snaps, err := h.queries.ListNetWorthSnapshots(ctx, 5000)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list snapshots: "+err.Error())
+		return
 	}
-
-	txns, _ := listAllTransactionsRows(ctx, h.queries)
-	accts, _ := h.queries.ListAccounts(ctx)
-	txnsChrono := make([]db.ListTransactionsRow, len(txns))
-	for i := range txns {
-		txnsChrono[i] = txns[len(txns)-1-i]
-	}
-	impEvents := computeImplicitCashClampEvents(accts, txnsChrono, histFX, fxRates)
-
-	type flowEvent struct {
-		date time.Time
-		amt  float64
-	}
-	var contribFlows []flowEvent
-	for _, ev := range impEvents {
-		if ev.DeltaEUR != 0 {
-			contribFlows = append(contribFlows, flowEvent{date: ev.Date, amt: ev.DeltaEUR})
-		}
-	}
-	for _, txn := range txnsChrono {
-		switch txn.Type {
-		case "deposit":
-			if txn.Amount.Valid {
-				f, _ := txn.Amount.Float64Value()
-				amt := convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-				if amt > 0 {
-					contribFlows = append(contribFlows, flowEvent{date: txn.Date, amt: amt})
-				}
-			}
-		case "withdrawal":
-			if txn.Amount.Valid {
-				f, _ := txn.Amount.Float64Value()
-				amt := convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-				if amt > 0 {
-					contribFlows = append(contribFlows, flowEvent{date: txn.Date, amt: -amt})
-				}
-			}
-		}
-	}
-	sort.SliceStable(contribFlows, func(i, j int) bool {
-		if contribFlows[i].date.Equal(contribFlows[j].date) {
-			return (contribFlows[i].amt > 0) && !(contribFlows[j].amt > 0)
-		}
-		return contribFlows[i].date.Before(contribFlows[j].date)
-	})
-
-	benchShares := 0.0
-	for _, cf := range contribFlows {
-		price := closestPrice(cf.date)
-		if price > 0 {
-			benchShares = math.Max(0, benchShares+cf.amt/price)
-		}
-	}
-	benchValue := benchShares * latestBenchPrice
-
-	type replayPoint struct {
-		Date      string  `json:"date"`
-		Actual    float64 `json:"actual"`
-		Benchmark float64 `json:"benchmark"`
-	}
-
-	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 5000)
-	snapByMonth := make(map[string]float64)
-	for _, s := range snaps {
-		m := s.Date.Format("2006-01")
-		if _, exists := snapByMonth[m]; !exists && s.Total.Valid {
-			f, _ := s.Total.Float64Value()
-			snapByMonth[m] = f.Float64
-		}
-	}
-
-	comparison := []replayPoint{}
-	lastMonth := ""
-	runningShares := 0.0
-	cfIdx := 0
-	for _, txn := range txnsChrono {
-		for cfIdx < len(contribFlows) && !contribFlows[cfIdx].date.After(txn.Date) {
-			price := closestPrice(contribFlows[cfIdx].date)
-			if price > 0 {
-				runningShares = math.Max(0, runningShares+contribFlows[cfIdx].amt/price)
-			}
-			cfIdx++
-		}
-		m := txn.Date.Format("2006-01")
-		if m == lastMonth {
-			continue
-		}
-		lastMonth = m
-		bPrice := closestPrice(txn.Date)
-		bVal := runningShares * bPrice
-		actual := snapByMonth[m]
-		if actual > 0 || bVal > 0 {
-			comparison = append(comparison, replayPoint{
-				Date: m, Actual: math.Round(actual), Benchmark: math.Round(bVal),
-			})
-		}
-	}
+	replay := replayBenchmark(investableRiskSeries(snaps), h.buildInvestableFlowsForRisk(ctx), prices)
 
 	benchName := benchISIN
 	if sec, err := h.queries.GetSecurity(ctx, benchISIN); err == nil {
 		benchName = sec.Name
 	}
 
-	actualValue := 0.0
-	if len(snaps) > 0 && snaps[0].Total.Valid {
-		f, _ := snaps[0].Total.Float64Value()
-		actualValue = f.Float64
-	}
-	diff := actualValue - benchValue
-
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"benchmark_name":  benchName,
 		"benchmark_isin":  benchISIN,
-		"actual_value":    math.Round(actualValue),
-		"benchmark_value": math.Round(benchValue),
-		"difference":      math.Round(diff),
-		"comparison":      comparison,
+		"actual_value":    math.Round(replay.ActualValue),
+		"benchmark_value": math.Round(replay.BenchmarkValue),
+		"difference":      math.Round(replay.ActualValue - replay.BenchmarkValue),
+		"comparison":      replay.Points,
 		"available":       true,
 		"have":            len(benchPrices),
 		"need":            benchmarkMinPrices,
-	})
+	}
+	if !replay.Start.IsZero() {
+		resp["start_date"] = replay.Start.Format("2006-01-02")
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type benchmarkReplayPoint struct {
+	Date      string  `json:"date"`
+	Actual    float64 `json:"actual"`
+	Benchmark float64 `json:"benchmark"`
+}
+
+type benchmarkReplay struct {
+	Points         []benchmarkReplayPoint
+	Start          time.Time
+	ActualValue    float64
+	BenchmarkValue float64
+}
+
+// replayBenchmark answers "what if all of this money had been in the
+// benchmark": it buys the benchmark with the value of cash and securities on
+// the first day both series have data, then buys and sells with every later
+// external flow (deposits, withdrawals, RSU vests and in-kind transfers at
+// market value: the same flows the Risk tab neutralises) at the latest price
+// on or before the flow's date. Units may go negative; flooring them would
+// silently drop withdrawals. Both lines are valued on the same dates: every
+// month end and the latest snapshot. actual is chronological; prices are in
+// EUR, ascending.
+func replayBenchmark(actual []analytics.DailyValuation, flows []analytics.CashFlow, prices []benchmarkPrice) benchmarkReplay {
+	out := benchmarkReplay{Points: []benchmarkReplayPoint{}}
+	if len(actual) == 0 || len(prices) == 0 {
+		return out
+	}
+	priceOn := func(d time.Time) float64 {
+		i := sort.Search(len(prices), func(i int) bool { return prices[i].date.After(d) })
+		if i == 0 {
+			return 0
+		}
+		return prices[i-1].price
+	}
+
+	startIdx := -1
+	for i, p := range actual {
+		if p.Value > 0 && priceOn(p.Date) > 0 {
+			startIdx = i
+			break
+		}
+	}
+	if startIdx < 0 {
+		return out
+	}
+	start := actual[startIdx]
+	end := actual[len(actual)-1]
+	out.Start = start.Date
+
+	sorted := append([]analytics.CashFlow(nil), flows...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Date.Before(sorted[j].Date) })
+	next := sort.Search(len(sorted), func(i int) bool { return sorted[i].Date.After(start.Date) })
+
+	units := start.Value / priceOn(start.Date)
+	series := actual[startIdx:]
+	valueAt := func(d time.Time) {
+		for next < len(sorted) && !sorted[next].Date.After(d) {
+			if p := priceOn(sorted[next].Date); p > 0 {
+				units += sorted[next].Amount / p
+			}
+			next++
+		}
+		a, _ := valueOnOrBefore(series, d)
+		out.Points = append(out.Points, benchmarkReplayPoint{
+			Date:      d.Format("2006-01-02"),
+			Actual:    math.Round(a.Value),
+			Benchmark: math.Round(units * priceOn(d)),
+		})
+	}
+
+	valueAt(start.Date)
+	for m := time.Date(start.Date.Year(), start.Date.Month(), 1, 0, 0, 0, 0, time.UTC); ; m = m.AddDate(0, 1, 0) {
+		monthEnd := m.AddDate(0, 1, -1)
+		if !monthEnd.Before(end.Date) {
+			break
+		}
+		if monthEnd.After(start.Date) {
+			valueAt(monthEnd)
+		}
+	}
+	if end.Date.After(start.Date) {
+		valueAt(end.Date)
+	}
+
+	out.ActualValue = end.Value
+	out.BenchmarkValue = units * priceOn(end.Date)
+	return out
 }
 
 // benchmarkMinPrices is the number of benchmark price rows needed before the
@@ -2877,7 +3381,39 @@ func (h *AnalysisHandler) HandleFSAStatus(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, res.response())
 }
 
-// HandleAlternatives returns cheaper ETF alternatives for current holdings.
+// switchOutcome compares keeping a fund with selling it and buying a cheaper
+// one, after German tax: switching realises the gain now (switchTaxCost on
+// value − costBasis), and both paths pay tax on their remaining gain at the
+// horizon. Growth before costs is costProjectionGrowthPct; the Vorabpauschale
+// and the saver's allowance are ignored. It returns the after-tax advantage of
+// switching after 10 years and the first year (1-50) in which switching is
+// ahead, or 0 when it never is within 50 years.
+func switchOutcome(value, costBasis, curTER, altTER, tfs float64) (tenYearNet float64, breakevenYears int) {
+	g := 1 + costProjectionGrowthPct/100
+	kKeep := g * (1 - curTER/100)
+	kSwitch := g * (1 - altTER/100)
+	switchTax := switchTaxCost(value-costBasis, tfs, 0)
+	reinvested := value - switchTax
+	advantage := func(years int) float64 {
+		n := float64(years)
+		keep := value * math.Pow(kKeep, n)
+		keep -= switchTaxCost(keep-costBasis, tfs, 0)
+		sw := reinvested * math.Pow(kSwitch, n)
+		sw -= switchTaxCost(sw-reinvested, tfs, 0)
+		return sw - keep
+	}
+	tenYearNet = advantage(10)
+	for y := 1; y <= 50; y++ {
+		if advantage(y) >= 0 {
+			return tenYearNet, y
+		}
+	}
+	return tenYearNet, 0
+}
+
+// HandleAlternatives returns cheaper ETF alternatives for current holdings,
+// with what a switch would cost in tax: selling realises the unrealised gain
+// now (Teilfreistellung applied, saver's allowance ignored).
 func (h *AnalysisHandler) HandleAlternatives(w http.ResponseWriter, r *http.Request) {
 	enriched, err := h.loadEnrichedHoldings(r.Context())
 	if err != nil {
@@ -2887,8 +3423,8 @@ func (h *AnalysisHandler) HandleAlternatives(w http.ResponseWriter, r *http.Requ
 
 	// Load static alternatives data
 	var altMap map[string]struct {
-		Name         string `json:"name"`
-		Index        string `json:"index"`
+		Name         string  `json:"name"`
+		Index        string  `json:"index"`
 		TER          float64 `json:"ter"`
 		Alternatives []struct {
 			ISIN  string  `json:"isin"`
@@ -2902,24 +3438,36 @@ func (h *AnalysisHandler) HandleAlternatives(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	type alternative struct {
+		ISIN          string  `json:"isin"`
+		Name          string  `json:"name"`
+		Index         string  `json:"index"`
+		SameIndex     bool    `json:"same_index"`
+		TER           float64 `json:"ter"`
+		AnnualSaving  float64 `json:"annual_saving"`
+		TenYearSaving float64 `json:"ten_year_saving"`
+		// After the switch tax and tax at the end; null when the cost basis
+		// is unknown.
+		TenYearNetAfterTax *float64 `json:"ten_year_net_after_tax"`
+		// First year in which switching is ahead after tax; null when it
+		// never is within 50 years or the cost basis is unknown.
+		BreakevenYears *int `json:"breakeven_years"`
+	}
 	type altResult struct {
-		ISIN        string  `json:"isin"`
-		Name        string  `json:"name"`
-		CurrentTER  float64 `json:"current_ter"`
-		Value       float64 `json:"value"`
-		Alternatives []struct {
-			ISIN          string  `json:"isin"`
-			Name          string  `json:"name"`
-			TER           float64 `json:"ter"`
-			AnnualSaving  float64 `json:"annual_saving"`
-			TenYearSaving float64 `json:"ten_year_saving"`
-		} `json:"alternatives"`
+		ISIN           string        `json:"isin"`
+		Name           string        `json:"name"`
+		Index          string        `json:"index"`
+		CurrentTER     float64       `json:"current_ter"`
+		Value          float64       `json:"value"`
+		UnrealizedGain *float64      `json:"unrealized_gain"`
+		SwitchTax      *float64      `json:"switch_tax"`
+		Alternatives   []alternative `json:"alternatives"`
 	}
 
 	results := []altResult{}
-	for _, eh := range enriched {
+	for _, eh := range aggregateByISIN(enriched) {
 		alt, ok := altMap[eh.security.ISIN]
-		if !ok || len(alt.Alternatives) == 0 {
+		if !ok || len(alt.Alternatives) == 0 || eh.value <= 0 {
 			continue
 		}
 		// Prefer database TER (from metadata fetcher) over stale static JSON
@@ -2927,292 +3475,473 @@ func (h *AnalysisHandler) HandleAlternatives(w http.ResponseWriter, r *http.Requ
 		if currentTER <= 0 {
 			currentTER = alt.TER
 		}
-		r := altResult{
-			ISIN: eh.security.ISIN, Name: eh.security.Name,
-			CurrentTER: currentTER, Value: eh.value,
+		res := altResult{
+			ISIN: eh.security.ISIN, Name: eh.security.Name, Index: alt.Index,
+			CurrentTER: currentTER, Value: math.Round(eh.value*100) / 100,
+			Alternatives: []alternative{},
+		}
+		tfs := securityTFSRate(eh.security)
+		knownBasis := eh.costValue > 0
+		if knownBasis {
+			gain := math.Round((eh.value-eh.costValue)*100) / 100
+			tax := math.Round(switchTaxCost(eh.value-eh.costValue, tfs, 0)*100) / 100
+			res.UnrealizedGain = &gain
+			res.SwitchTax = &tax
 		}
 		for _, a := range alt.Alternatives {
 			if a.TER >= currentTER {
 				continue // only show cheaper alternatives
 			}
 			saving := eh.value * (currentTER - a.TER) / 100
-			r.Alternatives = append(r.Alternatives, struct {
-				ISIN          string  `json:"isin"`
-				Name          string  `json:"name"`
-				TER           float64 `json:"ter"`
-				AnnualSaving  float64 `json:"annual_saving"`
-				TenYearSaving float64 `json:"ten_year_saving"`
-			}{
-				ISIN: a.ISIN, Name: a.Name, TER: a.TER,
-				AnnualSaving: math.Round(saving*100) / 100,
-				TenYearSaving: math.Round(saving*10*100) / 100,
-			})
-		}
-		if len(r.Alternatives) > 0 {
-			results = append(results, r)
-		}
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"alternatives": results})
-}
-
-// HandleSpending categorizes transactions and computes spending analytics.
-func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	txns, err := listAllTransactionsRows(ctx, h.queries)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
-		return
-	}
-	holdings, _ := assets.Load(ctx, h.queries)
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-
-	// Category patterns: match counterparty or reference
-	type pattern struct {
-		category string
-		keywords []string
-	}
-	patterns := []pattern{
-		{"Housing", []string{"miete", "rent", "wohnung", "hausgeld", "nebenkosten", "strom", "gas", "heizung", "stadtwerke", "wasser", "gez", "rundfunk"}},
-		{"Insurance", []string{"versicherung", "insurance", "allianz", "huk", "axa", "ergo", "debeka", "krankenversicherung", "haftpflicht", "berufsunfähigkeit"}},
-		{"Subscriptions", []string{"spotify", "netflix", "amazon prime", "disney", "youtube", "apple", "google storage", "cloud", "abo", "mitgliedschaft", "fitnessstudio", "gym"}},
-		{"Groceries", []string{"rewe", "edeka", "aldi", "lidl", "penny", "netto", "kaufland", "dm ", "rossmann", "supermarkt", "lebensmittel"}},
-		{"Transport", []string{"tankstelle", "aral", "shell", "total", "db ", "bahn", "bvg", "mvv", "hvv", "swb", "tier", "uber", "taxi", "kfz", "tüv", "adac"}},
-		{"Dining", []string{"restaurant", "gaststätte", "lieferando", "lieferservice", "pizz", "burger", "sushi", "café", "cafe", "bistro", "imbiss", "mcdonald", "starbuck"}},
-		{"Shopping", []string{"amazon", "zalando", "otto", "ebay", "mediamarkt", "saturn", "ikea", "h&m", "zara", "deichmann"}},
-		{"Health", []string{"apotheke", "arzt", "praxis", "labor", "krankenhaus", "physio", "zahnarzt", "optiker"}},
-		{"Education", []string{"schule", "universität", "studium", "kurs", "seminar", "vhs", "bücher", "udemy"}},
-		{"Investment", []string{"sparplan", "depot", "wertpapier", "etf", "aktie", "fonds", "scalable", "trade republic", "comdirect", "dkb"}},
-		{"Transfer", []string{"umbuchung", "übertrag", "migration", "internal transfer", "transfer"}},
-		{"Income", []string{"gehalt", "lohn", "salary", "bonus", "gutschrift", "erstattung", "rückzahlung", "kindergeld"}},
-	}
-
-	categorize := func(counterparty, reference, txnType string) string {
-		text := strings.ToLower(counterparty + " " + reference)
-		for _, p := range patterns {
-			for _, kw := range p.keywords {
-				if strings.Contains(text, kw) {
-					return p.category
+			tenYear := feeDragFV(eh.value, currentTER, costProjectionGrowthPct, 10) -
+				feeDragFV(eh.value, a.TER, costProjectionGrowthPct, 10)
+			item := alternative{
+				ISIN: a.ISIN, Name: a.Name, Index: a.Index,
+				SameIndex:     strings.EqualFold(strings.TrimSpace(a.Index), strings.TrimSpace(alt.Index)),
+				TER:           a.TER,
+				AnnualSaving:  math.Round(saving*100) / 100,
+				TenYearSaving: math.Round(tenYear*100) / 100,
+			}
+			if knownBasis {
+				net, breakeven := switchOutcome(eh.value, eh.costValue, currentTER, a.TER, tfs)
+				net = math.Round(net*100) / 100
+				item.TenYearNetAfterTax = &net
+				if breakeven > 0 {
+					item.BreakevenYears = &breakeven
 				}
 			}
+			res.Alternatives = append(res.Alternatives, item)
 		}
-		// Fallback by transaction type
-		switch txnType {
-		case "buy", "savings_plan":
-			return "Investment"
-		case "sell":
-			return "Investment"
-		case "dividend":
-			return "Dividends"
-		case "interest":
-			return "Interest"
-		case "fee":
-			return "Fees"
-		case "deposit":
-			return "Income"
-		case "withdrawal":
-			return "Transfer"
-		case "transfer", "transfer_out":
-			return "Transfer"
+		if len(res.Alternatives) > 0 {
+			results = append(results, res)
 		}
-		return "Other"
 	}
 
-	// Process transactions
-	type monthlySpend struct {
-		Month    string             `json:"month"`
-		Income   float64            `json:"income"`
-		Expenses float64            `json:"expenses"`
-		Net      float64            `json:"net"`
-		ByCategory map[string]float64 `json:"by_category"`
+	writeJSON(w, http.StatusOK, map[string]any{
+		"alternatives": results,
+		"growth_pct":   costProjectionGrowthPct,
+	})
+}
+
+// spendingEntry is one classified cash movement on a checking or savings
+// account, in EUR.
+type spendingEntry struct {
+	Date         time.Time
+	Category     cashflow.Category
+	Amount       float64 // signed: + inflow, − outflow
+	Counterparty string
+	Explicit     bool // category set by the user
+	LoanPart     bool // interest or principal part of a matched loan instalment
+}
+
+// spendingEntriesFromCash classifies checking/savings rows exactly like the
+// Cashflow page: signed cash delta (amount and fee, whatever sign the import
+// stored), matched loan instalments split into interest (housing/transport)
+// and principal, everything else through cashflow.ResolveCategory.
+// split reports a matched loan instalment's interest and whether it finances
+// a car.
+func spendingEntriesFromCash(rows []db.ListCashTransactionsRow, toEUR func(amount float64, currency string, date time.Time) float64, split func(id uuid.UUID) (interest float64, car bool, ok bool)) []spendingEntry {
+	out := make([]spendingEntry, 0, len(rows))
+	for _, row := range rows {
+		amt := toEUR(numericToFloat(row.Amount), row.Currency, row.Date)
+		fee := toEUR(numericToFloat(row.Fee), row.Currency, row.Date)
+		tax := toEUR(numericToFloat(row.Tax), row.Currency, row.Date)
+		amount := txnSignedCashDelta(row.Type, false, amt, fee, tax)
+		if amount == 0 {
+			continue
+		}
+		cp := ""
+		if row.Counterparty.Valid {
+			cp = row.Counterparty.String
+		}
+		if interest, car, ok := split(row.ID); ok {
+			interestCat := cashflow.CatHousing
+			if car {
+				interestCat = cashflow.CatTransport
+			}
+			interestPart := math.Copysign(math.Min(interest, math.Abs(amount)), amount)
+			out = append(out,
+				spendingEntry{Date: row.Date, Category: interestCat, Amount: interestPart, Counterparty: cp, LoanPart: true},
+				spendingEntry{Date: row.Date, Category: cashflow.CatLoanPrincipal, Amount: amount - interestPart, Counterparty: cp, LoanPart: true})
+			continue
+		}
+		ref, override := "", ""
+		if row.Reference.Valid {
+			ref = row.Reference.String
+		}
+		if row.Category.Valid {
+			override = row.Category.String
+		}
+		env := cashflow.Env{AccountType: row.AccountType}
+		cat := cashflow.ResolveCategoryWith(env, override, row.Type, cp, ref)
+		if amount > 0 {
+			if spendCat, ok := spendingRefundCategory(env, override, cp, ref, cat); ok {
+				cat = spendCat
+			}
+		}
+		out = append(out, spendingEntry{
+			Date:         row.Date,
+			Category:     cat,
+			Amount:       amount,
+			Counterparty: cp,
+			Explicit:     strings.TrimSpace(override) != "",
+		})
 	}
-	type categoryTotal struct {
-		Category string  `json:"category"`
-		Total    float64 `json:"total"`
-		Count    int     `json:"count"`
-		AvgMonthly float64 `json:"avg_monthly"`
+	return out
+}
+
+// spendingRefundCategory returns the spending category an inflow should net
+// against on the Spending tab. The shared classifier books money back from a
+// merchant as CatRefund (income on the Cashflow page); here a refund reduces
+// the category it came from: the user's spending-category override if there
+// is one, else the merchant category the same text would get as an outflow.
+func spendingRefundCategory(env cashflow.Env, override, counterparty, reference string, resolved cashflow.Category) (cashflow.Category, bool) {
+	isSpend := func(c cashflow.Category) bool {
+		b := cashflow.BucketOf(c)
+		return b == cashflow.BucketFixed || b == cashflow.BucketVariable
+	}
+	if o := cashflow.Category(strings.ToLower(strings.TrimSpace(override))); o != "" && cashflow.IsKnown(o) && isSpend(o) {
+		return o, true
+	}
+	if resolved == cashflow.CatRefund {
+		if c := cashflow.ClassifyWith(env, "withdrawal", counterparty, reference); isSpend(c) {
+			return c, true
+		}
+	}
+	return "", false
+}
+
+// spendingMonth is one calendar month of the spending series.
+type spendingMonth struct {
+	Month      string             `json:"month"`
+	Income     float64            `json:"income"`
+	Expenses   float64            `json:"expenses"`
+	Net        float64            `json:"net"`
+	ByCategory map[string]float64 `json:"by_category"`
+}
+
+// spendingCategory is one category's spending over the whole span.
+type spendingCategory struct {
+	Category   string  `json:"category"`
+	Total      float64 `json:"total"`
+	Count      int     `json:"count"`
+	AvgMonthly float64 `json:"avg_monthly"`
+}
+
+// spendingSubscription is a detected recurring charge.
+type spendingSubscription struct {
+	Name        string  `json:"name"`
+	Amount      float64 `json:"amount"`
+	Frequency   int     `json:"occurrences"`
+	Cadence     string  `json:"cadence"`
+	LastCharged string  `json:"last_charged"`
+	AnnualCost  float64 `json:"annual_cost"`
+}
+
+// spendingSummary is the /analysis/spending response.
+type spendingSummary struct {
+	Monthly           []spendingMonth        `json:"monthly"`
+	Categories        []spendingCategory     `json:"categories"`
+	Subscriptions     []spendingSubscription `json:"subscriptions"`
+	TotalIncome       float64                `json:"total_income"`
+	TotalExpenses     float64                `json:"total_expenses"`
+	SavingsRatePct    float64                `json:"savings_rate_pct"`
+	SavingsRatePct12m *float64               `json:"savings_rate_pct_12m"`
+	WindowMonths      int                    `json:"window_months"`
+	WindowFrom        string                 `json:"window_from,omitempty"`
+	WindowTo          string                 `json:"window_to,omitempty"`
+	AvgMonthlyExpense float64                `json:"avg_monthly_expense"`
+	MonthsAnalyzed    int                    `json:"months_analyzed"`
+	SpanFrom          string                 `json:"span_from,omitempty"`
+	SpanTo            string                 `json:"span_to,omitempty"`
+	// Inflows that matched no category and have no user category: likely
+	// own-account transfers, so they count as neither income nor a refund.
+	UnclassifiedInflow      float64 `json:"unclassified_inflow"`
+	UnclassifiedInflowCount int     `json:"unclassified_inflow_count"`
+}
+
+// computeSpending aggregates classified cash entries.
+//   - Income is the income bucket (salary, interest, refunds); spending is
+//     the fixed and variable buckets; transfers, investments, asset
+//     purchases and loan principal count as neither, on both sides.
+//   - An inflow in a spending category nets against that category (a shop
+//     refund). An inflow that matched no rule and has no user category is
+//     left out and reported as unclassified.
+//   - The month denominator is the calendar span of the data, first to last
+//     month with any checking/savings activity, counting months without
+//     activity.
+//   - The savings-rate window is the last 12 calendar months ending in the
+//     month of `now`, limited to that span.
+func computeSpending(entries []spendingEntry, now time.Time) spendingSummary {
+	res := spendingSummary{
+		Monthly:       []spendingMonth{},
+		Categories:    []spendingCategory{},
+		Subscriptions: []spendingSubscription{},
+	}
+	if len(entries) == 0 {
+		return res
+	}
+	monthStart := func(t time.Time) time.Time { return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC) }
+	spanFrom, spanTo := monthStart(entries[0].Date), monthStart(entries[0].Date)
+	asOf := entries[0].Date
+	for _, e := range entries {
+		if m := monthStart(e.Date); m.Before(spanFrom) {
+			spanFrom = m
+		} else if m.After(spanTo) {
+			spanTo = m
+		}
+		if e.Date.After(asOf) {
+			asOf = e.Date
+		}
 	}
 
-	monthMap := make(map[string]*monthlySpend)
-	catTotals := make(map[string]*categoryTotal)
-	allCategories := make(map[string]bool)
-
-	// Track recurring charges for subscription detection
+	months := map[string]*spendingMonth{}
+	var order []string
+	for m := spanFrom; !m.After(spanTo); m = addMonthsFirstOfMonth(m, 1) {
+		key := m.Format("2006-01")
+		months[key] = &spendingMonth{Month: key, ByCategory: map[string]float64{}}
+		order = append(order, key)
+	}
+	catTotals := map[string]*spendingCategory{}
 	type chargeKey struct {
 		counterparty string
 		amount       float64
 	}
-	chargeFreq := make(map[chargeKey]int)
+	charges := map[chargeKey][]spendingEntry{}
 
-	for _, txn := range txns {
-		if isAssetPurchase(txn.Category) {
-			continue // cash → physical asset, not an expense
-		}
-		cp := ""
-		if txn.Counterparty.Valid { cp = txn.Counterparty.String }
-		ref := ""
-		if txn.Reference.Valid { ref = txn.Reference.String }
-		amt := 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-		}
-
-		cat := categorize(cp, ref, txn.Type)
-		// Use user-assigned category if set
-		if txn.Category.Valid && txn.Category.String != "" {
-			cat = txn.Category.String
-		}
-		// Loan instalment: only the interest is spending; the principal is saved.
-		if isLoanPayment(txn.Category) {
-			interest, _, kind, ok := holdings.PaymentSplit(txn.ID)
-			if !ok {
+	for _, e := range entries {
+		ms := months[e.Date.Format("2006-01")]
+		cat := e.Category
+		var spend float64 // > 0 adds to spending, < 0 is a refund
+		switch cashflow.BucketOf(cat) {
+		case cashflow.BucketIncome:
+			if e.Amount > 0 {
+				ms.Income += e.Amount
 				continue
 			}
-			amt = math.Copysign(interest, amt)
-			cat = "Housing"
-			if kind == assets.KindCar {
-				cat = "Transport"
+			// Money out under an income label (e.g. a repaid refund) is
+			// still money spent.
+			cat = cashflow.CatOther
+			spend = -e.Amount
+		case cashflow.BucketUnclassified:
+			// Unmatched money in (often own money moved between banks) is
+			// neither income nor a refund; report it separately.
+			if e.Amount > 0 {
+				res.UnclassifiedInflow += e.Amount
+				res.UnclassifiedInflowCount++
 			}
-		}
-		allCategories[cat] = true
-
-		month := txn.Date.Format("2006-01")
-		ms, ok := monthMap[month]
-		if !ok {
-			ms = &monthlySpend{Month: month, ByCategory: make(map[string]float64)}
-			monthMap[month] = ms
-		}
-
-		// For spending analysis, focus on cash flow (not investment transactions)
-		// Classify: withdrawals from brokerage accounts are transfers, not expenses
-		// Same for deposits that are internal transfers (Sparplan, Umbuchung, Migration)
-		// Cash transfers between accounts are never income or expenses
-		if txn.Type == "cash_transfer_in" || txn.Type == "cash_transfer_out" {
+			continue
+		case cashflow.BucketFixed, cashflow.BucketVariable:
+			if e.Amount > 0 && !e.Explicit && cat == cashflow.CatOther {
+				res.UnclassifiedInflow += e.Amount
+				res.UnclassifiedInflowCount++
+				continue
+			}
+			spend = -e.Amount
+		default: // transfers, investments, asset purchases, loan principal
 			continue
 		}
-		isBrokerageTransfer := (txn.Type == "withdrawal" || txn.Type == "deposit") &&
-			(strings.Contains(strings.ToLower(cp), "broker") || strings.Contains(strings.ToLower(cp), "scalable") ||
-				strings.Contains(strings.ToLower(cp), "trade republic") || strings.Contains(strings.ToLower(cp), "sparplan") ||
-				strings.Contains(strings.ToLower(cp), "umbuchung") || strings.Contains(strings.ToLower(cp), "migration") ||
-				strings.Contains(strings.ToLower(cp), "internal transfer") || strings.Contains(strings.ToLower(cp), "übertrag"))
-		isExpense := (txn.Type == "fee") ||
-			(txn.Type == "withdrawal" && !isBrokerageTransfer) ||
-			(amt < 0 && txn.Type != "buy" && txn.Type != "savings_plan" && txn.Type != "transfer" && txn.Type != "transfer_out" && txn.Type != "withdrawal")
-		isIncome := (txn.Type == "dividend" || txn.Type == "interest") ||
-			(txn.Type == "deposit" && !isBrokerageTransfer) ||
-			(amt > 0 && txn.Type != "sell" && txn.Type != "transfer" && txn.Type != "transfer_out" && txn.Type != "deposit" && txn.Type != "dividend" && txn.Type != "interest")
-
-		if isExpense {
-			expAmt := math.Abs(amt)
-			ms.Expenses += expAmt
-			ms.ByCategory[cat] += expAmt
-			ct := catTotals[cat]
-			if ct == nil { ct = &categoryTotal{Category: cat}; catTotals[cat] = ct }
-			ct.Total += expAmt
+		ms.Expenses += spend
+		ms.ByCategory[string(cat)] += spend
+		ct := catTotals[string(cat)]
+		if ct == nil {
+			ct = &spendingCategory{Category: string(cat)}
+			catTotals[string(cat)] = ct
+		}
+		ct.Total += spend
+		if spend > 0 {
 			ct.Count++
-		} else if isIncome && cat != "Investment" && cat != "Transfer" {
-			ms.Income += amt
 		}
-
-		// Track for subscription detection (exclude investment/dividend/transfer types)
-		if cp != "" && amt != 0 && txn.Type != "buy" && txn.Type != "sell" && txn.Type != "savings_plan" &&
-			txn.Type != "dividend" && txn.Type != "transfer" && txn.Type != "transfer_out" && txn.Type != "fee" {
-			key := chargeKey{counterparty: strings.ToLower(cp), amount: math.Round(math.Abs(amt)*100) / 100}
-			chargeFreq[key]++
+		if e.Amount < 0 && !e.LoanPart && strings.TrimSpace(e.Counterparty) != "" {
+			key := chargeKey{
+				counterparty: strings.ToLower(strings.TrimSpace(e.Counterparty)),
+				amount:       math.Round(-e.Amount*100) / 100,
+			}
+			charges[key] = append(charges[key], e)
 		}
 	}
 
-	// Build monthly series (sorted chronologically)
-	var months []string
-	for m := range monthMap {
-		months = append(months, m)
-	}
-	sort.Strings(months)
-
-	monthlySeries := []monthlySpend{}
-	for _, m := range months {
-		ms := monthMap[m]
+	numMonths := float64(len(order))
+	windowStart := addMonthsFirstOfMonth(monthStart(now), -11)
+	windowEnd := monthStart(now)
+	windowIncome, windowExpenses := 0.0, 0.0
+	for _, key := range order {
+		ms := months[key]
 		ms.Net = ms.Income - ms.Expenses
-		monthlySeries = append(monthlySeries, *ms)
+		res.TotalIncome += ms.Income
+		res.TotalExpenses += ms.Expenses
+		m, _ := time.Parse("2006-01", key)
+		if !m.Before(windowStart) && !m.After(windowEnd) {
+			windowIncome += ms.Income
+			windowExpenses += ms.Expenses
+			if res.WindowFrom == "" {
+				res.WindowFrom = key
+			}
+			res.WindowTo = key
+			res.WindowMonths++
+		}
+		ms.Income = math.Round(ms.Income*100) / 100
+		ms.Expenses = math.Round(ms.Expenses*100) / 100
+		ms.Net = math.Round(ms.Net*100) / 100
+		res.Monthly = append(res.Monthly, *ms)
 	}
+	if res.TotalIncome > 0 {
+		res.SavingsRatePct = math.Round((res.TotalIncome-res.TotalExpenses)/res.TotalIncome*1000) / 10
+	}
+	if windowIncome > 0 {
+		rate := math.Round((windowIncome-windowExpenses)/windowIncome*1000) / 10
+		res.SavingsRatePct12m = &rate
+	}
+	res.MonthsAnalyzed = len(order)
+	res.SpanFrom = spanFrom.Format("2006-01")
+	res.SpanTo = spanTo.Format("2006-01")
+	res.AvgMonthlyExpense = math.Round(res.TotalExpenses/numMonths*100) / 100
+	res.TotalIncome = math.Round(res.TotalIncome*100) / 100
+	res.TotalExpenses = math.Round(res.TotalExpenses*100) / 100
+	res.UnclassifiedInflow = math.Round(res.UnclassifiedInflow*100) / 100
 
-	// Build category totals
-	numMonths := float64(len(months))
-	if numMonths < 1 { numMonths = 1 }
-	categories := []categoryTotal{}
 	for _, ct := range catTotals {
+		if ct.Total <= 0 {
+			continue // fully refunded
+		}
 		ct.AvgMonthly = math.Round(ct.Total/numMonths*100) / 100
 		ct.Total = math.Round(ct.Total*100) / 100
-		categories = append(categories, *ct)
+		res.Categories = append(res.Categories, *ct)
 	}
-	sort.Slice(categories, func(i, j int) bool { return categories[i].Total > categories[j].Total })
-
-	// Detect subscriptions: same counterparty + same amount appearing 3+ times
-	type subscription struct {
-		Name       string  `json:"name"`
-		Amount     float64 `json:"amount"`
-		Frequency  int     `json:"occurrences"`
-		AnnualCost float64 `json:"annual_cost"`
-	}
-	subscriptions := []subscription{}
-	for key, freq := range chargeFreq {
-		if freq >= 3 && key.amount > 1 && key.amount < 500 {
-			annual := key.amount * 12 // assume monthly
-			if freq < 8 { annual = key.amount * float64(freq) } // use actual frequency if < monthly
-			subscriptions = append(subscriptions, subscription{
-				Name: key.counterparty, Amount: key.amount,
-				Frequency: freq, AnnualCost: math.Round(annual*100) / 100,
-			})
+	sort.Slice(res.Categories, func(i, j int) bool {
+		if res.Categories[i].Total != res.Categories[j].Total {
+			return res.Categories[i].Total > res.Categories[j].Total
 		}
-	}
-	sort.Slice(subscriptions, func(i, j int) bool { return subscriptions[i].AnnualCost > subscriptions[j].AnnualCost })
-
-	// Compute totals — lifetime (across all months_analyzed) AND a trailing
-	// 12-month window so seasonality and old high-spend years don't drag the
-	// headline savings rate down. Both fields surface; frontend headline uses
-	// the windowed one for recency, with lifetime available as a sub-line.
-	totalExpenses := 0.0
-	totalIncome := 0.0
-	for _, ms := range monthlySeries {
-		totalExpenses += ms.Expenses
-		totalIncome += ms.Income
-	}
-	savingsRate := 0.0
-	if totalIncome > 0 {
-		savingsRate = (totalIncome - totalExpenses) / totalIncome * 100
-	}
-
-	// Trailing 12 months — slice the chronologically-sorted monthlySeries.
-	windowStart := len(monthlySeries) - 12
-	if windowStart < 0 {
-		windowStart = 0
-	}
-	windowExpenses := 0.0
-	windowIncome := 0.0
-	for _, ms := range monthlySeries[windowStart:] {
-		windowExpenses += ms.Expenses
-		windowIncome += ms.Income
-	}
-	savingsRate12m := 0.0
-	if windowIncome > 0 {
-		savingsRate12m = (windowIncome - windowExpenses) / windowIncome * 100
-	}
-	windowMonths := len(monthlySeries) - windowStart
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"monthly":             monthlySeries,
-		"categories":          categories,
-		"subscriptions":       subscriptions,
-		"total_income":        math.Round(totalIncome*100) / 100,
-		"total_expenses":      math.Round(totalExpenses*100) / 100,
-		"savings_rate_pct":    math.Round(savingsRate*10) / 10,
-		"savings_rate_pct_12m": math.Round(savingsRate12m*10) / 10,
-		"window_months":       windowMonths,
-		"avg_monthly_expense": math.Round(totalExpenses/numMonths*100) / 100,
-		"months_analyzed":     len(months),
+		return res.Categories[i].Category < res.Categories[j].Category
 	})
+
+	groups := make([]subscriptionCharges, 0, len(charges))
+	for key, list := range charges {
+		g := subscriptionCharges{Amount: key.amount}
+		sort.Slice(list, func(i, j int) bool { return list[i].Date.Before(list[j].Date) })
+		for _, e := range list {
+			g.Dates = append(g.Dates, e.Date)
+		}
+		g.Name = list[len(list)-1].Counterparty
+		groups = append(groups, g)
+	}
+	res.Subscriptions = detectSubscriptions(groups, asOf)
+	return res
+}
+
+// subscriptionCharges is every charge of one amount to one payee, oldest first.
+type subscriptionCharges struct {
+	Name   string
+	Amount float64
+	Dates  []time.Time
+}
+
+// subscriptionCadences are the billing cycles recognised by
+// detectSubscriptions: a median gap between charges inside [minDays,
+// maxDays] snaps to perYear charges a year.
+var subscriptionCadences = []struct {
+	name             string
+	minDays, maxDays float64
+	perYear          float64
+}{
+	{"weekly", 5, 9, 52},
+	{"every two weeks", 12, 16, 26},
+	{"monthly", 26, 35, 12},
+	{"every two months", 55, 66, 6},
+	{"quarterly", 80, 100, 4},
+	{"half-yearly", 170, 195, 2},
+	{"yearly", 340, 390, 1},
+}
+
+// detectSubscriptions finds recurring charges: the same payee charging the
+// same amount (1-500 €) at least three times. The cadence comes from the
+// median gap between charges and must match a regular billing cycle; the
+// annual cost is amount × charges per year of that cycle (equivalently
+// amount × 365.25 / gap). A subscription whose last charge is more than 1.5
+// cycles before asOf (the newest transaction on record) has lapsed and is
+// dropped.
+func detectSubscriptions(groups []subscriptionCharges, asOf time.Time) []spendingSubscription {
+	out := []spendingSubscription{}
+	for _, g := range groups {
+		if len(g.Dates) < 3 || g.Amount <= 1 || g.Amount >= 500 {
+			continue
+		}
+		dates := append([]time.Time(nil), g.Dates...)
+		sort.Slice(dates, func(i, j int) bool { return dates[i].Before(dates[j]) })
+		gaps := make([]float64, 0, len(dates)-1)
+		for i := 1; i < len(dates); i++ {
+			gaps = append(gaps, dates[i].Sub(dates[i-1]).Hours()/24)
+		}
+		sort.Float64s(gaps)
+		median := gaps[len(gaps)/2]
+		if len(gaps)%2 == 0 {
+			median = (gaps[len(gaps)/2-1] + gaps[len(gaps)/2]) / 2
+		}
+		cadence := -1
+		for i, c := range subscriptionCadences {
+			if median >= c.minDays && median <= c.maxDays {
+				cadence = i
+				break
+			}
+		}
+		if cadence < 0 {
+			continue
+		}
+		c := subscriptionCadences[cadence]
+		last := dates[len(dates)-1]
+		if asOf.Sub(last).Hours()/24 > 1.5*365.25/c.perYear {
+			continue // lapsed
+		}
+		out = append(out, spendingSubscription{
+			Name:        g.Name,
+			Amount:      g.Amount,
+			Frequency:   len(dates),
+			Cadence:     c.name,
+			LastCharged: last.Format("2006-01-02"),
+			AnnualCost:  math.Round(g.Amount*c.perYear*100) / 100,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AnnualCost != out[j].AnnualCost {
+			return out[i].AnnualCost > out[j].AnnualCost
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// HandleSpending computes the savings rate, spending by category and
+// recurring charges from checking and savings accounts, with the same scope
+// and classifier as the Cashflow page (see computeSpending).
+func (h *AnalysisHandler) HandleSpending(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	now := time.Now()
+	to := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.UTC) // last day of this month
+	rows, err := h.queries.ListCashTransactions(ctx, db.ListCashTransactionsParams{
+		Date:   time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC),
+		Date_2: to,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list cash transactions: "+err.Error())
+		return
+	}
+	holdings, err := assets.Load(ctx, h.queries)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load loans: "+err.Error())
+		return
+	}
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+
+	entries := spendingEntriesFromCash(rows,
+		func(amount float64, currency string, date time.Time) float64 {
+			return convertAmountToEURAtDate(amount, currency, date, histFX, fxRates)
+		},
+		func(id uuid.UUID) (float64, bool, bool) {
+			interest, _, kind, ok := holdings.PaymentSplit(id)
+			return interest, kind == assets.KindCar, ok
+		})
+	writeJSON(w, http.StatusOK, computeSpending(entries, now))
 }
 
 // taxCalendarFSATitle is a plain string constant (not a format string), so the percent
@@ -3414,7 +4143,14 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// volElevatedPct is the 30-day annualised volatility (in %) above which the
+// Risk tab flags elevated volatility; the flag and its message use the same
+// threshold so the callout never shows up empty.
+const volElevatedPct = 25.0
+
 // HandleVolatilityContext provides factual context during elevated volatility.
+// It uses the same investable, flow-adjusted and smoothed series as the Risk
+// tab's KPI tiles.
 func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	snaps, err := h.queries.ListNetWorthSnapshots(ctx, 3000)
@@ -3423,27 +4159,18 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Build chronological points
-	points := make([]analytics.DailyValuation, len(snaps))
-	for i, s := range snaps {
-		val := 0.0
-		if s.Total.Valid {
-			f, _ := s.Total.Float64Value()
-			val = f.Float64
-		}
-		points[len(snaps)-1-i] = analytics.DailyValuation{Date: s.Date, Value: val}
-	}
-	start := 0
-	for start < len(points) && points[start].Value <= 0 {
-		start++
-	}
-	points = points[start:]
-	points = analytics.BuildCashflowAdjustedSeries(points, h.buildExternalFlowsForRisk(ctx))
+	raw := investableRiskSeries(snaps)
+	points := analytics.PrepareRiskSeries(analytics.BuildCashflowAdjustedSeries(raw, h.buildInvestableFlowsForRisk(ctx)))
 	if len(points) < 31 {
 		writeJSON(w, http.StatusOK, map[string]any{"elevated": false})
 		return
 	}
+	writeJSON(w, http.StatusOK, volatilityContext(points, raw))
+}
 
+// volatilityContext builds the elevated-volatility callout from a prepared
+// flow-adjusted series (points) and the recorded values (raw).
+func volatilityContext(points, raw []analytics.DailyValuation) map[string]any {
 	current := points[len(points)-1].Value
 	peak := 0.0
 	peakDate := ""
@@ -3458,41 +4185,7 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 		drawdownPct = (current - peak) / peak * 100
 	}
 
-	// Compute 30-day volatility (safe index bounds: startIdx >= 1)
-	returns := make([]float64, 0, 30)
-	startIdx := len(points) - 30
-	if startIdx < 1 {
-		startIdx = 1
-	}
-	for i := startIdx; i < len(points); i++ {
-		if points[i-1].Value > 0 {
-			r := (points[i].Value - points[i-1].Value) / points[i-1].Value
-			returns = append(returns, r)
-		}
-	}
-	avg := 0.0
-	for _, r := range returns {
-		avg += r
-	}
-	if len(returns) > 0 {
-		avg /= float64(len(returns))
-	}
-	variance := 0.0
-	for _, r := range returns {
-		d := r - avg
-		variance += d * d
-	}
-	if len(returns) > 1 {
-		variance /= float64(len(returns) - 1)
-	}
-	periodsPerYear := 252.0
-	if len(points) >= 10 {
-		spanDays := points[len(points)-1].Date.Sub(points[0].Date).Hours() / 24.0
-		if spanDays >= 14 && float64(len(points)-1)/(spanDays/365.25) > 300 {
-			periodsPerYear = 365.25
-		}
-	}
-	vol30d := math.Sqrt(variance) * math.Sqrt(periodsPerYear) * 100
+	vol30d := analytics.RecentVolatility(points, 30) * 100
 
 	// Historical drawdown recovery analysis
 	type drawdownEpisode struct {
@@ -3539,45 +4232,87 @@ func (h *AnalysisHandler) HandleVolatilityContext(w http.ResponseWriter, r *http
 		}
 	}
 
-	// Elevated volatility detection
-	elevated := vol30d > 20 || drawdownPct < -5
-
-	// Context message
-	message := ""
-	if drawdownPct < -10 {
-		message = fmt.Sprintf("Portfolio is %.1f%% below its all-time high (%s). ", math.Abs(drawdownPct), peakDate)
-		if len(episodes) > 0 {
-			avgRecovery := 0
-			for _, ep := range episodes {
-				avgRecovery += ep.RecoveryDays
-			}
-			avgRecovery /= len(episodes)
-			message += fmt.Sprintf("Your portfolio has recovered from %d drawdowns before, averaging %d days to recover.", len(episodes), avgRecovery)
+	avgRecovery := 0
+	if len(episodes) > 0 {
+		for _, ep := range episodes {
+			avgRecovery += ep.RecoveryDays
 		}
-	} else if drawdownPct < -5 {
-		message = fmt.Sprintf("Portfolio is %.1f%% off its peak. This is within normal market fluctuation.", math.Abs(drawdownPct))
-	} else if vol30d > 25 {
-		message = fmt.Sprintf("30-day volatility is elevated at %.0f%% (annualized). Markets are choppy but your portfolio is near its highs.", vol30d)
+		avgRecovery /= len(episodes)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"elevated":       elevated,
-		"current_value":  math.Round(current),
-		"all_time_high":  math.Round(peak),
-		"ath_date":       peakDate,
-		"drawdown_pct":   math.Round(drawdownPct*10) / 10,
-		"vol_30d":        math.Round(vol30d*10) / 10,
-		"message":        message,
-		"past_drawdowns": episodes,
-		"drawdown_count": len(episodes),
-	})
+	// Elevated volatility detection. Every case that sets the flag also sets
+	// a reason and a message, so the callout is never empty.
+	reason, message := "", ""
+	switch {
+	case drawdownPct < -10:
+		reason = "deep_drawdown"
+		message = fmt.Sprintf("Returns are %.1f%% below their peak of %s. ", math.Abs(drawdownPct), peakDate)
+		if len(episodes) > 0 {
+			message += fmt.Sprintf("The portfolio has recovered from %d drawdowns before, averaging %d days to recover.", len(episodes), avgRecovery)
+		}
+	case drawdownPct < -5:
+		reason = "drawdown"
+		message = fmt.Sprintf("Returns are %.1f%% below their peak. This is within normal market fluctuation.", math.Abs(drawdownPct))
+	case vol30d > volElevatedPct:
+		reason = "volatility"
+		message = fmt.Sprintf("30-day volatility is elevated at %.0f%% (annualized). Markets are choppy but returns are near their peak.", vol30d)
+	}
+	elevated := reason != ""
+
+	// Recorded high and current value of cash and securities (the index above
+	// is scaled, so its peak is not a value the portfolio ever had).
+	recordedHigh, recordedHighDate := 0.0, ""
+	for _, p := range raw {
+		if p.Value > recordedHigh {
+			recordedHigh, recordedHighDate = p.Value, p.Date.Format("2006-01-02")
+		}
+	}
+	recordedCurrent := 0.0
+	if len(raw) > 0 {
+		recordedCurrent = raw[len(raw)-1].Value
+	}
+
+	return map[string]any{
+		"elevated":          elevated,
+		"reason":            reason,
+		"current_value":     math.Round(recordedCurrent),
+		"all_time_high":     math.Round(recordedHigh),
+		"ath_date":          recordedHighDate,
+		"peak_date":         peakDate,
+		"drawdown_pct":      math.Round(drawdownPct*10) / 10,
+		"vol_30d":           math.Round(vol30d*10) / 10,
+		"vol_threshold":     volElevatedPct,
+		"message":           message,
+		"past_drawdowns":    episodes,
+		"drawdown_count":    len(episodes),
+		"avg_recovery_days": avgRecovery,
+	}
 }
 
 // HandleOpportunityCost computes opportunity costs from cash drag, timing delays, and FSA waste.
+// Query params: monthly_expenses (€) and reserve_months (default 6) size the
+// emergency reserve the same way as the Contribution Router; joint=1 doubles
+// the saver's allowance; church_rate (0–0.09) sets the capital-income rate.
 func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	now := time.Now().UTC()
 	year := now.Year()
+	q := r.URL.Query()
+
+	monthlyExpenses := 0.0
+	if v, err := parseFiniteFloat(q.Get("monthly_expenses")); err == nil && v > 0 && v <= 1e7 {
+		monthlyExpenses = v
+	}
+	reserveMonths := float64(analytics.PlanningReserveMonths)
+	if v, err := parseFiniteFloat(q.Get("reserve_months")); err == nil && v >= 0 && v <= 36 {
+		reserveMonths = v
+	}
+	joint := q.Get("joint") == "1"
+	churchRate := 0.0
+	if v, err := parseFiniteFloat(q.Get("church_rate")); err == nil && v >= 0 && v <= 0.09 {
+		churchRate = v
+	}
+	capRate := analytics.CapitalIncomeTaxRate(churchRate)
 
 	accts, _ := h.queries.ListAccounts(ctx)
 	txns, _ := listAllTransactionsRows(ctx, h.queries)
@@ -3586,18 +4321,35 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 	fxRates := loadFXRatesMap(ctx, h.queries)
 	histFX := loadHistoricalFXRates(ctx, h.queries)
 	tfsMap := make(map[string]float64, len(secs))
+	secMap := make(map[string]db.Security, len(secs))
 	for _, s := range secs {
 		tfsMap[s.ISIN] = securityTFSRate(s)
+		secMap[s.ISIN] = s
 	}
 
 	// Portfolio total and annual return estimate
 	portfolioValue := 0.0
+	valueByISIN := make(map[string]float64)
+	qtyByISIN := make(map[string]float64)
+	unrealisedTaxable := 0.0 // § 20 gains that could be realised tax-free within the allowance
 	for _, eh := range enriched {
 		portfolioValue += eh.value
+		if eh.value > 0 {
+			valueByISIN[eh.security.ISIN] += eh.value
+			qtyByISIN[eh.security.ISIN] += numericToFloat(eh.holding.Quantity)
+		}
+		if gain := eh.value - eh.costValue; gain > 0 && !analytics.IsPrivateSaleAssetClass(eh.security.AssetClass) {
+			unrealisedTaxable += gain * (1 - tfsMap[eh.security.ISIN])
+		}
 	}
-	annualReturn := 0.07 // 7% nominal
+	annualReturnPct := analytics.PlanningDefaultReturnPct
+	annualReturn := annualReturnPct / 100
+	cashRatePct := analytics.PlanningCashRatePct
+	cashSpread := math.Max(0, annualReturnPct-cashRatePct) / 100
 
 	// --- 1. Cash Drag Analysis ---
+	// Idle cash still earns savings interest, so the cost is the spread between
+	// the expected portfolio return and the stated cash rate.
 	type accountCashDrag struct {
 		AccountName     string  `json:"account_name"`
 		AccountType     string  `json:"account_type"`
@@ -3617,24 +4369,24 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 			continue
 		}
 		totalCash += cash
-		oc := cash * annualReturn
 		cashDragAccounts = append(cashDragAccounts, accountCashDrag{
 			AccountName: acc.Name, AccountType: acc.Type,
 			CashBalance:     math.Round(cash*100) / 100,
-			OpportunityCost: math.Round(oc*100) / 100,
+			OpportunityCost: math.Round(cash*cashSpread*100) / 100,
 		})
 	}
 	sort.Slice(cashDragAccounts, func(i, j int) bool {
 		return cashDragAccounts[i].CashBalance > cashDragAccounts[j].CashBalance
 	})
 
-	totalWealth := portfolioValue + totalCash
-	recommendedReserve := totalWealth * 0.05 // 5% cash reserve
-	if recommendedReserve < 5000 {
-		recommendedReserve = 5000
+	// Reserve: the same months-of-expenses rule as the Contribution Router.
+	// Without known expenses no cash is called idle.
+	reserveKnown := monthlyExpenses > 0
+	recommendedReserve := monthlyExpenses * reserveMonths
+	excessCash, cashDragAnnual := 0.0, 0.0
+	if reserveKnown {
+		excessCash, cashDragAnnual = idleCashCost(totalCash, recommendedReserve, annualReturnPct, cashRatePct)
 	}
-	excessCash := math.Max(totalCash-recommendedReserve, 0)
-	cashDragAnnual := excessCash * annualReturn
 
 	// --- 2. Timing Cost: Sparplan delays ---
 	// Find months where savings_plan/buy was later than usual
@@ -3688,27 +4440,23 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 	avgDelayCost := float64(avgDay-1) * dailyReturn * avgMonthly * 12 // annual cost of avg delay
 
 	// --- 3. Rebalancing delay cost ---
-	// Check allocation drift from targets
+	// Euros that would have to move to reach the targets (half the summed
+	// absolute drift), assumed to earn 2 % less a year.
 	targets, _ := h.queries.ListTargetAllocations(ctx)
 	rebalanceCost := 0.0
 	if len(targets) > 0 && portfolioValue > 0 {
-		// Sum of absolute drift × estimated return difference
+		targetPct := make(map[string]float64, len(targets))
 		for _, t := range targets {
-			targetPct := numericToFloat(t.TargetWeightPct)
-			for _, eh := range enriched {
-				if eh.security.ISIN == t.SecurityISIN {
-					actualPct := eh.value / portfolioValue * 100
-					drift := math.Abs(actualPct - targetPct)
-					// Overweight in low-return assets or underweight in high-return = cost
-					// Estimate: 2% return drag per 10% drift
-					rebalanceCost += portfolioValue * drift / 100 * 0.02
-				}
-			}
+			targetPct[t.SecurityISIN] += numericToFloat(t.TargetWeightPct)
 		}
+		rebalanceCost = rebalanceTurnover(valueByISIN, targetPct) * 0.02
 	}
 
-	// --- 4. FSA Waste ---
-	ytdIncome := 0.0
+	// --- 4. Unused saver's allowance ---
+	// Income using the allowance this year: dividends and interest (projected
+	// to the full year), gains and losses already realised, and the
+	// Vorabpauschale deemed received on the first working day of the year.
+	recurringYTD := 0.0
 	for _, txn := range txns {
 		if txn.Date.Year() != year {
 			continue
@@ -3720,7 +4468,7 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 				if txn.Type == "dividend" && txn.SecurityISIN.Valid {
 					amtEUR *= 1 - tfsMap[txn.SecurityISIN.String]
 				}
-				ytdIncome += amtEUR
+				recurringYTD += amtEUR
 			}
 		}
 	}
@@ -3728,9 +4476,30 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 	if monthsElapsed < 1 {
 		monthsElapsed = 1
 	}
-	projectedIncome := ytdIncome / monthsElapsed * 12
-	fsaUnused := math.Max(analytics.Sparerpauschbetrag-projectedIncome, 0)
-	fsaWaste := fsaUnused * analytics.EffectiveTaxRate
+	projectedRecurring := recurringYTD / monthsElapsed * 12
+
+	realisedTaxable := 0.0
+	taxTxns, _, _, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
+	if summary := analytics.ComputeTaxSummary(taxTxns, year, nil); summary != nil {
+		for _, s := range summary.BySecurity {
+			if analytics.IsPrivateSaleAssetClass(secMap[s.ISIN].AssetClass) {
+				continue
+			}
+			realisedTaxable += s.TaxablePL
+		}
+	}
+	vorabTaxable := 0.0
+	for _, vp := range h.computeYearVorabpauschale(ctx, year-1, txns, secMap, tfsMap, valueByISIN, qtyByISIN, histFX, fxRates) {
+		vorabTaxable += vp.Vorabpauschale * (1 - tfsMap[vp.ISIN])
+	}
+
+	allowance := analytics.SparerPauschbetragForYear(year, joint)
+	projectedIncome := math.Max(0, projectedRecurring+realisedTaxable+vorabTaxable)
+	fsaUnused := math.Max(allowance-projectedIncome, 0)
+	// The allowance is only worth something if there are gains to realise
+	// into it (sell and rebuy to step up the cost basis).
+	fsaHarvestable := math.Min(fsaUnused, unrealisedTaxable)
+	fsaWaste := fsaHarvestable * capRate
 
 	// --- Total ---
 	totalAnnual := cashDragAnnual + avgDelayCost + rebalanceCost + fsaWaste
@@ -3765,27 +4534,36 @@ func (h *AnalysisHandler) HandleOpportunityCost(w http.ResponseWriter, r *http.R
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"cash_drag": map[string]any{
-			"accounts":           cashDragAccounts,
-			"total_cash":         math.Round(totalCash*100) / 100,
+			"accounts":            cashDragAccounts,
+			"total_cash":          math.Round(totalCash*100) / 100,
 			"recommended_reserve": math.Round(recommendedReserve),
-			"excess_cash":        math.Round(excessCash),
-			"annual_cost":        math.Round(cashDragAnnual),
+			"reserve_known":       reserveKnown,
+			"reserve_months":      reserveMonths,
+			"excess_cash":         math.Round(excessCash),
+			"annual_cost":         math.Round(cashDragAnnual),
+			"expected_return_pct": annualReturnPct,
+			"cash_rate_pct":       cashRatePct,
 		},
 		"timing": map[string]any{
-			"avg_invest_day":  avgDay,
-			"avg_monthly":     math.Round(avgMonthly),
-			"annual_cost":     math.Round(avgDelayCost),
+			"avg_invest_day": avgDay,
+			"avg_monthly":    math.Round(avgMonthly),
+			"annual_cost":    math.Round(avgDelayCost),
 		},
 		"rebalance": map[string]any{
 			"annual_cost": math.Round(rebalanceCost),
 		},
 		"fsa_waste": map[string]any{
-			"projected_income": math.Round(projectedIncome),
-			"unused":           math.Round(fsaUnused),
-			"annual_cost":      math.Round(fsaWaste),
+			"allowance":           allowance,
+			"projected_income":    math.Round(projectedIncome),
+			"projected_recurring": math.Round(projectedRecurring),
+			"realised_gains":      math.Round(realisedTaxable),
+			"vorabpauschale":      math.Round(vorabTaxable),
+			"unused":              math.Round(fsaUnused),
+			"harvestable":         math.Round(fsaHarvestable),
+			"annual_cost":         math.Round(fsaWaste),
 		},
-		"total_annual":    math.Round(totalAnnual),
-		"monthly_rollup":  monthlySeries,
+		"total_annual":   math.Round(totalAnnual),
+		"monthly_rollup": monthlySeries,
 	})
 }
 
@@ -3814,8 +4592,27 @@ func (h *AnalysisHandler) HandleDataQuality(w http.ResponseWriter, r *http.Reque
 		secMap[s.ISIN] = s
 	}
 
-	// --- 1. Stale Prices ---
+	// Holdings come per account; the price and dividend checks are about the
+	// security, so they run once per ISIN on the summed value (otherwise one
+	// ISIN held in two depots is reported twice).
+	type isinHolding struct {
+		security db.Security
+		value    float64
+	}
+	var byISIN []*isinHolding
+	isinIdx := make(map[string]*isinHolding)
 	for _, eh := range enriched {
+		ih := isinIdx[eh.security.ISIN]
+		if ih == nil {
+			ih = &isinHolding{security: eh.security}
+			isinIdx[eh.security.ISIN] = ih
+			byISIN = append(byISIN, ih)
+		}
+		ih.value += eh.value
+	}
+
+	// --- 1. Stale Prices ---
+	for _, eh := range byISIN {
 		if eh.value <= 0 {
 			continue
 		}
@@ -3853,7 +4650,7 @@ func (h *AnalysisHandler) HandleDataQuality(w http.ResponseWriter, r *http.Reque
 			}
 		}
 	}
-	for _, eh := range enriched {
+	for _, eh := range byISIN {
 		sec := eh.security
 		if sec.AssetClass != "etf" || eh.value < 1000 {
 			continue
@@ -4099,7 +4896,9 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 		Description string  `json:"description"`
 	}
 
-	// Static crisis library — MSCI World drawdowns (approximate)
+	// Static crisis library: approximate MSCI World price-index drawdowns in
+	// US dollars, and the index's recovery time after the trough. In euros the
+	// declines differed; the page says so.
 	scenarios := []crisisScenario{
 		{Name: "2008 Global Financial Crisis", Period: "Oct 2007 – Mar 2009", StartDate: "2007-10-01", EndDate: "2009-03-09", IndexReturn: -54.0, RecoveryMo: 50, WorstMonth: -18.9, Description: "Lehman collapse, global bank bailouts, housing market crash"},
 		{Name: "Dot-Com Crash", Period: "Mar 2000 – Oct 2002", StartDate: "2000-03-01", EndDate: "2002-10-09", IndexReturn: -47.0, RecoveryMo: 72, WorstMonth: -11.0, Description: "Tech bubble burst, 9/11 aftermath, Enron/WorldCom scandals"},
@@ -4115,23 +4914,21 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 	ctx := r.Context()
 	enriched, err := h.loadEnrichedHoldings(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"scenarios": scenarios, "portfolio_impact": []any{}})
+		writeError(w, http.StatusInternalServerError, "load holdings: "+err.Error())
 		return
 	}
 
-	totalValue := 0.0
-	equityValue := 0.0
+	totalValue, equityValue, cryptoValue := 0.0, 0.0, 0.0
 	for _, eh := range enriched {
-		val := eh.value
-		totalValue += val
-		if eh.security.AssetClass == "stock" || securityTFSRate(eh.security) > 0 {
-			equityValue += val
-		}
+		eq, cr := stressExposure(eh.security)
+		totalValue += eh.value
+		equityValue += eh.value * eq
+		cryptoValue += eh.value * cr
 	}
-
-	equityPct := 0.0
+	equityShare, cryptoShare := 0.0, 0.0
 	if totalValue > 0 {
-		equityPct = equityValue / totalValue
+		equityShare = equityValue / totalValue
+		cryptoShare = cryptoValue / totalValue
 	}
 
 	type portfolioImpact struct {
@@ -4143,28 +4940,37 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 		WorstMonthEUR  float64 `json:"worst_month_eur"`
 	}
 
+	// Net contributions of the last 12 months, the rate at which money keeps
+	// going in during a crisis (project rule: trailing 12 months, not an
+	// all-time average).
+	now := time.Now().UTC()
+	monthlyContribution := trailingMonthlyContribution(h.buildInvestableFlowsForRisk(ctx), now)
+
+	type dcaResult struct {
+		Name         string `json:"name"`
+		WithoutDCA   int    `json:"without_dca_months"`
+		WithDCA      int    `json:"with_dca_months"`
+		Acceleration int    `json:"acceleration_months"`
+	}
 	impacts := make([]portfolioImpact, len(scenarios))
+	dcaRecovery := make([]dcaResult, len(scenarios))
 	for i, s := range scenarios {
-		// Scale crisis drawdown by equity exposure
-		drawdownPct := s.IndexReturn * equityPct
+		drawdownPct := crisisDrop(s.IndexReturn, equityShare, cryptoShare)
+		worstMonthPct := crisisDrop(s.WorstMonth, equityShare, cryptoShare)
 		impacts[i] = portfolioImpact{
 			Name:           s.Name,
 			DrawdownPct:    math.Round(drawdownPct*10) / 10,
 			DrawdownEUR:    math.Round(totalValue * drawdownPct / 100),
 			RecoveryMonths: s.RecoveryMo,
-			WorstMonthPct:  math.Round(s.WorstMonth*equityPct*10) / 10,
-			WorstMonthEUR:  math.Round(totalValue * s.WorstMonth * equityPct / 100),
+			WorstMonthPct:  math.Round(worstMonthPct*10) / 10,
+			WorstMonthEUR:  math.Round(totalValue * worstMonthPct / 100),
 		}
-	}
-
-	// Cash buffer: sum positive EUR cash balances across all active accounts
-	cashBuffer := 0.0
-	allAccounts, _ := h.queries.ListAccounts(ctx)
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	cashByAcct, _ := computeAllAccountCashEUR(ctx, h.queries, allAccounts, fxRates)
-	for _, acc := range allAccounts {
-		if acc.IsActive && cashByAcct[acc.ID] > 0 {
-			cashBuffer += cashByAcct[acc.ID]
+		withDCA := dcaRecoveryMonths(drawdownPct, scenarioMonths(s.StartDate, s.EndDate), s.RecoveryMo, totalValue, monthlyContribution)
+		dcaRecovery[i] = dcaResult{
+			Name:         s.Name,
+			WithoutDCA:   s.RecoveryMo,
+			WithDCA:      withDCA,
+			Acceleration: s.RecoveryMo - withDCA,
 		}
 	}
 
@@ -4174,77 +4980,247 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 		ISIN        string  `json:"isin"`
 		Value       float64 `json:"value"`
 		IsEquity    bool    `json:"is_equity"`
+		EquityPct   float64 `json:"equity_pct"`
+		IsCrypto    bool    `json:"is_crypto"`
 		DrawdownEUR float64 `json:"drawdown_eur"`
 		DrawdownPct float64 `json:"drawdown_pct"`
 	}
 	worstDrawdown := scenarios[0].IndexReturn // GFC = -54%
 	holdingImpacts := make([]holdingImpact, 0, len(enriched))
 	for _, eh := range enriched {
-		isEq := eh.security.AssetClass == "stock" || securityTFSRate(eh.security) > 0
-		dd := 0.0
-		if isEq {
-			dd = worstDrawdown
-		}
+		eq, cr := stressExposure(eh.security)
+		dd := crisisDrop(worstDrawdown, eq, cr)
 		holdingImpacts = append(holdingImpacts, holdingImpact{
 			Name:        eh.security.Name,
 			ISIN:        eh.security.ISIN,
 			Value:       math.Round(eh.value),
-			IsEquity:    isEq,
+			IsEquity:    eq >= 0.5,
+			EquityPct:   math.Round(eq * 100),
+			IsCrypto:    cr > 0,
 			DrawdownEUR: math.Round(eh.value * dd / 100),
-			DrawdownPct: dd,
+			DrawdownPct: math.Round(dd*10) / 10,
 		})
 	}
 
-	// DCA recovery: how much faster recovery is with continued monthly contributions
-	// Assume monthly DCA of totalValue * 0.01 (1% of portfolio)
-	monthlyDCA := totalValue * 0.01
-	dcaRecovery := make([]struct {
-		Name         string `json:"name"`
-		WithoutDCA   int    `json:"without_dca_months"`
-		WithDCA      int    `json:"with_dca_months"`
-		Acceleration int    `json:"acceleration_months"`
-	}, len(scenarios))
-	for i, s := range scenarios {
-		withoutDCA := s.RecoveryMo
-		// With DCA: approximate recovery by simulating monthly contributions during drawdown recovery
-		// Each month of DCA buys at lower prices, accelerating recovery by ~20-30%
-		drawdownAbs := math.Abs(s.IndexReturn) / 100
-		dcaBoost := 0.0
-		if totalValue > 0 && drawdownAbs > 0 {
-			dcaBoost = monthlyDCA * float64(withoutDCA) / (totalValue * drawdownAbs)
-		}
-		withDCA := int(math.Round(float64(withoutDCA) * (1 - math.Min(dcaBoost*0.5, 0.4))))
-		if withDCA < 1 {
-			withDCA = 1
-		}
-		dcaRecovery[i] = struct {
-			Name         string `json:"name"`
-			WithoutDCA   int    `json:"without_dca_months"`
-			WithDCA      int    `json:"with_dca_months"`
-			Acceleration int    `json:"acceleration_months"`
-		}{
-			Name:         s.Name,
-			WithoutDCA:   withoutDCA,
-			WithDCA:      withDCA,
-			Acceleration: withoutDCA - withDCA,
+	// Cash buffer: liquid cash (checking, savings and broker cash) against
+	// recorded spending; the 5 % rule of thumb only when nothing is recorded.
+	allAccounts, _ := h.queries.ListAccounts(ctx)
+	fxRates := loadFXRatesMap(ctx, h.queries)
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	cashByAcct, _ := computeAllAccountCashEUR(ctx, h.queries, allAccounts, fxRates)
+	cashBuffer := liquidCashEUR(allAccounts, cashByAcct)
+
+	var txnsChrono []db.ListTransactionsRow
+	if txns, err := listAllTransactionsRows(ctx, h.queries); err == nil {
+		txnsChrono = make([]db.ListTransactionsRow, len(txns))
+		for i := range txns {
+			txnsChrono[i] = txns[len(txns)-1-i]
 		}
 	}
-
-	// Cash buffer adequacy: months of expenses covered
-	monthlyExpense := totalValue * 0.05 / 12 // rough 5% annual withdrawal rate
-	cashMonths := 0
+	physHoldings, _ := assets.Load(ctx, h.queries)
+	monthlyExpense, spendingMonths := recordedMonthlySpending(txnsChrono, allAccounts, physHoldings.AssetLinkedIDs(), histFX, fxRates, now)
+	spendingBasis := "recorded"
+	if monthlyExpense <= 0 {
+		monthlyExpense = totalValue * 0.05 / 12
+		spendingBasis = "assumed"
+		spendingMonths = 0
+	}
+	cashMonths := 0.0
 	if monthlyExpense > 0 {
-		cashMonths = int(cashBuffer / monthlyExpense)
+		cashMonths = cashBuffer / monthlyExpense
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"scenarios":         scenarios,
-		"portfolio_impact":  impacts,
-		"holding_impacts":   holdingImpacts,
-		"dca_recovery":      dcaRecovery,
-		"portfolio_value":   math.Round(totalValue),
-		"equity_pct":        math.Round(equityPct * 1000) / 10,
-		"cash_buffer":       math.Round(cashBuffer),
-		"cash_buffer_months": cashMonths,
+		"scenarios":            scenarios,
+		"portfolio_impact":     impacts,
+		"holding_impacts":      holdingImpacts,
+		"dca_recovery":         dcaRecovery,
+		"monthly_contribution": math.Round(monthlyContribution),
+		"portfolio_value":      math.Round(totalValue),
+		"equity_pct":           math.Round(equityShare*1000) / 10,
+		"crypto_pct":           math.Round(cryptoShare*1000) / 10,
+		"crypto_beta":          cryptoCrisisBeta,
+		"cash_buffer":          math.Round(cashBuffer),
+		"cash_buffer_months":   math.Round(cashMonths*10) / 10,
+		"monthly_spending":     math.Round(monthlyExpense),
+		"spending_basis":       spendingBasis,
+		"spending_months":      math.Round(spendingMonths*10) / 10,
 	})
+}
+
+const (
+	// cryptoCrisisBeta assumes crypto falls twice as far as equities in a
+	// crisis (2022: MSCI World about −25 %, Bitcoin about −65 %; March 2020:
+	// −34 % vs about −50 %), capped at cryptoMaxCrisisDrop. Crypto did not
+	// exist in the older scenarios; this is a stated assumption, not data.
+	cryptoCrisisBeta    = 2.0
+	cryptoMaxCrisisDrop = -90.0
+	// mixedFundEquityShare is assumed for a mixed fund (15 % Teilfreistellung,
+	// at least 25 % equities) without a recorded equity_pct.
+	mixedFundEquityShare = 0.5
+)
+
+// stressExposure returns the share of a holding's value that moves with
+// equities and the share that moves like crypto in a crisis. Funds use
+// securities.equity_pct when recorded; otherwise equity funds count fully
+// and mixed funds half. Bonds, gold and other commodities are not shocked.
+func stressExposure(sec db.Security) (equity, crypto float64) {
+	switch sec.AssetClass {
+	case "crypto":
+		return 0, 1
+	case "stock":
+		return 1, 0
+	case "etf", "fund":
+		if sec.EquityPct.Valid {
+			v := numericToFloat(sec.EquityPct)
+			if v > 1 {
+				v /= 100
+			}
+			return math.Max(0, math.Min(1, v)), 0
+		}
+		switch securityTFSRate(sec) {
+		case analytics.TeilfreistellungEquity:
+			return 1, 0
+		case analytics.TeilfreistellungMixed:
+			return mixedFundEquityShare, 0
+		}
+	}
+	return 0, 0
+}
+
+// crisisDrop scales an equity-index drop (negative %) to a holding or
+// portfolio with the given equity and crypto shares.
+func crisisDrop(indexDropPct, equityShare, cryptoShare float64) float64 {
+	cryptoDrop := math.Max(indexDropPct*cryptoCrisisBeta, cryptoMaxCrisisDrop)
+	return indexDropPct*equityShare + cryptoDrop*cryptoShare
+}
+
+// scenarioMonths is the length of a crisis' decline in whole months (≥ 1).
+func scenarioMonths(start, end string) int {
+	s, err1 := time.Parse("2006-01-02", start)
+	e, err2 := time.Parse("2006-01-02", end)
+	if err1 != nil || err2 != nil || !e.After(s) {
+		return 1
+	}
+	m := int(math.Round(e.Sub(s).Hours() / 24 / 30.44))
+	if m < 1 {
+		m = 1
+	}
+	return m
+}
+
+// trailingMonthlyContribution is the net external flow (deposits, vests and
+// transfers in, minus withdrawals) of the 12 months up to now, per month.
+func trailingMonthlyContribution(flows []analytics.CashFlow, now time.Time) float64 {
+	from := now.AddDate(-1, 0, 0)
+	total := 0.0
+	for _, f := range flows {
+		if f.Date.After(from) && !f.Date.After(now) {
+			total += f.Amount
+		}
+	}
+	return total / 12
+}
+
+// dcaRecoveryMonths simulates a crisis path (a steady fall of dropPct over
+// declineMonths, then a steady climb back over recoveryMonths, both
+// geometric) with `monthly` invested at each month-end price. It returns the
+// months after the trough until the value covers everything put in (start
+// value plus contributions). Without contributions that is recoveryMonths,
+// the index's own recovery.
+func dcaRecoveryMonths(dropPct float64, declineMonths, recoveryMonths int, startValue, monthly float64) int {
+	if dropPct >= 0 || startValue <= 0 || monthly <= 0 || recoveryMonths <= 0 {
+		return recoveryMonths
+	}
+	if declineMonths < 1 {
+		declineMonths = 1
+	}
+	trough := 1 + dropPct/100
+	if trough <= 0 {
+		return recoveryMonths
+	}
+	price := func(t int) float64 {
+		if t <= declineMonths {
+			return math.Pow(trough, float64(t)/float64(declineMonths))
+		}
+		if t >= declineMonths+recoveryMonths {
+			return 1
+		}
+		return math.Pow(trough, 1-float64(t-declineMonths)/float64(recoveryMonths))
+	}
+	units, invested := startValue, startValue
+	for t := 1; t <= declineMonths+recoveryMonths; t++ {
+		p := price(t)
+		units += monthly / p
+		invested += monthly
+		if t > declineMonths && units*p >= invested {
+			return t - declineMonths
+		}
+	}
+	return recoveryMonths
+}
+
+// liquidCashEUR sums positive cash on active checking, savings and brokerage
+// accounts: money that can be spent without selling anything.
+func liquidCashEUR(accounts []db.Account, cashByAcct map[uuid.UUID]float64) float64 {
+	total := 0.0
+	for _, a := range accounts {
+		if !a.IsActive {
+			continue
+		}
+		switch a.Type {
+		case "checking", "savings", "brokerage":
+			if c := cashByAcct[a.ID]; c > 0 {
+				total += c
+			}
+		}
+	}
+	return total
+}
+
+// recordedMonthlySpending averages withdrawals from checking accounts over
+// the last 12 months, dividing by the months the imports actually cover
+// (from the window start, or the first checking transaction if later, to the
+// last checking transaction), so a short history is not diluted. Payments
+// for tracked assets (skip) are not spending. Returns 0 when nothing is
+// recorded.
+func recordedMonthlySpending(txnsChrono []db.ListTransactionsRow, accounts []db.Account, skip map[uuid.UUID]bool, histFX []market.HistoricalFXRate, fxRates map[string]float64, now time.Time) (perMonth, months float64) {
+	checking := make(map[uuid.UUID]bool)
+	for _, a := range accounts {
+		if a.IsActive && a.Type == "checking" {
+			checking[a.ID] = true
+		}
+	}
+	from := now.AddDate(-1, 0, 0)
+	var first, last time.Time
+	total := 0.0
+	for _, t := range txnsChrono {
+		if !checking[t.AccountID] || t.Date.After(now) {
+			continue
+		}
+		if first.IsZero() || t.Date.Before(first) {
+			first = t.Date
+		}
+		if !t.Date.After(from) {
+			continue
+		}
+		if t.Date.After(last) {
+			last = t.Date
+		}
+		if t.Type == "withdrawal" && !skip[t.ID] {
+			total += math.Abs(convertAmountToEURAtDate(numericToFloat(t.Amount), t.Currency, t.Date, histFX, fxRates))
+		}
+	}
+	if total <= 0 || last.IsZero() {
+		return 0, 0
+	}
+	start := from
+	if first.After(from) {
+		start = first
+	}
+	months = last.Sub(start).Hours() / 24 / 30.44
+	if months < 1 {
+		months = 1
+	}
+	return total / months, months
 }

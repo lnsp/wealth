@@ -143,7 +143,11 @@ func (p *ScalableCapitalParser) Parse(records [][]string, accountID uuid.UUID) (
 		// Cancellation rows reverse a prior transaction. Flip the type so they
 		// net to zero against the original when the cash balance is computed.
 		isCancellation := strings.ToLower(getField(record, cancelCol)) == "true"
-		if isCancellation {
+		if signed, ok := scalableSignedType(typeRaw, subType, side, txnType, signedAmount, isCancellation); ok {
+			// The booked sign already says which way the cash moved, for
+			// cancellations too, so a sign-derived type is never reversed.
+			txnType = signed
+		} else if isCancellation {
 			txnType = reverseTxnType(txnType)
 		}
 
@@ -315,6 +319,74 @@ func classifyScalableType(txnType, subType, side string) string {
 
 	default:
 		return "deposit"
+	}
+}
+
+// scalableSignedType returns the stored type for rows whose direction only
+// the sign of the booked amount carries (amounts are stored as magnitudes,
+// so a type that ignores the sign turns a refund into a charge or back).
+//
+//   - TAX rows: a positive amount is a tax refund (deposit), a negative one a
+//     tax payment (tax). Mirrors the Sparkasse fee/interest handling.
+//   - Unknown cash sub-types, unknown row types and PRIME+ rows without a
+//     side: money in is a deposit, money out a withdrawal.
+//   - Regular cash rows whose sign contradicts the sub-type (not
+//     cancellations, which flip the sign on purpose): negative interest or
+//     distributions are charges (fee), a negative deposit is a withdrawal
+//     and a positive withdrawal a deposit.
+//
+// ok is false when the sub-type alone decides the type.
+func scalableSignedType(typeRaw, subType, side, base string, signed float64, cancellation bool) (string, bool) {
+	bySign := func() string {
+		if signed < 0 {
+			return "withdrawal"
+		}
+		return "deposit"
+	}
+	taxBySign := func() string {
+		if signed > 0 {
+			return "deposit"
+		}
+		return "tax"
+	}
+
+	if typeRaw == "" && subType == "" {
+		// PRIME+ native format: classified from the side column.
+		switch side {
+		case "tax", "steuer":
+			return taxBySign(), true
+		case "":
+			return bySign(), true
+		}
+		return "", false
+	}
+
+	switch typeRaw {
+	case "security_transaction", "non_trade_security_transaction":
+		return "", false
+	case "cash_transaction":
+		switch subType {
+		case "tax", "steuer":
+			return taxBySign(), true
+		case "deposit", "withdrawal", "distribution", "dividend", "dividende", "interest", "zinsen",
+			"cash_transfer_out", "cash_transfer_in":
+			if cancellation {
+				return "", false
+			}
+			switch {
+			case (base == "interest" || base == "dividend") && signed < 0:
+				return "fee", true
+			case base == "deposit" && signed < 0:
+				return "withdrawal", true
+			case base == "withdrawal" && signed > 0:
+				return "deposit", true
+			}
+			return "", false
+		default:
+			return bySign(), true
+		}
+	default:
+		return bySign(), true
 	}
 }
 

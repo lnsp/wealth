@@ -1,47 +1,76 @@
 {
   "IE00BK5BQT80": {
-    "name": "Vanguard FTSE All-World (Acc)",
+    "name": "Vanguard FTSE All-World UCITS ETF (USD) Accumulating",
     "index": "FTSE All-World",
-    "ter": 0.22,
+    "ter": 0.14,
     "alternatives": [
-      {"isin": "IE00BJ0KDQ92", "name": "Xtrackers MSCI ACWI (Acc)", "ter": 0.17, "index": "MSCI ACWI"},
-      {"isin": "IE000716YHJ7", "name": "Amundi Prime All Country World (Acc)", "ter": 0.07, "index": "Solactive GBS Global Markets"}
+      {"isin": "IE000L6ZMMC4", "name": "Xtrackers FTSE All-World UCITS ETF 1C (Acc)", "ter": 0.07, "index": "FTSE All-World"},
+      {"isin": "IE0003XJA0J9", "name": "Amundi Prime All Country World UCITS ETF (Acc)", "ter": 0.07, "index": "Solactive GBS Global Markets Large & Mid Cap"}
+    ]
+  },
+  "IE00B3RBWM25": {
+    "name": "Vanguard FTSE All-World UCITS ETF (USD) Distributing",
+    "index": "FTSE All-World",
+    "ter": 0.14,
+    "alternatives": [
+      {"isin": "IE000L6ZMMC4", "name": "Xtrackers FTSE All-World UCITS ETF 1C (Acc)", "ter": 0.07, "index": "FTSE All-World"},
+      {"isin": "IE0003XJA0J9", "name": "Amundi Prime All Country World UCITS ETF (Acc)", "ter": 0.07, "index": "Solactive GBS Global Markets Large & Mid Cap"}
+    ]
+  },
+  "IE00B4L5Y983": {
+    "name": "iShares Core MSCI World UCITS ETF USD (Acc)",
+    "index": "MSCI World",
+    "ter": 0.20,
+    "alternatives": [
+      {"isin": "IE00BJ0KDQ92", "name": "Xtrackers MSCI World UCITS ETF 1C (Acc)", "ter": 0.12, "index": "MSCI World"}
     ]
   },
   "IE00B5BMR087": {
-    "name": "iShares Core S&P 500 (Acc)",
+    "name": "iShares Core S&P 500 UCITS ETF USD (Acc)",
     "index": "S&P 500",
     "ter": 0.07,
     "alternatives": [
-      {"isin": "IE00BFMXXD54", "name": "Vanguard S&P 500 (Acc)", "ter": 0.07, "index": "S&P 500"},
-      {"isin": "LU0496786574", "name": "Xtrackers S&P 500 Swap (Acc)", "ter": 0.06, "index": "S&P 500"}
+      {"isin": "IE000XZSV718", "name": "SPDR S&P 500 UCITS ETF (Acc)", "ter": 0.03, "index": "S&P 500"},
+      {"isin": "IE000Z9SJA06", "name": "Xtrackers S&P 500 UCITS ETF 4C (Acc)", "ter": 0.03, "index": "S&P 500"},
+      {"isin": "IE000HY30YW6", "name": "Xtrackers S&P 500 Swap II UCITS ETF 1C (Acc, swap)", "ter": 0.04, "index": "S&P 500"}
     ]
   },
   "IE00BTJRMP35": {
-    "name": "Xtrackers MSCI Emerging Markets (Acc)",
+    "name": "Xtrackers MSCI Emerging Markets UCITS ETF 1C (Acc)",
     "index": "MSCI Emerging Markets",
     "ter": 0.18,
     "alternatives": [
-      {"isin": "IE00BKM4GZ66", "name": "iShares Core MSCI EM IMI (Acc)", "ter": 0.18, "index": "MSCI EM IMI"},
-      {"isin": "LU1681045370", "name": "Amundi MSCI Emerging Markets (Acc)", "ter": 0.10, "index": "MSCI Emerging Markets"}
+      {"isin": "IE00B3DWVS88", "name": "Invesco MSCI Emerging Markets UCITS ETF (Acc, swap)", "ter": 0.09, "index": "MSCI Emerging Markets"},
+      {"isin": "LU2573967036", "name": "Amundi Core MSCI Emerging Markets Swap UCITS ETF (Acc)", "ter": 0.14, "index": "MSCI Emerging Markets"},
+      {"isin": "LU0950674175", "name": "UBS Core MSCI EM UCITS ETF USD (Acc)", "ter": 0.15, "index": "MSCI Emerging Markets"}
+    ]
+  },
+  "IE00B4L5YC18": {
+    "name": "iShares MSCI EM UCITS ETF USD (Acc)",
+    "index": "MSCI Emerging Markets",
+    "ter": 0.18,
+    "alternatives": [
+      {"isin": "IE00B3DWVS88", "name": "Invesco MSCI Emerging Markets UCITS ETF (Acc, swap)", "ter": 0.09, "index": "MSCI Emerging Markets"},
+      {"isin": "LU2573967036", "name": "Amundi Core MSCI Emerging Markets Swap UCITS ETF (Acc)", "ter": 0.14, "index": "MSCI Emerging Markets"},
+      {"isin": "LU0950674175", "name": "UBS Core MSCI EM UCITS ETF USD (Acc)", "ter": 0.15, "index": "MSCI Emerging Markets"}
     ]
   },
   "LU0908500753": {
-    "name": "Amundi Core Stoxx Europe 600 (Acc)",
+    "name": "Amundi Core Stoxx Europe 600 UCITS ETF (Acc)",
     "index": "STOXX Europe 600",
     "ter": 0.07,
     "alternatives": [
-      {"isin": "DE0002635307", "name": "iShares STOXX Europe 600 (Dist)", "ter": 0.20, "index": "STOXX Europe 600"},
-      {"isin": "LU0908501058", "name": "Amundi Prime Europe (Acc)", "ter": 0.05, "index": "Solactive GBS Developed Markets Europe"}
+      {"isin": "IE00003M6Z62", "name": "Xtrackers Stoxx Europe 600 II UCITS ETF 1C (Acc)", "ter": 0.05, "index": "STOXX Europe 600"},
+      {"isin": "LU2089238039", "name": "Amundi Prime Europe UCITS ETF DR (Acc)", "ter": 0.05, "index": "Solactive GBS Developed Markets Europe Large & Mid Cap"}
     ]
   },
   "IE00B4WXJJ64": {
-    "name": "iShares Core Euro Govt Bond (Dist)",
-    "index": "EUR Government Bond",
-    "ter": 0.09,
+    "name": "iShares Core Euro Government Bond UCITS ETF (Dist)",
+    "index": "Bloomberg Euro Treasury Bond",
+    "ter": 0.07,
     "alternatives": [
-      {"isin": "LU1931975152", "name": "Amundi Euro Government Bond (Acc)", "ter": 0.05, "index": "JPM EMU Government Bond"},
-      {"isin": "DE000ETFL177", "name": "Deka Euro Govt Bond (Dist)", "ter": 0.15, "index": "iBoxx EUR Sovereigns"}
+      {"isin": "LU1931975152", "name": "Amundi Prime Euro Government Bond UCITS ETF (Dist)", "ter": 0.05, "index": "Solactive Eurozone Government Bond"},
+      {"isin": "LU2089238898", "name": "Amundi Prime Euro Government Bond UCITS ETF (Acc)", "ter": 0.05, "index": "Solactive Eurozone Government Bond"}
     ]
   }
 }

@@ -149,16 +149,19 @@ WHERE ih.account_id != $1 AND ih.filename = $2 AND ih.imported > 0
 LIMIT 1;
 
 -- name: GetCashBalance :one
+-- The cash queries mirror txnSignedCashDelta (internal/handler/fx_cash.go):
+-- amounts are magnitudes and the type gives the direction. ABS keeps a row
+-- stored with a signed amount from flipping a payment into an inflow.
 WITH raw_cash AS (
     SELECT
         COALESCE(SUM(
             CASE
                 WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
-                    THEN amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                    THEN ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
                 WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
-                    THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                    THEN -ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
                 WHEN type = 'transfer' AND security_isin IS NULL
-                    THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                    THEN -ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
                 -- security transfers (in-kind) have no cash impact
                 ELSE 0
             END
@@ -188,11 +191,11 @@ SELECT
     COALESCE(SUM(
         CASE
             WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
-                THEN amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                THEN ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
             WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
-                THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                THEN -ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
             WHEN type = 'transfer' AND security_isin IS NULL
-                THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                THEN -ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
             ELSE 0
         END
     ), 0)::numeric(18,4) AS balance,
@@ -208,11 +211,11 @@ SELECT
     COALESCE(SUM(
         CASE
             WHEN t.type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
-                THEN t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+                THEN ABS(t.amount) - ABS(COALESCE(t.fee, 0)) - ABS(COALESCE(t.tax, 0))
             WHEN t.type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
-                THEN -t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+                THEN -ABS(t.amount) - ABS(COALESCE(t.fee, 0)) - ABS(COALESCE(t.tax, 0))
             WHEN t.type = 'transfer' AND t.security_isin IS NULL
-                THEN -t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+                THEN -ABS(t.amount) - ABS(COALESCE(t.fee, 0)) - ABS(COALESCE(t.tax, 0))
             ELSE 0
         END
     ), 0)::numeric(18,4) AS balance,
@@ -330,15 +333,18 @@ DELETE FROM net_worth_intraday WHERE recorded_at < NOW() - INTERVAL '7 days';
 SELECT isin, symbol FROM securities WHERE symbol IS NOT NULL AND symbol != '';
 
 -- name: InsertImportHistory :exec
-INSERT INTO import_history (account_id, institution, filename, total_rows, imported, skipped, new_securities)
-VALUES ($1, $2, $3, $4, $5, $6, $7);
+INSERT INTO import_history (account_id, institution, filename, total_rows, imported, skipped, new_securities, updated, rsu_vests)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
 
 -- name: ListImportHistory :many
+-- account_ids NULL = every account (household scope); otherwise only imports
+-- into the listed accounts.
 SELECT ih.*, a.name as account_name
 FROM import_history ih
 JOIN accounts a ON ih.account_id = a.id
+WHERE (sqlc.narg('account_ids')::uuid[] IS NULL OR ih.account_id = ANY(sqlc.narg('account_ids')::uuid[]))
 ORDER BY ih.imported_at DESC
-LIMIT $1;
+LIMIT sqlc.arg('limit') OFFSET sqlc.arg('offset');
 
 -- name: RefreshCurrentHoldings :exec
 REFRESH MATERIALIZED VIEW CONCURRENTLY current_holdings;
@@ -675,3 +681,28 @@ RETURNING series;
 -- Snapshot rebuild: nothing tracked existed before the first transaction or
 -- physical asset, so earlier rows (all-zero leftovers) are removed.
 DELETE FROM net_worth_snapshots WHERE date < $1;
+
+-- name: CountImportHistory :one
+-- account_ids NULL = every account; mirrors ListImportHistory's filter.
+SELECT count(*) FROM import_history ih
+WHERE (sqlc.narg('account_ids')::uuid[] IS NULL OR ih.account_id = ANY(sqlc.narg('account_ids')::uuid[]));
+
+-- name: GetTransactionImportState :one
+-- The fields InsertTransaction's ON CONFLICT clause can overwrite, used to
+-- tell a re-imported row that changed from an unchanged duplicate.
+SELECT type, security_isin, quantity, price FROM transactions WHERE import_hash = $1;
+
+-- name: GetFirstTransactionDate :one
+SELECT date FROM transactions ORDER BY date ASC LIMIT 1;
+
+-- name: UpdateWealthReportForPeriod :execrows
+-- Replaces the stored figures of an existing report (regenerate).
+UPDATE wealth_reports
+SET data = $3, period_start = $4, period_end = $5, generated_at = now()
+WHERE report_type = $1 AND period_label = $2;
+
+-- name: UpdateSecurityAssetClass :exec
+-- Reclassifies a security when fund data proves its name-based class wrong
+-- (e.g. a broker-abbreviated ETF stored as a stock). Only updates while the
+-- class is still the one the caller saw.
+UPDATE securities SET asset_class = $2 WHERE isin = $1 AND asset_class = $3;

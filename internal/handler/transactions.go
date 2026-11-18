@@ -172,6 +172,7 @@ func (h *TransactionsHandler) HandleList(w http.ResponseWriter, r *http.Request)
 			"total":        total,
 			"limit":        limit,
 			"offset":       offset,
+			"first_date":   earliestTxnDate(allTxns),
 		})
 		return
 	}
@@ -198,6 +199,7 @@ func (h *TransactionsHandler) HandleList(w http.ResponseWriter, r *http.Request)
 		if end > total { end = total }
 		writeJSON(w, http.StatusOK, map[string]any{
 			"transactions": allTxns[start:end], "total": total, "limit": limit, "offset": offset,
+			"first_date": earliestTxnDate(allTxns),
 		})
 		return
 	}
@@ -214,10 +216,32 @@ func (h *TransactionsHandler) HandleList(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	firstDate := ""
+	if d, err := h.queries.GetFirstTransactionDate(r.Context()); err == nil {
+		firstDate = d.Format("2006-01-02")
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"transactions": txns,
 		"total":        count,
 		"limit":        limit,
 		"offset":       offset,
+		"first_date":   firstDate,
 	})
+}
+
+// earliestTxnDate is the date of the oldest row ("" when there is none), so
+// the month picker can reach back to the first transaction whatever the
+// current filters.
+func earliestTxnDate(rows []db.ListTransactionsRow) string {
+	var first time.Time
+	for _, t := range rows {
+		if first.IsZero() || t.Date.Before(first) {
+			first = t.Date
+		}
+	}
+	if first.IsZero() {
+		return ""
+	}
+	return first.Format("2006-01-02")
 }

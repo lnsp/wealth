@@ -33,6 +33,19 @@ func (q *Queries) CheckFileImportedToOtherAccount(ctx context.Context, arg Check
 	return account_name, err
 }
 
+const countImportHistory = `-- name: CountImportHistory :one
+SELECT count(*) FROM import_history ih
+WHERE ($1::uuid[] IS NULL OR ih.account_id = ANY($1::uuid[]))
+`
+
+// account_ids NULL = every account; mirrors ListImportHistory's filter.
+func (q *Queries) CountImportHistory(ctx context.Context, accountIds []uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countImportHistory, accountIds)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countTransactions = `-- name: CountTransactions :one
 SELECT count(*) FROM transactions
 `
@@ -834,11 +847,11 @@ SELECT
     COALESCE(SUM(
         CASE
             WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
-                THEN amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                THEN ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
             WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
-                THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                THEN -ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
             WHEN type = 'transfer' AND security_isin IS NULL
-                THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                THEN -ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
             ELSE 0
         END
     ), 0)::numeric(18,4) AS balance,
@@ -914,11 +927,11 @@ WITH raw_cash AS (
         COALESCE(SUM(
             CASE
                 WHEN type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
-                    THEN amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                    THEN ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
                 WHEN type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
-                    THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                    THEN -ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
                 WHEN type = 'transfer' AND security_isin IS NULL
-                    THEN -amount - COALESCE(fee, 0) - COALESCE(tax, 0)
+                    THEN -ABS(amount) - ABS(COALESCE(fee, 0)) - ABS(COALESCE(tax, 0))
                 -- security transfers (in-kind) have no cash impact
                 ELSE 0
             END
@@ -943,11 +956,25 @@ SELECT (
 FROM raw_cash rc
 `
 
+// The cash queries mirror txnSignedCashDelta (internal/handler/fx_cash.go):
+// amounts are magnitudes and the type gives the direction. ABS keeps a row
+// stored with a signed amount from flipping a payment into an inflow.
 func (q *Queries) GetCashBalance(ctx context.Context, id uuid.UUID) (pgtype.Numeric, error) {
 	row := q.db.QueryRow(ctx, getCashBalance, id)
 	var balance pgtype.Numeric
 	err := row.Scan(&balance)
 	return balance, err
+}
+
+const getFirstTransactionDate = `-- name: GetFirstTransactionDate :one
+SELECT date FROM transactions ORDER BY date ASC LIMIT 1
+`
+
+func (q *Queries) GetFirstTransactionDate(ctx context.Context) (time.Time, error) {
+	row := q.db.QueryRow(ctx, getFirstTransactionDate)
+	var date time.Time
+	err := row.Scan(&date)
+	return date, err
 }
 
 const getLatestExchangeRate = `-- name: GetLatestExchangeRate :one
@@ -1118,6 +1145,31 @@ func (q *Queries) GetTransactionIDByHash(ctx context.Context, importHash string)
 	return id, err
 }
 
+const getTransactionImportState = `-- name: GetTransactionImportState :one
+SELECT type, security_isin, quantity, price FROM transactions WHERE import_hash = $1
+`
+
+type GetTransactionImportStateRow struct {
+	Type         string         `json:"type"`
+	SecurityISIN pgtype.Text    `json:"security_isin"`
+	Quantity     pgtype.Numeric `json:"quantity"`
+	Price        pgtype.Numeric `json:"price"`
+}
+
+// The fields InsertTransaction's ON CONFLICT clause can overwrite, used to
+// tell a re-imported row that changed from an unchanged duplicate.
+func (q *Queries) GetTransactionImportState(ctx context.Context, importHash string) (GetTransactionImportStateRow, error) {
+	row := q.db.QueryRow(ctx, getTransactionImportState, importHash)
+	var i GetTransactionImportStateRow
+	err := row.Scan(
+		&i.Type,
+		&i.SecurityISIN,
+		&i.Quantity,
+		&i.Price,
+	)
+	return i, err
+}
+
 const getUserByID = `-- name: GetUserByID :one
 SELECT id, username, password_hash, role, is_active, created_at, totp_secret, totp_enabled FROM users WHERE id = $1
 `
@@ -1194,8 +1246,8 @@ func (q *Queries) InsertAssetTransaction(ctx context.Context, arg InsertAssetTra
 }
 
 const insertImportHistory = `-- name: InsertImportHistory :exec
-INSERT INTO import_history (account_id, institution, filename, total_rows, imported, skipped, new_securities)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO import_history (account_id, institution, filename, total_rows, imported, skipped, new_securities, updated, rsu_vests)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 `
 
 type InsertImportHistoryParams struct {
@@ -1206,6 +1258,8 @@ type InsertImportHistoryParams struct {
 	Imported      int32     `json:"imported"`
 	Skipped       int32     `json:"skipped"`
 	NewSecurities []string  `json:"new_securities"`
+	Updated       int32     `json:"updated"`
+	RsuVests      int32     `json:"rsu_vests"`
 }
 
 func (q *Queries) InsertImportHistory(ctx context.Context, arg InsertImportHistoryParams) error {
@@ -1217,6 +1271,8 @@ func (q *Queries) InsertImportHistory(ctx context.Context, arg InsertImportHisto
 		arg.Imported,
 		arg.Skipped,
 		arg.NewSecurities,
+		arg.Updated,
+		arg.RsuVests,
 	)
 	return err
 }
@@ -1481,11 +1537,11 @@ SELECT
     COALESCE(SUM(
         CASE
             WHEN t.type IN ('deposit', 'interest', 'sell', 'dividend', 'cash_transfer_in')
-                THEN t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+                THEN ABS(t.amount) - ABS(COALESCE(t.fee, 0)) - ABS(COALESCE(t.tax, 0))
             WHEN t.type IN ('buy', 'savings_plan', 'withdrawal', 'fee', 'tax', 'cash_transfer_out')
-                THEN -t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+                THEN -ABS(t.amount) - ABS(COALESCE(t.fee, 0)) - ABS(COALESCE(t.tax, 0))
             WHEN t.type = 'transfer' AND t.security_isin IS NULL
-                THEN -t.amount - COALESCE(t.fee, 0) - COALESCE(t.tax, 0)
+                THEN -ABS(t.amount) - ABS(COALESCE(t.fee, 0)) - ABS(COALESCE(t.tax, 0))
             ELSE 0
         END
     ), 0)::numeric(18,4) AS balance,
@@ -2123,12 +2179,19 @@ func (q *Queries) ListFinancialGoals(ctx context.Context) ([]FinancialGoal, erro
 }
 
 const listImportHistory = `-- name: ListImportHistory :many
-SELECT ih.id, ih.account_id, ih.imported_at, ih.institution, ih.filename, ih.total_rows, ih.imported, ih.skipped, ih.new_securities, a.name as account_name
+SELECT ih.id, ih.account_id, ih.imported_at, ih.institution, ih.filename, ih.total_rows, ih.imported, ih.skipped, ih.new_securities, ih.updated, ih.rsu_vests, a.name as account_name
 FROM import_history ih
 JOIN accounts a ON ih.account_id = a.id
+WHERE ($1::uuid[] IS NULL OR ih.account_id = ANY($1::uuid[]))
 ORDER BY ih.imported_at DESC
-LIMIT $1
+LIMIT $3 OFFSET $2
 `
+
+type ListImportHistoryParams struct {
+	AccountIds []uuid.UUID `json:"account_ids"`
+	Offset     int32       `json:"offset"`
+	Limit      int32       `json:"limit"`
+}
 
 type ListImportHistoryRow struct {
 	ID            uuid.UUID `json:"id"`
@@ -2140,11 +2203,15 @@ type ListImportHistoryRow struct {
 	Imported      int32     `json:"imported"`
 	Skipped       int32     `json:"skipped"`
 	NewSecurities []string  `json:"new_securities"`
+	Updated       int32     `json:"updated"`
+	RsuVests      int32     `json:"rsu_vests"`
 	AccountName   string    `json:"account_name"`
 }
 
-func (q *Queries) ListImportHistory(ctx context.Context, limit int32) ([]ListImportHistoryRow, error) {
-	rows, err := q.db.Query(ctx, listImportHistory, limit)
+// account_ids NULL = every account (household scope); otherwise only imports
+// into the listed accounts.
+func (q *Queries) ListImportHistory(ctx context.Context, arg ListImportHistoryParams) ([]ListImportHistoryRow, error) {
+	rows, err := q.db.Query(ctx, listImportHistory, arg.AccountIds, arg.Offset, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -2162,6 +2229,8 @@ func (q *Queries) ListImportHistory(ctx context.Context, limit int32) ([]ListImp
 			&i.Imported,
 			&i.Skipped,
 			&i.NewSecurities,
+			&i.Updated,
+			&i.RsuVests,
 			&i.AccountName,
 		); err != nil {
 			return nil, err
@@ -3495,6 +3564,24 @@ func (q *Queries) UpdateNotificationChannel(ctx context.Context, arg UpdateNotif
 	return err
 }
 
+const updateSecurityAssetClass = `-- name: UpdateSecurityAssetClass :exec
+UPDATE securities SET asset_class = $2 WHERE isin = $1 AND asset_class = $3
+`
+
+type UpdateSecurityAssetClassParams struct {
+	ISIN         string `json:"isin"`
+	AssetClass   string `json:"asset_class"`
+	AssetClass_2 string `json:"asset_class_2"`
+}
+
+// Reclassifies a security when fund data proves its name-based class wrong
+// (e.g. a broker-abbreviated ETF stored as a stock). Only updates while the
+// class is still the one the caller saw.
+func (q *Queries) UpdateSecurityAssetClass(ctx context.Context, arg UpdateSecurityAssetClassParams) error {
+	_, err := q.db.Exec(ctx, updateSecurityAssetClass, arg.ISIN, arg.AssetClass, arg.AssetClass_2)
+	return err
+}
+
 const updateSecurityMetadata = `-- name: UpdateSecurityMetadata :exec
 UPDATE securities SET
     sector_weights = $2,
@@ -3575,6 +3662,35 @@ type UpdateUserActiveParams struct {
 func (q *Queries) UpdateUserActive(ctx context.Context, arg UpdateUserActiveParams) error {
 	_, err := q.db.Exec(ctx, updateUserActive, arg.ID, arg.IsActive)
 	return err
+}
+
+const updateWealthReportForPeriod = `-- name: UpdateWealthReportForPeriod :execrows
+UPDATE wealth_reports
+SET data = $3, period_start = $4, period_end = $5, generated_at = now()
+WHERE report_type = $1 AND period_label = $2
+`
+
+type UpdateWealthReportForPeriodParams struct {
+	ReportType  string          `json:"report_type"`
+	PeriodLabel string          `json:"period_label"`
+	Data        json.RawMessage `json:"data"`
+	PeriodStart time.Time       `json:"period_start"`
+	PeriodEnd   time.Time       `json:"period_end"`
+}
+
+// Replaces the stored figures of an existing report (regenerate).
+func (q *Queries) UpdateWealthReportForPeriod(ctx context.Context, arg UpdateWealthReportForPeriodParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateWealthReportForPeriod,
+		arg.ReportType,
+		arg.PeriodLabel,
+		arg.Data,
+		arg.PeriodStart,
+		arg.PeriodEnd,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const upsertAssetObservation = `-- name: UpsertAssetObservation :one

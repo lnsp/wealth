@@ -20,11 +20,11 @@ export default function PerformanceTab() {
   );
 }
 
-/** Tooltip for charts whose x axis holds "YYYY-MM" months and whose values are EUR. */
-function monthMoneyTooltip(params: unknown): string {
+/** Tooltip for charts whose x axis holds valuation dates (month ends and the latest day) and whose values are EUR. */
+function dateMoneyTooltip(params: unknown): string {
   const ps = params as { seriesName: string; value: number; marker: string; axisValue: string }[];
   if (!Array.isArray(ps) || ps.length === 0) return '';
-  return [escapeHtml(fmtMonthShort(ps[0].axisValue)), ...ps.map(p => `${p.marker} ${escapeHtml(p.seriesName)}: ${fmtEUR(p.value)}`)].join('<br/>');
+  return [escapeHtml(fmtDateLong(ps[0].axisValue)), ...ps.map(p => `${p.marker} ${escapeHtml(p.seriesName)}: ${fmtEUR(p.value)}`)].join('<br/>');
 }
 
 /* ───────────── What if you had bought the benchmark ───────────── */
@@ -37,7 +37,7 @@ function BenchmarkComparison() {
   const name = bench.data?.benchmark_name?.trim();
   return (
     <Section first title={name && bench.data?.available !== false ? `What If You Had Bought ${name}?` : 'What If You Had Bought the Benchmark?'}
-      subtitle="Replays every deposit and withdrawal you made through a single benchmark fund.">
+      subtitle="Puts your cash and securities into a single benchmark fund on the first day both have data, then replays every later deposit, withdrawal and share grant through it at market value. Property, vehicles and their loans are not included.">
       <Loaded state={bench} lines={6}>
         {data => {
           const points = arr(data?.comparison);
@@ -47,7 +47,7 @@ function BenchmarkComparison() {
             return (
               <EmptyState
                 title="Not enough benchmark history"
-                message={`${name || 'The benchmark'} needs ${need} daily prices before your deposits can be replayed through it.`}
+                message={`${name || 'The benchmark'} needs ${need} daily prices before your money can be replayed through it.`}
                 action={{ label: 'Load historical prices', onClick: backfill.run }}
               >
                 <div className="w-full max-w-xs">
@@ -71,14 +71,15 @@ function BenchmarkComparison() {
           return (
             <>
               <MetricGrid>
-                <MetricCard label="Your portfolio" value={fmtEUR(data.actual_value)} sublabel="Net worth today" />
-                <MetricCard label={benchName} value={fmtEUR(data.benchmark_value)} sublabel="Same deposits, benchmark only" />
+                <MetricCard label="Your portfolio" value={fmtEUR(data.actual_value)} sublabel="Cash and securities today" />
+                <MetricCard label={benchName} value={fmtEUR(data.benchmark_value)}
+                  sublabel={data.start_date ? `Same money and flows since ${fmtDateLong(data.start_date)}` : 'Same money and flows, benchmark only'} />
                 <MetricCard label="Difference" value={fmtEUR(data.difference, { sign: true })} tone={toneOf(num(data.difference))}
                   sublabel={num(data.difference) >= 0 ? 'You are ahead of the benchmark' : 'You are behind the benchmark'} />
               </MetricGrid>
               <SubHeading className="mt-6 mb-2">Value Over Time</SubHeading>
               <EChartWrapper option={{
-                tooltip: { trigger: 'axis' as const, formatter: monthMoneyTooltip },
+                tooltip: { trigger: 'axis' as const, formatter: dateMoneyTooltip },
                 legend: lineLegend([{ name: 'Your portfolio', style: 'solid' }, { name: benchName, style: 'dashed' }]),
                 xAxis: { type: 'category' as const, data: points.map(c => c.date), boundaryGap: false, axisLabel: { formatter: (v: string) => fmtMonthShort(v) } },
                 yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
@@ -102,32 +103,36 @@ function PurchasingPower() {
   const tc = useThemeColors();
   const inflation = useLoad<Inflation>(() => api.getInflation());
   return (
-    <Section title="Purchasing Power" subtitle="Net worth as recorded (nominal) and in today’s euros (real), adjusted with the German HVPI consumer price index.">
+    <Section title="Purchasing Power" subtitle="Your cash and securities as recorded (nominal) and in today’s euros (real), deflated with the German consumer price index (VPI, Destatis). Property, vehicles and their loans are not included.">
       <Loaded state={inflation} lines={6}>
         {data => {
           const history = arr(data?.history);
           if (history.length <= 3) {
             return (
               <EmptyState
-                title="Not enough net worth history"
-                message="Purchasing power compares at least four months of net worth with consumer prices."
+                title="Not enough history"
+                message="Purchasing power compares at least four months of cash and securities with consumer prices."
                 action={{ label: 'Import transactions', href: '/transactions' }}
               />
             );
           }
           const hasReturns = data.nominal_return != null && data.real_return != null;
+          const span = data.window_start && data.window_end ? `${fmtDateLong(data.window_start)} to ${fmtDateLong(data.window_end)}` : 'Last 12 months';
           return (
             <>
               {hasReturns && (
                 <MetricGrid>
-                  <MetricCard money={false} label="Nominal change" value={fmtPct(data.nominal_return, { sign: true })} tone={toneOf(num(data.nominal_return))} sublabel="As recorded" />
-                  <MetricCard money={false} label="Real change" value={fmtPct(data.real_return, { sign: true })} tone={toneOf(num(data.real_return))} sublabel="After inflation" />
-                  <MetricCard label="Lost to inflation" value={fmtEUR(Math.max(0, num(data.purchasing_power_lost)))} sublabel="In today’s euros" />
+                  <MetricCard money={false} label="Return" value={fmtPct(data.nominal_return, { sign: true })} tone={toneOf(num(data.nominal_return))}
+                    sublabel={`${span}, deposits and withdrawals excluded`} />
+                  <MetricCard money={false} label="Return after inflation" value={fmtPct(data.real_return, { sign: true })} tone={toneOf(num(data.real_return))}
+                    sublabel={data.inflation_pct != null ? `Consumer prices ${fmtPct(data.inflation_pct, { sign: true })} over the same period` : 'After consumer-price inflation'} />
+                  <MetricCard label="Lost to inflation" value={fmtEUR(Math.max(0, num(data.purchasing_power_lost)))}
+                    sublabel={data.window_start ? `Purchasing power taken from the ${fmtDateLong(data.window_start)} value, in today’s euros` : 'In today’s euros'} />
                 </MetricGrid>
               )}
-              <SubHeading className={`${hasReturns ? 'mt-6' : ''} mb-2`}>Nominal and Real Net Worth</SubHeading>
+              <SubHeading className={`${hasReturns ? 'mt-6' : ''} mb-2`}>Nominal and Real Value</SubHeading>
               <EChartWrapper option={{
-                tooltip: { trigger: 'axis' as const, formatter: monthMoneyTooltip },
+                tooltip: { trigger: 'axis' as const, formatter: dateMoneyTooltip },
                 legend: lineLegend([{ name: 'Nominal', style: 'solid' }, { name: 'Real (today’s euros)', style: 'dashed' }]),
                 xAxis: { type: 'category' as const, data: history.map(h => h.date), boundaryGap: false, axisLabel: { formatter: (v: string) => fmtMonthShort(v) } },
                 yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
@@ -152,7 +157,7 @@ function ExchangeRates() {
   const fx = useLoad(() => api.getFXHistory());
   const backfill = useJobTrigger('/api/settings/refresh-historical-prices', fx.reload);
   return (
-    <Section title="Exchange Rates" subtitle="How much foreign currency 1 € buys. A falling line means the euro has weakened, which lifts the euro value of holdings in that currency.">
+    <Section title="Exchange Rates" subtitle="How much of each foreign currency you hold in securities or cash 1 € buys (ECB reference rates). A falling line means the euro has weakened, which lifts the euro value of holdings in that currency.">
       <Loaded state={fx} lines={5}>
         {data => {
           const rates = rec(data?.rates);

@@ -1,6 +1,7 @@
 package analytics
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"testing"
@@ -295,11 +296,21 @@ func TestBuildAllocationTreemap_Hierarchy(t *testing.T) {
 	if etfNode.Name != "S&P 500 ETF" {
 		t.Errorf("top node name = %q, want %q", etfNode.Name, "S&P 500 ETF")
 	}
-	if etfNode.Value != 0 {
-		t.Errorf("parent node should not have value set (children carry values)")
+	// Audit C5: the fund node carries its market value and the part not
+	// covered by listed constituents is a "Rest of fund" child, so the fund
+	// is drawn at 40,000 rather than at the 6,600 of its listed holdings.
+	if etfNode.Value != 40000 {
+		t.Errorf("fund node value = %f, want its market value 40000", etfNode.Value)
 	}
-	if len(etfNode.Children) != 2 {
-		t.Fatalf("expected 2 sector children, got %d", len(etfNode.Children))
+	if len(etfNode.Children) != 3 {
+		t.Fatalf("expected 2 sector children plus the rest of the fund, got %d", len(etfNode.Children))
+	}
+	childSum := 0.0
+	for _, c := range etfNode.Children {
+		childSum += c.Value
+	}
+	if math.Abs(childSum-40000) > 0.01 {
+		t.Errorf("children sum to %f, want 40000", childSum)
 	}
 
 	// Sort sectors for stable test
@@ -308,7 +319,11 @@ func TestBuildAllocationTreemap_Hierarchy(t *testing.T) {
 	})
 
 	healthSector := etfNode.Children[0]
-	techSector := etfNode.Children[1]
+	rest := etfNode.Children[1]
+	techSector := etfNode.Children[2]
+	if rest.Name != TreemapRestOfFund || math.Abs(rest.Value-33400) > 0.01 {
+		t.Errorf("rest of fund = %q %f, want %q 33400", rest.Name, rest.Value, TreemapRestOfFund)
+	}
 
 	if healthSector.Name != "Healthcare" {
 		t.Errorf("first sector = %q, want Healthcare", healthSector.Name)
@@ -357,9 +372,48 @@ func TestBuildAllocationTreemap_LeafNodeForNonETF(t *testing.T) {
 		t.Errorf("leaf should have no children, got %d", len(leaf.Children))
 	}
 
-	// VWCE should have children
+	// VWCE should have its sector child plus the rest of the fund
 	parent := nodes[1]
-	if len(parent.Children) != 1 {
-		t.Errorf("VWCE should have 1 sector child, got %d", len(parent.Children))
+	if len(parent.Children) != 2 {
+		t.Errorf("VWCE should have 1 sector child and the rest of the fund, got %d", len(parent.Children))
+	}
+	if parent.Value != 60000 {
+		t.Errorf("VWCE value = %f, want 60000", parent.Value)
+	}
+}
+
+// Audit C5: a 10,000 € All-World ETF whose top 10 cover 20 % was drawn as
+// 2,000 € because the fund node had no value and ECharts summed the
+// children. Constituents without a sector hang directly under the fund.
+func TestBuildAllocationTreemap_FlatConstituentsKeepFundSize(t *testing.T) {
+	var top []TreemapNode
+	for i := 0; i < 10; i++ {
+		top = append(top, TreemapNode{Name: fmt.Sprintf("Company %d", i), Value: 200})
+	}
+	nodes := BuildAllocationTreemap([]ETFForTreemap{
+		{Name: "All-World", MarketValue: 10000, Constituents: top},
+		{Name: "Alphabet", MarketValue: 10000},
+	})
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(nodes))
+	}
+	fund := nodes[0]
+	if fund.Value != 10000 {
+		t.Errorf("fund value = %f, want 10000", fund.Value)
+	}
+	if len(fund.Children) != 11 {
+		t.Fatalf("fund children = %d, want 10 companies + rest of fund", len(fund.Children))
+	}
+	last := fund.Children[10]
+	if last.Name != TreemapRestOfFund || math.Abs(last.Value-8000) > 0.01 {
+		t.Errorf("rest of fund = %q %f, want 8000", last.Name, last.Value)
+	}
+	for _, c := range fund.Children {
+		if c.Name == "Other" {
+			t.Error("constituents without a sector must not be grouped under a sector called Other")
+		}
+	}
+	if nodes[1].Value != fund.Value {
+		t.Errorf("a 10,000 € fund and a 10,000 € stock must be the same size: %f vs %f", fund.Value, nodes[1].Value)
 	}
 }

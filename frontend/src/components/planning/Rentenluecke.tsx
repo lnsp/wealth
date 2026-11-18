@@ -8,13 +8,23 @@ import {
 } from '../ui';
 import { fmtEUR, fmtPct, fmtAxis } from '../../utils/format';
 import { ItemCard, RemoveButton, toNum } from './shared';
+import { parsePct } from './planningMath';
+import {
+  DEFAULT_INFLATION_PCT, DEFAULT_RETURN_PCT, EARLIEST_STATUTORY_AGE, KV_RATE, KV_ZUSATZ_2026, PV_RATE_2026, REGELALTERSGRENZE,
+  VERSORGUNGSBEZUG_FREIBETRAG_2026,
+} from './constants';
 
 type PensionResult = {
-  sources: { type: string; label: string; monthly_gross: number; monthly_net: number; start_age: number }[];
+  sources: {
+    type: string; label: string; monthly_gross: number; monthly_net: number; start_age: number;
+    monthly_income_tax?: number; monthly_health?: number; taxable_share_pct?: number; starts_after_retirement?: boolean;
+  }[];
   total_monthly_net: number; portfolio_net: number; projected_portfolio: number;
   monthly_contrib: number; gap: number; gap_annual: number; sparplan_to_close: number;
+  gap_after_all_pensions?: number;
   sensitivity?: { age: number; pension_net: number; portfolio_net: number; total_net: number; gap: number }[];
   rentenwert: number;
+  return_pct?: number; swr_pct?: number; inflation_pct?: number;
 };
 
 // English labels; the German legal term stays as a gloss where it is the name on the paperwork.
@@ -47,21 +57,30 @@ function isPensionResult(body: unknown): body is PensionResult {
 // projected income from gesetzliche Rente / bAV / Riester / Rürup against
 // a monthly spending target and surfaces the gap that has to come from
 // the private portfolio. Backend at POST /api/portfolio/pension-gap does
-// the actuarial math (Rentenwert, Besteuerungsanteil, …).
+// the math (Rentenwert, Besteuerungsanteil, § 32a tariff on the combined
+// income, retirees' health insurance); every result is in today's money.
+// Return, withdrawal rate and inflation are the FIRE Calculator's.
 export default function Rentenluecke() {
-  const { pensionCurrentAge, pensionAge, pensionNeed, setPensionNeed, pensionContrib, setPensionContrib, pensionSources, setPensionSources } = usePlanning();
+  const {
+    pensionCurrentAge, pensionAge, pensionNeed, setPensionNeed, pensionContrib, setPensionContrib, pensionSources, setPensionSources,
+    projReturn, projData, fireSWR, fireInflation, crChildren, churchRate, joint,
+  } = usePlanning();
   const tc = useThemeColors();
   const [confirm, confirmDialog] = useConfirm();
   const [result, setResult] = useState<PensionResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // tax_portion_pct 0 means "derive the taxable share from the type and start year".
   const addSource = (t: typeof PENSION_TEMPLATES[number]) => {
     setPensionSources([...pensionSources, {
       type: t.type, label: t.label, monthly_gross: t.type === 'gesetzliche' ? 0 : 500,
-      rentenpunkte: t.rp, start_age: pensionAge, tax_portion_pct: 0,
+      rentenpunkte: t.rp, start_age: t.type === 'gesetzliche' ? Math.max(pensionAge, EARLIEST_STATUTORY_AGE) : pensionAge, tax_portion_pct: 0,
     }]);
   };
+  const returnPct = parsePct(projReturn, projData?.return_pct ?? DEFAULT_RETURN_PCT);
+  const swr = parsePct(fireSWR, 3.5);
+  const inflation = parsePct(fireInflation, DEFAULT_INFLATION_PCT);
   const updateSource = (i: number, patch: Partial<PensionSource>) => {
     setPensionSources(pensionSources.map((s, j) => (j === i ? { ...s, ...patch } : s)));
   };
@@ -77,7 +96,11 @@ export default function Rentenluecke() {
     try {
       const res = await fetch('/api/portfolio/pension-gap', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sources: pensionSources, retirement_age: pensionAge, monthly_need: pensionNeed, current_age: pensionCurrentAge, monthly_contrib: parseFloat(pensionContrib) || 0 }),
+        body: JSON.stringify({
+          sources: pensionSources, retirement_age: pensionAge, monthly_need: pensionNeed, current_age: pensionCurrentAge,
+          monthly_contrib: toNum(pensionContrib), return_pct: returnPct, swr, inflation_pct: inflation,
+          children: Math.max(0, Math.round(toNum(crChildren))), church_rate: churchRate, joint,
+        }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body: unknown = await res.json();
@@ -122,18 +145,18 @@ export default function Rentenluecke() {
           integer
           value={pensionNeed}
           onValueChange={v => setPensionNeed(Math.max(0, v))}
-          hint="What you want to live on, after tax."
+          hint="What you want to live on, after tax, in today’s money."
         />
         <NumberField
           label="Monthly investment until retirement"
           unit="€ / month"
           value={toNum(pensionContrib)}
           onValueChange={v => setPensionContrib(v > 0 ? String(v) : '')}
-          hint="Leave at 0 to use your average deposits over the last 12 months."
+          hint="Leave at 0 to use your net contributions over the last 12 months."
         />
       </div>
       <p className="mt-3 text-[13px] text-ink-muted">
-        Uses age {pensionCurrentAge} and retirement age {pensionAge} from Your Profile.
+        Uses age {pensionCurrentAge} and retirement age {pensionAge} from Your Profile, and {fmtPct(returnPct)} return, a {fmtPct(swr)} withdrawal rate and {fmtPct(inflation)} inflation from the FIRE Calculator.
       </p>
 
       <SubHeading className="mt-6">Pension sources</SubHeading>
@@ -183,6 +206,9 @@ export default function Rentenluecke() {
                   integer
                   value={src.start_age}
                   onValueChange={v => updateSource(i, { start_age: Math.max(0, v) })}
+                  hint={src.type === 'gesetzliche'
+                    ? `Not before ${EARLIEST_STATUTORY_AGE}; 0,3 % less for each month before ${REGELALTERSGRENZE}, 0,5 % more after.`
+                    : undefined}
                 />
               </div>
             </ItemCard>
@@ -208,7 +234,12 @@ export default function Rentenluecke() {
               money={result.gap > 0}
               tone={result.gap > 0 ? 'negative' : 'positive'}
               value={result.gap > 0 ? fmtEUR(result.gap) : 'Covered'}
-              sublabel={<>Against <span data-privacy="blur">{fmtEUR(pensionNeed)}</span> a month from age {pensionAge}</>}
+              sublabel={<>
+                Against <span data-privacy="blur">{fmtEUR(pensionNeed)}</span> a month from age {pensionAge}, in today’s money
+                {result.gap_after_all_pensions != null && Math.abs(result.gap_after_all_pensions - result.gap) >= 1 && (
+                  <>; <span data-privacy="blur">{result.gap_after_all_pensions > 0 ? fmtEUR(result.gap_after_all_pensions) : 'covered'}</span> once every pension has started</>
+                )}
+              </>}
             />
             <MetricCard
               label="Extra savings needed"
@@ -220,24 +251,30 @@ export default function Rentenluecke() {
               label="Projected portfolio"
               value={fmtEUR(result.projected_portfolio)}
               sublabel={result.monthly_contrib > 0
-                ? <>At retirement, investing <span data-privacy="blur">{fmtEUR(result.monthly_contrib)}</span> a month</>
-                : 'At retirement, without further investing'}
+                ? <>At retirement in today’s money, investing <span data-privacy="blur">{fmtEUR(result.monthly_contrib)}</span> a month</>
+                : 'At retirement in today’s money, without further investing'}
             />
             <MetricCard
               label="Portfolio withdrawal"
               value={fmtEUR(result.portfolio_net)}
-              sublabel="A month, after tax"
+              sublabel="A month, after tax on the gain, in today’s money"
             />
           </MetricGrid>
 
           <SubHeading className="mt-6">Monthly income after tax, against your target</SubHeading>
-          <p className="mt-1 mb-3 text-[13px] text-ink-muted">Share of the desired retirement income each source covers.</p>
+          <p className="mt-1 mb-3 text-[13px] text-ink-muted">
+            Share of the desired retirement income each source covers at age {pensionAge}.
+            {result.sources.some(s => s.starts_after_retirement) && <> Sources that start later count as 0 here.</>}
+          </p>
           <RankedBars items={incomeBars} scale="max" />
 
           {sensitivity.length > 0 && (
             <div className="mt-6">
               <SubHeading>If you retired at a different age</SubHeading>
-              <p className="mt-1 text-[13px] text-ink-muted">Monthly income after tax by retirement age; the dashed line is the remaining gap.</p>
+              <p className="mt-1 text-[13px] text-ink-muted">
+                Monthly income after tax in the first year of retirement, by retirement age; the dashed line is the remaining gap.
+                The statutory pension starts at {EARLIEST_STATUTORY_AGE} at the earliest, with up to 14,4 % less; your pension points may also be fewer if you stop earlier.
+              </p>
               <EChartWrapper
                 option={{
                   tooltip: { trigger: 'axis' as const, valueFormatter: (v: unknown) => fmtEUR(Number(v)) },
@@ -265,7 +302,9 @@ export default function Rentenluecke() {
           )}
 
           <p className="mt-4 text-[13px] text-ink-muted">
-            Estimate only: pensions are taxed with a simplified progressive rate and about 7,7 % health insurance; the result reflects the inputs at the time you pressed Calculate.
+            Estimate only, in today’s money. Pensions: one pension point is worth {fmtEUR(result.rentenwert, { cents: true })} a month; income tax uses the 2026 tariff on all pensions together, with the taxable share set by the start year (statutory, Rürup) or age (private annuity), and company and Riester pensions taxed in full.
+            Retirees’ health and care insurance: about {fmtPct(((KV_RATE + KV_ZUSATZ_2026) / 2 + PV_RATE_2026) * 100, { digits: 2 })} on the statutory pension, the full rate on company pensions above {fmtEUR(VERSORGUNGSBEZUG_FREIBETRAG_2026, { cents: true })} a month, none on private, Riester and Rürup pensions.
+            The portfolio withdrawal is taxed only on its gain. The result reflects the inputs at the time you pressed Calculate.
           </p>
         </div>
       )}

@@ -8,6 +8,11 @@ interface Props {
   onImportComplete: (result: ImportResult) => void;
 }
 
+// Morgan Stanley files never name the stock; the import takes it from the account
+// and rejects the file without it (vests would otherwise book as cash withdrawals).
+const needsStockISIN = (acc: Account) => acc.institution === 'morgan_stanley' && !acc.import_security_isin?.trim();
+const STOCK_ISIN_MISSING = 'Add the Stock ISIN to this account in Settings › Accounts first. Morgan Stanley files don’t name the stock.';
+
 export default function CsvUploader({ accounts, onImportComplete }: Props) {
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -21,6 +26,11 @@ export default function CsvUploader({ accounts, onImportComplete }: Props) {
       setAccountError('Select the account this file belongs to first.');
       return;
     }
+    const acc = accounts.find(a => a.id === selectedAccount);
+    if (acc && needsStockISIN(acc)) {
+      setAccountError(STOCK_ISIN_MISSING);
+      return;
+    }
     setUploading(true);
     setError(null);
     try {
@@ -31,7 +41,7 @@ export default function CsvUploader({ accounts, onImportComplete }: Props) {
     } finally {
       setUploading(false);
     }
-  }, [selectedAccount, onImportComplete]);
+  }, [selectedAccount, accounts, onImportComplete]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -53,7 +63,12 @@ export default function CsvUploader({ accounts, onImportComplete }: Props) {
         label="Account"
         value={selectedAccount}
         error={accountError}
-        onChange={(e) => { setSelectedAccount(e.target.value); setAccountError(undefined); }}
+        onChange={(e) => {
+          const id = e.target.value;
+          setSelectedAccount(id);
+          const acc = accounts.find(a => a.id === id);
+          setAccountError(acc && needsStockISIN(acc) ? STOCK_ISIN_MISSING : undefined);
+        }}
       >
         <option value="">Select account...</option>
         {accounts.map((acc) => (

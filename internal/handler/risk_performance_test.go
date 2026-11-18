@@ -345,13 +345,6 @@ func TestDCARecoveryMonths(t *testing.T) {
 	if a, b := dcaRecoveryMonths(-34, 1, 5, 10000, 100), dcaRecoveryMonths(-34, 1, 5, 1000000, 10000); a != b {
 		t.Errorf("scale invariance: %d vs %d", a, b)
 	}
-	if got := trailingMonthlyContribution([]analytics.CashFlow{
-		{Date: rpDay("2025-11-01"), Amount: 99999}, // outside the window
-		{Date: rpDay("2026-01-01"), Amount: 26000},
-		{Date: rpDay("2026-03-01"), Amount: -2000},
-	}, rpDay("2026-11-18")); math.Abs(got-2000) > 1e-9 {
-		t.Errorf("trailing monthly contribution = %.2f, want 2,000", got)
-	}
 	if got := scenarioMonths("2007-10-01", "2009-03-09"); got != 17 {
 		t.Errorf("GFC decline = %d months, want 17", got)
 	}

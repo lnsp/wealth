@@ -1896,7 +1896,8 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 	histFX := loadHistoricalFXRates(ctx, h.queries)
 	txns, _ := listAllTransactionsRows(ctx, h.queries)
 	acctTypes := h.accountTypesByID(ctx)
-	trailing := trailingNetContribution(txns, acctTypes, now, histFX, fxRates)
+	physHoldings, _ := assets.Load(ctx, h.queries)
+	trailing := trailingNetContribution(txns, acctTypes, now, histFX, fxRates, physHoldings)
 
 	monthlyContrib := trailing.Monthly
 	annualReturn := analytics.PlanningDefaultReturnPct
@@ -2192,7 +2193,7 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 		if pastVal <= 0 {
 			break
 		}
-		then := trailingNetContribution(txns, acctTypes, s.Date, histFX, fxRates)
+		then := trailingNetContribution(txns, acctTypes, s.Date, histFX, fxRates, physHoldings)
 		projected := math.Max(0, planProjectFV(pastVal, then.Monthly, analytics.PlanningDefaultReturnPct, 0, 12))
 		diffEUR := currentValue - projected
 		diffPct := 0.0
@@ -2228,6 +2229,10 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 			"deposits":       math.Round(trailing.Deposits),
 			"withdrawals":    math.Round(trailing.Withdrawals),
 			"in_kind":        math.Round(trailing.InKind),
+			// One-off payments into physical assets, left out of the rate.
+			"asset_payments": math.Round(trailing.AssetPayments),
+			// Withdrawals that look like an asset's payment but aren't linked.
+			"unlinked_asset_payments": nonNilHints(trailing.UnlinkedAssetPayments),
 		},
 		"return_pct":          annualReturn,
 		"horizon_years":       horizonYears,
@@ -3417,7 +3422,7 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 	if req.Contribution != nil {
 		monthlyContrib = *req.Contribution
 	} else {
-		monthlyContrib = trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates).Monthly
+		monthlyContrib = trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates, h.physicalHoldings(ctx)).Monthly
 	}
 	annualReturn := analytics.PlanningDefaultReturnPct
 	if req.ReturnPct != nil {
@@ -3715,7 +3720,7 @@ func (h *PortfolioHandler) HandlePensionGap(w http.ResponseWriter, r *http.Reque
 	if monthlyContrib <= 0 {
 		histFX := loadHistoricalFXRates(ctx, h.queries)
 		txns, _ := listAllTransactionsRows(ctx, h.queries)
-		monthlyContrib = trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates).Monthly
+		monthlyContrib = trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates, h.physicalHoldings(ctx)).Monthly
 	}
 	taxRate := analytics.CapitalIncomeTaxRate(churchRate)
 	tfs := h.portfolioTFS(ctx, fxRates)

@@ -63,6 +63,84 @@ type cashflowResponse struct {
 	// UnconvertedCurrencies lists currencies with no EUR rate. Their
 	// transactions are left out rather than counted 1:1 as euros.
 	UnconvertedCurrencies []string `json:"unconverted_currencies"`
+	// Scope says which accounts the income/spending view reads. Without a
+	// current account, salary and day-to-day spending run through a bank that
+	// isn't imported and cannot be measured here.
+	Scope cashflowScope `json:"scope"`
+	// External is money crossing the boundary of all tracked accounts per
+	// month (same months as Months), and ExternalTrailing its 12-month net
+	// per month — the figure Planning uses as the default contribution.
+	External         []externalMonth     `json:"external"`
+	ExternalTrailing externalTrailingRate `json:"external_trailing"`
+}
+
+// cashflowScope describes the accounts behind the income/spending figures.
+type cashflowScope struct {
+	CashAccounts      []string `json:"cash_accounts"` // checking and savings accounts read for income and spending
+	HasCurrentAccount bool     `json:"has_current_account"`
+}
+
+// externalMonth is money that entered or left the tracked accounts in one
+// month: deposits from and withdrawals to untracked accounts, shares granted
+// (RSU vests) and payments into linked physical assets.
+type externalMonth struct {
+	Month      string  `json:"month"`
+	In         float64 `json:"in"`
+	InKind     float64 `json:"in_kind"`
+	Out        float64 `json:"out"`
+	IntoAssets float64 `json:"into_assets"`
+	Net        float64 `json:"net"` // In + InKind − Out − IntoAssets
+}
+
+// externalTrailingRate is trailingNetContribution in JSON form.
+type externalTrailingRate struct {
+	Monthly       float64 `json:"monthly"`
+	MonthsCovered float64 `json:"months_covered"`
+	Deposits      float64 `json:"deposits"`
+	InKind        float64 `json:"in_kind"`
+	Withdrawals   float64 `json:"withdrawals"`
+	AssetPayments float64 `json:"asset_payments"`
+}
+
+// buildExternalMonths sums externalFlowOf per calendar month for the given
+// months ("2006-01", newest first), so the Cashflow page can show what is
+// visible when salary and spending run through an untracked bank.
+func buildExternalMonths(txns []db.ListTransactionsRow, acctTypes map[uuid.UUID]string, holdings assets.Holdings, histFX []market.HistoricalFXRate, fxRates map[string]float64, months []string) []externalMonth {
+	idx := make(map[string]int, len(months))
+	out := make([]externalMonth, len(months))
+	for i, m := range months {
+		idx[m] = i
+		out[i].Month = m
+	}
+	washed := washedInKindIDs(txns, acctTypes)
+	oneOff := oneOffAssetPaymentIDs(holdings)
+	for _, t := range txns {
+		i, ok := idx[t.Date.Format("2006-01")]
+		if !ok {
+			continue
+		}
+		kind := externalFlowOf(t, acctTypes, washed, oneOff)
+		if kind == extNone {
+			continue
+		}
+		amt := math.Abs(convertAmountToEURAtDate(numericToFloat(t.Amount), t.Currency, t.Date, histFX, fxRates))
+		switch kind {
+		case extDeposit:
+			out[i].In += amt
+		case extInKind:
+			out[i].InKind += amt
+		case extWithdrawal:
+			out[i].Out += amt
+		case extAssetPayment:
+			out[i].IntoAssets += amt
+		}
+	}
+	for i := range out {
+		e := &out[i]
+		e.In, e.InKind, e.Out, e.IntoAssets = math.Round(e.In*100)/100, math.Round(e.InKind*100)/100, math.Round(e.Out*100)/100, math.Round(e.IntoAssets*100)/100
+		e.Net = math.Round((e.In+e.InKind-e.Out-e.IntoAssets)*100) / 100
+	}
+	return out
 }
 
 // medianSummary describes a typical month over the last 12 complete months
@@ -135,10 +213,21 @@ func (h *CashflowHandler) HandleCashflow(w http.ResponseWriter, r *http.Request)
 	// IBANs of every own account, closed ones included: a payment naming one
 	// is an own-account transfer.
 	var ownIBANs []string
-	if accts, err := h.queries.ListAllAccounts(r.Context()); err == nil {
-		for _, a := range accts {
-			if a.IBAN.Valid && a.IBAN.String != "" {
-				ownIBANs = append(ownIBANs, a.IBAN.String)
+	allAccts, _ := h.queries.ListAllAccounts(r.Context())
+	acctTypes := make(map[uuid.UUID]string, len(allAccts))
+	scope := cashflowScope{CashAccounts: []string{}}
+	for _, a := range allAccts {
+		if a.IsActive { // same account set as Planning's default contribution
+			acctTypes[a.ID] = a.Type
+		}
+		if a.IBAN.Valid && a.IBAN.String != "" {
+			ownIBANs = append(ownIBANs, a.IBAN.String)
+		}
+		// Closed accounts keep their history on this page, so they count too.
+		if a.Type == "checking" || a.Type == "savings" {
+			scope.CashAccounts = append(scope.CashAccounts, a.Name)
+			if a.Type == "checking" {
+				scope.HasCurrentAccount = true
 			}
 		}
 	}
@@ -170,6 +259,26 @@ func (h *CashflowHandler) HandleCashflow(w http.ResponseWriter, r *http.Request)
 	}
 
 	resp := buildCashflow(cashRows, split, ownIBANs, now, months)
+	resp.Scope = scope
+	if txns, err := listAllTransactionsRows(r.Context(), h.queries); err == nil {
+		keys := make([]string, len(resp.Months))
+		for i, m := range resp.Months {
+			keys[i] = m.Month
+		}
+		resp.External = buildExternalMonths(txns, acctTypes, holdings, histFX, fxRates, keys)
+		tr := trailingNetContribution(txns, acctTypes, now, histFX, fxRates, holdings)
+		resp.ExternalTrailing = externalTrailingRate{
+			Monthly:       math.Round(tr.Monthly*100) / 100,
+			MonthsCovered: math.Round(tr.MonthsCovered*10) / 10,
+			Deposits:      math.Round(tr.Deposits),
+			InKind:        math.Round(tr.InKind),
+			Withdrawals:   math.Round(tr.Withdrawals),
+			AssetPayments: math.Round(tr.AssetPayments),
+		}
+	}
+	if resp.External == nil {
+		resp.External = []externalMonth{}
+	}
 	for c := range unconverted {
 		resp.UnconvertedCurrencies = append(resp.UnconvertedCurrencies, c)
 	}

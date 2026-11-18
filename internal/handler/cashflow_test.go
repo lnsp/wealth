@@ -8,7 +8,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/lnsp/wealth/internal/assets"
+	db "github.com/lnsp/wealth/internal/database/generated"
 	"github.com/lnsp/wealth/internal/market"
 )
 
@@ -336,5 +339,42 @@ func TestHasEURRate(t *testing.T) {
 		if got := hasEURRate(tc.cur, d, hist, latest); got != tc.want {
 			t.Errorf("hasEURRate(%q) = %v, want %v", tc.cur, got, tc.want)
 		}
+	}
+}
+
+// Prod shape: salary and spending run through an untracked bank; only a
+// savings account and brokers are imported. The external series is what the
+// page can still show: savings plans in, RSU vests, wires out, a car payment.
+func TestBuildExternalMonths_UntrackedCurrentAccount(t *testing.T) {
+	savings, broker, ms := uuid.New(), uuid.New(), uuid.New()
+	types := map[uuid.UUID]string{savings: "savings", broker: "brokerage", ms: "brokerage"}
+	row := func(acct uuid.UUID, date, typ string, amount float64, isin string) db.ListTransactionsRow {
+		d, _ := time.Parse("2006-01-02", date)
+		r := db.ListTransactionsRow{ID: uuid.New(), AccountID: acct, Date: d, Type: typ, Amount: numericFromFloat(amount), Currency: "EUR"}
+		if isin != "" {
+			r.SecurityISIN = pgtype.Text{String: isin, Valid: true}
+			r.Quantity = numericFromFloat(1)
+		}
+		return r
+	}
+	carPay := row(savings, "2026-11-08", "withdrawal", 46500, "")
+	txns := []db.ListTransactionsRow{
+		row(broker, "2026-10-02", "deposit", 2000, ""),            // savings plan from the salary account
+		row(ms, "2026-10-20", "transfer", 1500, "US02079K1079"),   // RSU vest
+		row(ms, "2026-10-21", "withdrawal", 1400, ""),             // auto-wire to the salary account
+		row(broker, "2026-10-13", "cash_transfer_out", 35000, ""), // own accounts: not external
+		row(savings, "2026-10-13", "cash_transfer_in", 35000, ""),
+		row(savings, "2026-10-31", "interest", 51.02, ""), // income, not a boundary flow
+		carPay,
+	}
+	car := assets.Asset{Asset: db.Asset{ID: uuid.New(), Name: "ID.3 Neo", PurchaseDate: time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC), PurchasePrice: numericFromFloat(44990)},
+		Links: []db.AssetTransaction{{TransactionID: carPay.ID, Purpose: "purchase"}}}
+	got := buildExternalMonths(txns, types, assets.Holdings{Assets: []assets.Asset{car}}, nil, nil, []string{"2026-11", "2026-10"})
+	nov, oct := got[0], got[1]
+	if oct.In != 2000 || oct.InKind != 1500 || oct.Out != 1400 || oct.Net != 2100 {
+		t.Errorf("October = %+v, want in 2,000, in-kind 1,500, out 1,400, net 2,100", oct)
+	}
+	if nov.Out != 0 || nov.IntoAssets != 46500 || nov.Net != -46500 {
+		t.Errorf("November = %+v, want 46,500 into assets and no other outflow", nov)
 	}
 }

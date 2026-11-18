@@ -4975,8 +4975,22 @@ func (h *AnalysisHandler) HandleCrisisStressTest(w http.ResponseWriter, r *http.
 	// Net contributions of the last 12 months, the rate at which money keeps
 	// going in during a crisis (project rule: trailing 12 months, not an
 	// all-time average).
+	// Same definition as the Planning and Net Worth projections: one-off
+	// payments linked to physical assets (a car, a house) are swaps, not a
+	// rate at which money stops going in.
 	now := time.Now().UTC()
-	monthlyContribution := trailingMonthlyContribution(h.buildInvestableFlowsForRisk(ctx), now)
+	monthlyContribution := 0.0
+	if txns, err := listAllTransactionsRows(ctx, h.queries); err == nil {
+		acctTypes := map[uuid.UUID]string{}
+		if accts, err := h.queries.ListAccounts(ctx); err == nil {
+			for _, a := range accts {
+				acctTypes[a.ID] = a.Type
+			}
+		}
+		hold, _ := assets.Load(ctx, h.queries)
+		monthlyContribution = trailingNetContribution(txns, acctTypes, now,
+			loadHistoricalFXRates(ctx, h.queries), loadFXRatesMap(ctx, h.queries), hold).Monthly
+	}
 
 	type dcaResult struct {
 		Name         string `json:"name"`
@@ -5139,19 +5153,6 @@ func scenarioMonths(start, end string) int {
 		m = 1
 	}
 	return m
-}
-
-// trailingMonthlyContribution is the net external flow (deposits, vests and
-// transfers in, minus withdrawals) of the 12 months up to now, per month.
-func trailingMonthlyContribution(flows []analytics.CashFlow, now time.Time) float64 {
-	from := now.AddDate(-1, 0, 0)
-	total := 0.0
-	for _, f := range flows {
-		if f.Date.After(from) && !f.Date.After(now) {
-			total += f.Amount
-		}
-	}
-	return total / 12
 }
 
 // dcaRecoveryMonths simulates a crisis path (a steady fall of dropPct over

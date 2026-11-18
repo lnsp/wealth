@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, type CashflowBucket, type CashflowData, type CashflowMonth } from '../api/client';
+import { api, type CashflowBucket, type CashflowData, type CashflowExternalMonth, type CashflowMonth } from '../api/client';
 import {
   PageHeader, Section, MetricCard, MetricGrid, RankedBars,
   LoadingState, ErrorState, EmptyState, SectionBoundary,
@@ -190,7 +190,8 @@ export default function Cashflow() {
     );
   }
 
-  if (!data || !months.some(hasActivity)) {
+  const externalActivity = (data?.external ?? []).some(e => e.in !== 0 || e.in_kind !== 0 || e.out !== 0 || e.into_assets !== 0);
+  if (!data || (!months.some(hasActivity) && !(data.scope && !data.scope.has_current_account && externalActivity))) {
     return (
       <div className="space-y-4">
         <PageHeader title="Cashflow" />
@@ -201,6 +202,10 @@ export default function Cashflow() {
         />
       </div>
     );
+  }
+
+  if (data.scope && !data.scope.has_current_account) {
+    return <UntrackedCurrentAccountView data={data} />;
   }
 
   const med = data.medians;
@@ -402,6 +407,107 @@ export default function Cashflow() {
               </button>
             </div>
           </div>
+        </Section>
+      </SectionBoundary>
+    </div>
+  );
+}
+
+/**
+ * Shown when no current account is imported. Salary and everyday spending then
+ * run through a bank the app can't see, so income, spending and the savings
+ * rate would only reflect savings interest. What is visible is money crossing
+ * the boundary of the tracked accounts: deposits from the salary account, share
+ * vests, withdrawals back to it and payments into linked assets.
+ */
+function UntrackedCurrentAccountView({ data }: { data: CashflowData }) {
+  const ext: CashflowExternalMonth[] = data.external ?? [];
+  const tr = data.external_trailing;
+  const accounts = data.scope?.cash_accounts ?? [];
+  const nets = ext.map(e => Math.round(e.net));
+  const maxNet = Math.max(0, ...nets);
+  const minNet = Math.min(0, ...nets);
+  const scopeText = accounts.length === 0
+    ? 'No current or savings account is imported'
+    : `Only ${accounts.join(', ')} ${accounts.length === 1 ? 'is' : 'are'} imported as ${accounts.length === 1 ? 'a cash account' : 'cash accounts'}`;
+
+  return (
+    <div>
+      <PageHeader title="Cashflow" />
+      <div className="mt-2 md:mt-6 rounded-apple border border-divider bg-inset px-4 py-3 text-[14px] text-ink-body max-w-3xl">
+        {scopeText}. Your salary and everyday spending go through a current account that isn’t imported, so income,
+        spending and the savings rate can’t be measured here.{' '}
+        <Link to="/transactions" className="font-medium text-forest underline underline-offset-2">Import that account’s transactions</Link>{' '}
+        to fill this page. Until then it shows the money moving into and out of the accounts you do track.
+      </div>
+
+      {tr && (
+        <MetricGrid className="mt-4">
+          <MetricCard label="Added per month" value={fmtEUR(Math.round(tr.monthly), { sign: true })}
+            tone={tr.monthly > 0 ? 'positive' : tr.monthly < 0 ? 'negative' : 'neutral'}
+            sublabel={`Net, over the last ${fmtNum(tr.months_covered)} months · Planning’s default contribution`} />
+          <MetricCard label="Money in" value={fmtEUR(Math.round(tr.deposits + tr.in_kind))}
+            sublabel={tr.in_kind > 0 ? `Last 12 months, incl. ${fmtEUR(Math.round(tr.in_kind))} in share vests` : 'Last 12 months'} />
+          <MetricCard label="Money out" value={fmtEUR(Math.round(tr.withdrawals))}
+            sublabel="Last 12 months, to accounts that aren’t imported" />
+          <MetricCard label="Into assets" value={fmtEUR(Math.round(tr.asset_payments))}
+            sublabel="Payments linked to a car or property; left out of the monthly rate" />
+        </MetricGrid>
+      )}
+
+      <SectionBoundary>
+        <Section title="Money In and Out" subtitle="Per month, across every tracked account. Moves between your own accounts and trades inside them are left out. Amounts in EUR.">
+          <div className="relative rounded-apple border border-divider overflow-hidden">
+            <div className={`${GRID} bg-inset border-b border-divider py-2 pl-3 pr-2.5 text-right`} aria-hidden="true">
+              <span className="label-caps text-left">Month</span>
+              <span className="label-caps">In</span>
+              <span className="label-caps">Out</span>
+              <span className="label-caps">Net</span>
+              <span className="label-caps hidden md:block">Trend</span>
+            </div>
+            {ext.map((e, idx) => {
+              const inAmt = Math.round(e.in + e.in_kind);
+              const outAmt = Math.round(e.out + e.into_assets);
+              const net = inAmt - outAmt;
+              const bar = trendBar(net, minNet, maxNet);
+              const running = idx === 0 && data.months[0]?.partial;
+              return (
+                <div key={e.month}
+                  className={`${GRID} min-h-[44px] pl-3 pr-2.5 text-right text-[14px] text-ink-body ${idx === ext.length - 1 ? '' : 'border-b border-divider'}`}>
+                  <span className="text-left whitespace-nowrap">
+                    {fmtMonthShort(monthDate(e.month))}
+                    {running && <span className="block text-[12px] leading-4 text-ink-muted">to date</span>}
+                  </span>
+                  <span data-privacy="blur">{plain(inAmt)}</span>
+                  <span data-privacy="blur">
+                    {plain(outAmt)}
+                    {e.into_assets > 0 && <span className="block text-[12px] leading-4 text-ink-muted">{plain(Math.round(e.into_assets))} into assets</span>}
+                  </span>
+                  <span data-privacy="blur" className={netTone(net)}>{signed(net)}</span>
+                  <span className="hidden md:block pl-6" aria-hidden="true">
+                    <span className="relative block h-2 rounded-[2px] bg-divider overflow-hidden">
+                      {minNet < 0 && <span className="absolute inset-y-0 w-px bg-ink-muted" style={{ left: `${bar.zero}%` }} />}
+                      <span className={`absolute inset-y-0 ${net < 0 ? 'bg-claret' : 'bg-forest'}`} style={{ left: `${bar.left}%`, width: `${bar.width}%` }} />
+                    </span>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          <p className="mt-3 text-[13px] text-ink-muted max-w-2xl">
+            In is cash deposited from accounts that aren’t imported (for example savings plans paid from your salary account)
+            plus shares received, such as RSU vests at their value. Out is cash sent back to those accounts. Savings interest and
+            dividends are returns, not money added, so they aren’t in this table.
+          </p>
+        </Section>
+      </SectionBoundary>
+
+      <SectionBoundary>
+        <Section title="Calibrate Planning" subtitle="Use measured figures as the starting inputs on the Planning page.">
+          <p className="text-[14px] text-ink-body max-w-2xl">
+            Needs your current account. Without it the only income here is savings interest, which would set your invest
+            budget to a few euros. Planning already uses the net money added above as its default monthly contribution.
+          </p>
         </Section>
       </SectionBoundary>
     </div>

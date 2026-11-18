@@ -85,6 +85,25 @@ export interface CashflowData {
     window_months: number;
   };
   unconverted_currencies: string[];
+  /** Accounts behind income and spending; without a current account they can't be measured. */
+  scope?: { cash_accounts: string[]; has_current_account: boolean };
+  /** Money crossing the boundary of all tracked accounts, same months as `months`. */
+  external?: CashflowExternalMonth[];
+  /** Net money added per month over the last 12 months — Planning's default contribution. */
+  external_trailing?: { monthly: number; months_covered: number; deposits: number; in_kind: number; withdrawals: number; asset_payments: number };
+}
+
+export interface CashflowExternalMonth {
+  month: string;
+  /** Cash deposited from accounts that aren't imported (e.g. savings plans from the salary account). */
+  in: number;
+  /** Shares granted or moved in from outside (RSU vests), at value. */
+  in_kind: number;
+  /** Cash withdrawn to accounts that aren't imported. */
+  out: number;
+  /** Payments linked to physical assets (car, property). */
+  into_assets: number;
+  net: number;
 }
 
 export interface HoldingRow {
@@ -858,6 +877,11 @@ export interface SensitivityBar {
   base: number;
 }
 
+export interface UnlinkedAssetPayment {
+  asset: string; asset_id: string; purchase_date: string; price: number;
+  transaction_id: string; date: string; amount: number;
+}
+
 export interface ProjectionData {
   history: { date: string; value: number }[];
   projection: { date: string; value: number; p10?: number; p90?: number }[];
@@ -869,7 +893,13 @@ export interface ProjectionData {
   contribution: number;
   /** Trailing 12-month net contribution (deposits − withdrawals + vests) ÷ months covered, regardless of overrides. */
   default_contribution?: number;
-  contribution_basis?: { kind: string; months_covered: number; deposits: number; withdrawals: number; in_kind: number };
+  contribution_basis?: {
+    kind: string; months_covered: number; deposits: number; withdrawals: number; in_kind: number;
+    /** One-off payments linked to physical assets (car, property): swaps, left out of the rate. */
+    asset_payments?: number;
+    /** Withdrawals that look like an asset's payment but aren't linked to it; they still count as withdrawals. */
+    unlinked_asset_payments?: UnlinkedAssetPayment[];
+  };
   return_pct: number;
   horizon_years?: number;
   contrib_growth_pct?: number;

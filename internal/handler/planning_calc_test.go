@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/lnsp/wealth/internal/analytics"
+	"github.com/lnsp/wealth/internal/assets"
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
 
@@ -52,7 +53,7 @@ func TestTrailingNetContribution_NetOfWithdrawalsPlusVests(t *testing.T) {
 		// Outside investable scope.
 		planTxn(house, "2026-08-01", "deposit", 50000, "", 0),
 	}
-	got := trailingNetContribution(txns, types, planNow, nil, nil)
+	got := trailingNetContribution(txns, types, planNow, nil, nil, assets.Holdings{})
 	want := (26000 - 7328.97 + 1200) / 12
 	if math.Abs(got.Monthly-want) > 1e-6 || got.MonthsCovered != 12 {
 		t.Errorf("monthly %.4f over %.1f months, want %.4f over 12", got.Monthly, got.MonthsCovered, want)
@@ -75,7 +76,7 @@ func TestTrailingNetContribution_ShortHistory(t *testing.T) {
 		planTxn(acct, "2026-09-18", "deposit", 3000, "", 0),
 		planTxn(acct, "2026-10-18", "deposit", 3000, "", 0),
 	}
-	got := trailingNetContribution(txns, types, planNow, nil, nil)
+	got := trailingNetContribution(txns, types, planNow, nil, nil, assets.Holdings{})
 	months := planNow.Truncate(24*time.Hour).Sub(time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)).Hours() / 24 / 30.4375
 	if math.Abs(got.MonthsCovered-months) > 1e-9 || math.Abs(got.Monthly-9000/months) > 1e-6 {
 		t.Errorf("monthly %.2f over %.2f months, want %.2f over %.2f", got.Monthly, got.MonthsCovered, 9000/months, months)
@@ -300,5 +301,43 @@ func TestSimulateLifeEvents_RecurringAndBasis(t *testing.T) {
 	bv, bb := simulateLifeEvents(p.CurrentValue, p.MonthlyContrib, planMonthlyRate(7), nil, 600)
 	if got, want := fireMonthOnPath(p, bv, bb), simulateFIRE(p, planNow).Month; got != want {
 		t.Errorf("life-event FIRE month %d, FIRE calculator %d", got, want)
+	}
+}
+
+// A car bought with money from a savings account is a one-off move from
+// liquid to illiquid wealth (prod, Nov 2026: 46,500 € withdrawn on 8 Nov,
+// ID.3 at 44,990 € on 9 Nov). Linked, it must not depress the recurring
+// contribution; unlinked, it still counts but is pointed out for linking.
+func TestTrailingNetContribution_AssetPurchaseIsOneOff(t *testing.T) {
+	savings := uuid.New()
+	types := map[uuid.UUID]string{savings: "savings"}
+	txns := []db.ListTransactionsRow{planTxn(savings, "2024-01-01", "deposit", 500, "", 0)} // history before the window
+	for m := 1; m <= 12; m++ {
+		txns = append(txns, planTxn(savings, time.Date(2025, time.Month(11+m-1), 25, 0, 0, 0, 0, time.UTC).Format("2006-01-02"), "deposit", 2000, "", 0))
+	}
+	payment := planTxn(savings, "2026-11-08", "withdrawal", 46500, "", 0)
+	other := planTxn(savings, "2026-10-01", "withdrawal", 1200, "", 0)
+	txns = append(txns, payment, other)
+	car := assets.Asset{Asset: db.Asset{
+		ID: uuid.New(), Name: "ID.3 Neo", Kind: "car",
+		PurchaseDate:  time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC),
+		PurchasePrice: numericFromFloat(44990),
+	}}
+
+	unlinked := trailingNetContribution(txns, types, planNow, nil, nil, assets.Holdings{Assets: []assets.Asset{car}})
+	if want := (24000 - 46500 - 1200) / 12.0; math.Abs(unlinked.Monthly-want) > 1e-6 {
+		t.Errorf("unlinked: monthly %.2f, want %.2f (an unlinked payment still counts)", unlinked.Monthly, want)
+	}
+	if len(unlinked.UnlinkedAssetPayments) != 1 || unlinked.UnlinkedAssetPayments[0].TransactionID != payment.ID.String() {
+		t.Fatalf("unlinked: hints %+v, want the 46,500 € withdrawal", unlinked.UnlinkedAssetPayments)
+	}
+
+	car.Links = []db.AssetTransaction{{TransactionID: payment.ID, AssetID: car.ID, Purpose: "purchase"}}
+	linked := trailingNetContribution(txns, types, planNow, nil, nil, assets.Holdings{Assets: []assets.Asset{car}})
+	if want := (24000 - 1200) / 12.0; math.Abs(linked.Monthly-want) > 1e-6 {
+		t.Errorf("linked: monthly %.2f, want %.2f (the purchase is a swap, not a recurring withdrawal)", linked.Monthly, want)
+	}
+	if linked.AssetPayments != 46500 || len(linked.UnlinkedAssetPayments) != 0 {
+		t.Errorf("linked: asset payments %.2f, hints %d; want 46,500 and none", linked.AssetPayments, len(linked.UnlinkedAssetPayments))
 	}
 }

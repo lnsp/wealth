@@ -15,6 +15,7 @@ import { useThemeColors } from '../hooks/useThemeColors';
 import { useMarketRefresh } from '../hooks/useMarketRefresh';
 import UnvestedPanel from '../components/UnvestedPanel';
 import AssetsTab, { ASSET_VIEW_PARAMS } from '../components/assets/AssetsTab';
+import UnlinkedAssetPaymentsNote from '../components/planning/UnlinkedAssetPaymentsNote';
 import { escapeHtml, fmtEUR, fmtPct, fmtNum, fmtAxis, fmtDateLong, fmtMonth, fmtMonthShort } from '../utils/format';
 
 type NWTab = 'overview' | 'projection' | 'accounts' | 'assets';
@@ -1577,6 +1578,7 @@ function ProjectionTab() {
             onChange={v => { setProjContribGrowth(v); writeStored('proj_contrib_growth', v); }}
             display={`${fmtPct(growthNum)} per year`} />
         </div>
+        <UnlinkedAssetPaymentsNote payments={projData.contribution_basis?.unlinked_asset_payments} />
 
         {/* Save and compare scenarios */}
         <div className="flex flex-wrap items-center gap-2.5 mb-5">

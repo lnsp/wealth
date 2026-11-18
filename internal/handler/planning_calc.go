@@ -37,6 +37,117 @@ type trailingContribution struct {
 	Deposits      float64
 	Withdrawals   float64
 	InKind        float64 // RSU vests and other unmatched in-kind transfers, at FMV
+	// AssetPayments are one-off payments from investable accounts into
+	// physical assets (linked purchase and improvement payments, linked loan
+	// extra repayments). They are swaps, already reflected in today's starting
+	// value, so they are left out of the recurring rate.
+	AssetPayments float64
+	// UnlinkedAssetPayments are withdrawals that look like the payment for an
+	// asset bought in the window but are not linked to it. They still count
+	// as withdrawals; linking them removes them from the rate.
+	UnlinkedAssetPayments []assetPaymentHint
+}
+
+// physicalHoldings loads assets and loans; on error the zero value (no
+// physical holdings) is returned, which every caller handles.
+func (h *PortfolioHandler) physicalHoldings(ctx context.Context) assets.Holdings {
+	hold, _ := assets.Load(ctx, h.queries)
+	return hold
+}
+
+func nonNilHints(h []assetPaymentHint) []assetPaymentHint {
+	if h == nil {
+		return []assetPaymentHint{}
+	}
+	return h
+}
+
+// assetPaymentHint names a withdrawal that probably paid for an asset.
+type assetPaymentHint struct {
+	Asset         string  `json:"asset"`
+	AssetID       string  `json:"asset_id"`
+	PurchaseDate  string  `json:"purchase_date"`
+	Price         float64 `json:"price"`
+	TransactionID string  `json:"transaction_id"`
+	Date          string  `json:"date"`
+	Amount        float64 `json:"amount"`
+}
+
+// oneOffAssetPaymentIDs returns the transactions that moved money into
+// physical assets once: payments linked to an asset (purchase, improvement)
+// and linked loan extra repayments (Sondertilgungen). Regular loan
+// instalments are not in it: they recur and keep reducing investable cash,
+// so a projection of investable wealth must keep subtracting them.
+func oneOffAssetPaymentIDs(h assets.Holdings) map[uuid.UUID]bool {
+	ids := h.AssetLinkedIDs()
+	for _, l := range h.Loans {
+		for _, e := range l.Extras {
+			if e.TransactionID != nil {
+				ids[*e.TransactionID] = true
+			}
+		}
+	}
+	return ids
+}
+
+// externalFlowKind says how a transaction moves money between the tracked
+// investable accounts and the outside world.
+type externalFlowKind int
+
+const (
+	extNone         externalFlowKind = iota
+	extDeposit                       // cash in from an untracked account
+	extInKind                        // shares granted or moved in (RSU vests), at value
+	extWithdrawal                    // cash out to an untracked account
+	extAssetPayment                  // cash out into a linked physical asset (one-off swap)
+)
+
+// washedInKindIDs returns matched transfer/transfer_out pairs between own
+// depots: a move, not money from outside.
+func washedInKindIDs(txns []db.ListTransactionsRow, acctTypes map[uuid.UUID]string) map[uuid.UUID]struct{} {
+	var inkind []analytics.InKindTransfer
+	for _, t := range txns {
+		if !investableAccountType(acctTypes[t.AccountID]) || !t.SecurityISIN.Valid {
+			continue
+		}
+		if t.Type != "transfer" && t.Type != "transfer_out" {
+			continue
+		}
+		inkind = append(inkind, analytics.InKindTransfer{
+			ID: t.ID, Date: t.Date, Type: t.Type, ISIN: t.SecurityISIN.String,
+			Quantity: numericToFloat(t.Quantity),
+		})
+	}
+	return analytics.MatchInKindTransferPairs(inkind)
+}
+
+// externalFlowOf classifies one transaction at investable scope. Moves between
+// own accounts (cash_transfer_*, matched depot pairs), trades, income and
+// costs are extNone.
+func externalFlowOf(t db.ListTransactionsRow, acctTypes map[uuid.UUID]string, washed map[uuid.UUID]struct{}, oneOff map[uuid.UUID]bool) externalFlowKind {
+	if !investableAccountType(acctTypes[t.AccountID]) {
+		return extNone
+	}
+	if _, ok := washed[t.ID]; ok {
+		return extNone
+	}
+	hasISIN := t.SecurityISIN.Valid
+	switch analytics.ClassifyForAttribution(t.Type, hasISIN, analytics.ScopePortfolio) {
+	case analytics.BucketWithdrawal:
+		if oneOff[t.ID] {
+			return extAssetPayment
+		}
+		return extWithdrawal
+	case analytics.BucketContribution:
+		if oneOff[t.ID] {
+			return extNone // a refund of an asset payment is part of the swap
+		}
+		if hasISIN {
+			return extInKind
+		}
+		return extDeposit
+	}
+	return extNone
 }
 
 // trailingNetContribution returns the average monthly net external
@@ -54,24 +165,18 @@ func trailingNetContribution(
 	asOf time.Time,
 	histFX []market.HistoricalFXRate,
 	fxRates map[string]float64,
+	holdings assets.Holdings,
 ) trailingContribution {
 	asOfDay := assets.CivilDate(asOf)
 	cutoff := asOfDay.AddDate(-1, 0, 0)
-
-	var inkind []analytics.InKindTransfer
-	for _, t := range txns {
-		if !investableAccountType(acctTypes[t.AccountID]) || !t.SecurityISIN.Valid {
-			continue
-		}
-		if t.Type != "transfer" && t.Type != "transfer_out" {
-			continue
-		}
-		inkind = append(inkind, analytics.InKindTransfer{
-			ID: t.ID, Date: t.Date, Type: t.Type, ISIN: t.SecurityISIN.String,
-			Quantity: numericToFloat(t.Quantity),
-		})
+	oneOff := oneOffAssetPaymentIDs(holdings)
+	type withdrawal struct {
+		t   db.ListTransactionsRow
+		eur float64
 	}
-	washed := analytics.MatchInKindTransferPairs(inkind)
+	var windowWithdrawals []withdrawal
+
+	washed := washedInKindIDs(txns, acctTypes)
 
 	var out trailingContribution
 	var earliest time.Time
@@ -89,21 +194,20 @@ func trailingNetContribution(
 		if !d.After(cutoff) {
 			continue
 		}
-		if _, ok := washed[t.ID]; ok {
-			continue
-		}
-		hasISIN := t.SecurityISIN.Valid
-		bucket := analytics.ClassifyForAttribution(t.Type, hasISIN, analytics.ScopePortfolio)
-		if bucket != analytics.BucketContribution && bucket != analytics.BucketWithdrawal {
+		kind := externalFlowOf(t, acctTypes, washed, oneOff)
+		if kind == extNone {
 			continue
 		}
 		amt := math.Abs(convertAmountToEURAtDate(numericToFloat(t.Amount), t.Currency, t.Date, histFX, fxRates))
-		switch {
-		case bucket == analytics.BucketWithdrawal:
+		switch kind {
+		case extAssetPayment:
+			out.AssetPayments += amt
+		case extWithdrawal:
 			out.Withdrawals += amt
-		case hasISIN:
+			windowWithdrawals = append(windowWithdrawals, withdrawal{t, amt})
+		case extInKind:
 			out.InKind += amt
-		default:
+		case extDeposit:
 			out.Deposits += amt
 		}
 	}
@@ -115,6 +219,49 @@ func trailingNetContribution(
 		out.MonthsCovered = math.Max(1, asOfDay.Sub(earliest).Hours()/24/30.4375)
 	}
 	out.Monthly = (out.Deposits + out.InKind - out.Withdrawals) / out.MonthsCovered
+
+	// Assets bought in the window without a linked payment: point at the
+	// withdrawal that most likely paid for them (3 weeks before to 3 days
+	// after the purchase, within ±10 % of price plus costs), so the user can
+	// link it. The rate itself is not guessed at.
+	claimed := map[uuid.UUID]bool{}
+	for _, a := range holdings.Assets {
+		if len(a.Links) > 0 {
+			continue
+		}
+		bought := assets.CivilDate(a.PurchaseDate)
+		if !bought.After(cutoff) || bought.After(asOfDay) {
+			continue
+		}
+		cost := a.PurchasePrice() + a.PurchaseCosts()
+		if cost <= 0 {
+			continue
+		}
+		best, bestDiff := -1, math.Inf(1)
+		for i, w := range windowWithdrawals {
+			d := assets.CivilDate(w.t.Date)
+			if claimed[w.t.ID] || d.Before(bought.AddDate(0, 0, -21)) || d.After(bought.AddDate(0, 0, 3)) {
+				continue
+			}
+			if diff := math.Abs(w.eur-cost) / cost; diff <= 0.10 && diff < bestDiff {
+				best, bestDiff = i, diff
+			}
+		}
+		if best < 0 {
+			continue
+		}
+		w := windowWithdrawals[best]
+		claimed[w.t.ID] = true
+		out.UnlinkedAssetPayments = append(out.UnlinkedAssetPayments, assetPaymentHint{
+			Asset:         a.Name,
+			AssetID:       a.ID.String(),
+			PurchaseDate:  bought.Format("2006-01-02"),
+			Price:         math.Round(cost*100) / 100,
+			TransactionID: w.t.ID.String(),
+			Date:          assets.CivilDate(w.t.Date).Format("2006-01-02"),
+			Amount:        math.Round(w.eur*100) / 100,
+		})
+	}
 	return out
 }
 

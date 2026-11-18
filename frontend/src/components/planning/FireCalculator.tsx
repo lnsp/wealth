@@ -6,6 +6,7 @@ import { Section, SubHeading, MetricCard, MetricGrid, NumberField, ProgressBar, 
 import { fmtEUR, fmtPct, fmtNum, fmtAxis } from '../../utils/format';
 import { Assumptions, ScrollTable, monthLabel, toNum } from './shared';
 import { parsePct } from './planningMath';
+import UnlinkedAssetPaymentsNote from './UnlinkedAssetPaymentsNote';
 import { DEFAULT_INFLATION_PCT, DEFAULT_RETURN_PCT } from './constants';
 
 // "Financial Independence" calculator. The target, the independence date and
@@ -182,6 +183,7 @@ export default function FireCalculator() {
                 ? <>Assumes you keep adding <span data-privacy="blur">{fmtEUR(monthlyContrib)}</span> a month, your net contributions over the last 12 months.</>
                 : <>Assumes contributions of <span data-privacy="blur">{fmtEUR(monthlyContrib)}</span> a month{projDefaultContrib != null && <> (your last 12 months: <span data-privacy="blur">{fmtEUR(projDefaultContrib)}</span> a month)</>}.</>}
               {' '}Growth of {fmtPct(annualReturn)} a year before inflation; amounts in today’s money at {fmtPct(inflation)} inflation.
+              {usesAverage && <UnlinkedAssetPaymentsNote payments={projData?.contribution_basis?.unlinked_asset_payments} />}
             </p>
             <button
               type="button"

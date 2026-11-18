@@ -50,6 +50,8 @@ interface AnlageKAP {
   anlage_kap_inv?: KapLine[] | null;
   layout_note?: string;
   net_taxable?: number;
+  /** Losses carried in from earlier years (≤ 0), both pots. */
+  loss_carry_in?: number;
   estimated_tax?: number;
   total_withheld?: number;
   balance_due?: number;
@@ -270,6 +272,7 @@ function AnlageKap({ kap, query }: { kap: LoadState<AnlageKAP>; query: string })
 
               <SubHeadingRow>What the Tax Office Will Likely Compute</SubHeadingRow>
               <KeyValues rows={[
+                ...(num(data.loss_carry_in) < 0 ? [{ label: 'Losses carried in from earlier years', value: <Money value={data.loss_carry_in} cents tone="negative" /> }] : []),
                 { label: 'Capital income after loss offsetting', value: <Money value={data.net_taxable} cents /> },
                 { label: `Sparer-Pauschbetrag (saver’s allowance${data.joint ? ', joint filing' : ''})`, value: <Money value={data.allowance} /> },
                 { label: `Tax on the rest (${church > 0 ? `with ${fmtPct(church * 100, { digits: 0 })} church tax` : 'no church tax'})`, value: <Money value={data.estimated_tax} cents /> },
@@ -280,7 +283,7 @@ function AnlageKap({ kap, query }: { kap: LoadState<AnlageKAP>; query: string })
                 },
               ]} />
               <p className="mt-2 text-[12px] text-ink-muted">
-                Assumes every bank’s losses are declared and leaves out losses carried forward from earlier years. Joint filing and church tax follow the settings on the Overview and Tools tabs.
+                Same calculation as the Overview: assumes every bank’s losses are declared and includes losses carried in from earlier years. Joint filing and church tax follow the settings on the Overview and Tools tabs.
               </p>
 
               <SubHeadingRow>By Broker</SubHeadingRow>

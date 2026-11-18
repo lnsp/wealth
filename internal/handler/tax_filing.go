@@ -7,6 +7,7 @@ package handler
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"sort"
 	"strconv"
@@ -96,122 +97,14 @@ func accountOutsideKAP(a db.Account) bool {
 	return false
 }
 
-/* ───────────── Realised capital events ───────────── */
+/* ───────────── Classification ───────────── */
 
-// capitalEvent is one realised item of capital income in EUR.
-type capitalEvent struct {
-	AccountID  string
-	Year       int
-	Month      int
-	Kind       string // "sale", "dividend", "interest"
-	ISIN       string
-	AssetClass string
-	TFS        float64 // Teilfreistellung rate of the security (funds only)
-	Amount     float64 // sale: proceeds − FIFO cost (signed); income: amount received
-}
-
-// taxTxnTFS mirrors analytics' Teilfreistellung resolution for one transaction.
-func taxTxnTFS(t analytics.TaxTransaction) float64 {
-	if t.HasExplicitTFS || t.TFS > 0 {
-		return t.TFS
-	}
-	if t.IsEquityFund {
-		return analytics.TeilfreistellungEquity
-	}
-	return 0
-}
-
-// realiseCapitalEvents walks chronological tax transactions with per-depot
-// FIFO (§ 20 Abs. 4 S. 7 EStG) and returns every sale, dividend and interest
-// payment. Outgoing depot transfers consume lots without realising anything:
-// a transfer is not a sale (§ 43a Abs. 2 S. 3 EStG).
-func realiseCapitalEvents(txns []analytics.TaxTransaction) []capitalEvent {
-	type depot struct{ acct, isin string }
-	type lot struct{ qty, costPer float64 }
-	lots := make(map[depot][]lot)
-	consume := func(k depot, qty float64) (sold, cost float64) {
-		rem := qty
-		q := lots[k]
-		for rem > 1e-9 && len(q) > 0 {
-			if q[0].qty <= rem+1e-9 {
-				sold += q[0].qty
-				cost += q[0].qty * q[0].costPer
-				rem -= q[0].qty
-				q = q[1:]
-			} else {
-				sold += rem
-				cost += rem * q[0].costPer
-				q[0].qty -= rem
-				rem = 0
-			}
-		}
-		lots[k] = q
-		return sold, cost
-	}
-
-	var out []capitalEvent
-	for _, t := range txns {
-		k := depot{t.AccountID, t.ISIN}
-		ev := capitalEvent{
-			AccountID:  t.AccountID,
-			Year:       t.Year,
-			Month:      txnMonth(t.Date),
-			ISIN:       t.ISIN,
-			AssetClass: t.AssetClass,
-			TFS:        taxTxnTFS(t),
-		}
-		switch t.Type {
-		case "buy", "savings_plan", "transfer":
-			if t.ISIN == "" || t.Quantity <= 0 {
-				continue
-			}
-			lots[k] = append(lots[k], lot{qty: t.Quantity, costPer: t.Amount / t.Quantity})
-		case "transfer_out":
-			if t.ISIN == "" || t.Quantity <= 0 {
-				continue
-			}
-			consume(k, t.Quantity)
-		case "sell":
-			if t.ISIN == "" || t.Quantity <= 0 {
-				continue
-			}
-			sold, cost := consume(k, t.Quantity)
-			if sold <= 1e-9 {
-				continue
-			}
-			proceeds := t.Amount
-			if sold < t.Quantity {
-				proceeds = t.Amount * (sold / t.Quantity)
-			}
-			ev.Kind = "sale"
-			ev.Amount = proceeds - cost
-			out = append(out, ev)
-		case "dividend":
-			ev.Kind = "dividend"
-			ev.Amount = t.Amount
-			out = append(out, ev)
-		case "interest":
-			// Negative interest (Verwahrentgelt) and overdraft interest are not
-			// negative capital income and cannot be deducted (§ 20 Abs. 9 EStG).
-			if t.Amount <= 0 {
-				continue
-			}
-			ev.Kind = "interest"
-			ev.Amount = t.Amount
-			out = append(out, ev)
-		}
-	}
-	return out
-}
-
-func txnMonth(date string) int {
-	if len(date) >= 7 {
-		if m, err := strconv.Atoi(date[5:7]); err == nil {
-			return m
-		}
-	}
-	return 0
-}
+// Realised sales and income come from analytics.RealizedTaxEvents, the same
+// FIFO ledger behind the Overview: per-depot lots, in-kind depot transfers
+// keeping the original cost and date (§ 43a Abs. 2 S. 3 EStG), the
+// Vorabpauschale as January income of the next year (§ 18 Abs. 3 InvStG) and
+// deducted from later sale gains (§ 19 Abs. 1 S. 3 InvStG), and § 23 assets
+// flagged as private sales.
 
 // isFundAssetClass: investment funds under the InvStG (Anlage KAP-INV, Teilfreistellung).
 func isFundAssetClass(assetClass string, tfs float64) bool {
@@ -263,14 +156,6 @@ type withheldTax struct {
 	Kind      string // transaction type
 	Fund      bool
 	Amount    float64
-}
-
-// accountVP is a fund's Vorabpauschale attributed to one depot.
-type accountVP struct {
-	AccountID string
-	ISIN      string
-	TFS       float64
-	Amount    float64 // before Teilfreistellung
 }
 
 type fundIncome struct {
@@ -431,16 +316,42 @@ func netCapitalIncome(generalIncome, generalLosses, shareGains, shareLosses floa
 }
 
 type capitalIncomeInput struct {
-	Year     int
-	Events   []capitalEvent
+	Year int
+	// Ledger is the chronological tax ledger: buildTaxTransactions output with
+	// the Vorabpauschale events merged in (analytics.MergeVorabpauschaleEvents),
+	// as the Overview uses it.
+	Ledger   []analytics.TaxTransaction
 	Withheld []withheldTax
-	PriorVP  []accountVP // Vorabpauschale for Year-1, deemed received in January of Year (§ 18 Abs. 3 InvStG)
 	Accounts []db.Account
 }
 
-// aggregateCapitalIncome groups a tax year's capital income by bank.
-// Pension wrappers and § 23 EStG private-sale assets (crypto, physical gold)
-// are left out: neither belongs on Anlage KAP or uses the saver's allowance.
+// filingLedger drops the transactions of pension wrappers. bAV, Riester and
+// Rürup contracts are taxed on payout under § 22 EStG, so their trades never
+// realise § 20 income; removing them before the replay keeps them out of the
+// lines, the loss pots and the allowance alike.
+func (in capitalIncomeInput) filingLedger() []analytics.TaxTransaction {
+	excluded := make(map[string]bool)
+	for _, a := range in.Accounts {
+		if accountOutsideKAP(a) {
+			excluded[a.ID.String()] = true
+		}
+	}
+	if len(excluded) == 0 {
+		return in.Ledger
+	}
+	out := make([]analytics.TaxTransaction, 0, len(in.Ledger))
+	for _, t := range in.Ledger {
+		if t.AccountID == "" || !excluded[t.AccountID] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// aggregateCapitalIncome groups a tax year's capital income by bank, from the
+// tax ledger's realised sales and income events. Pension wrappers and § 23 EStG
+// private sales (crypto, physical gold) are left out: neither belongs on
+// Anlage KAP or uses the saver's allowance.
 func aggregateCapitalIncome(in capitalIncomeInput) []*bankIncome {
 	acctByID := make(map[string]db.Account, len(in.Accounts))
 	for _, a := range in.Accounts {
@@ -479,63 +390,62 @@ func aggregateCapitalIncome(in capitalIncomeInput) []*bankIncome {
 		return b
 	}
 
-	for _, ev := range in.Events {
-		if ev.Year != in.Year || analytics.IsPrivateSaleAssetClass(ev.AssetClass) {
+	sales, income := analytics.RealizedTaxEvents(in.filingLedger())
+	for _, s := range sales {
+		if s.Year != in.Year || s.PrivateSale {
 			continue
 		}
-		b := get(ev.AccountID)
+		b := get(s.AccountID)
 		if b == nil {
 			continue
 		}
-		if isFundAssetClass(ev.AssetClass, ev.TFS) && ev.ISIN != "" {
-			f := &b.Funds[fundTypeForTFS(ev.TFS)]
-			keep := 1 - ev.TFS
-			switch ev.Kind {
-			case "sale":
-				if ev.Amount >= 0 {
-					f.SaleGains += ev.Amount
-					f.SaleGainsNet += ev.Amount * keep
-				} else {
-					f.SaleLosses += -ev.Amount
-					f.SaleLossesNet += -ev.Amount * keep
-				}
-			case "dividend", "interest":
-				f.Dist += ev.Amount
-				f.DistNet += ev.Amount * keep
+		// PL is after the Vorabpauschale deduction (§ 19 Abs. 1 S. 3 InvStG)
+		// and before Teilfreistellung.
+		if isFundAssetClass(s.AssetClass, s.TFS) {
+			f := &b.Funds[fundTypeForTFS(s.TFS)]
+			if s.PL >= 0 {
+				f.SaleGains += s.PL
+				f.SaleGainsNet += s.TaxablePL()
+			} else {
+				f.SaleLosses -= s.PL
+				f.SaleLossesNet -= s.TaxablePL()
 			}
 			continue
 		}
-		switch ev.Kind {
-		case "sale":
-			share := analytics.IsShareAssetClass(ev.AssetClass)
-			switch {
-			case ev.Amount >= 0 && share:
-				b.ShareGains += ev.Amount
-			case ev.Amount >= 0:
-				b.OtherGains += ev.Amount
-			case share:
-				b.ShareLosses += -ev.Amount
-			default:
-				b.OtherLosses += -ev.Amount
-			}
-		case "dividend":
-			b.Dividends += ev.Amount
-		case "interest":
-			b.Interest += ev.Amount
+		share := analytics.IsShareAssetClass(s.AssetClass)
+		switch {
+		case s.PL >= 0 && share:
+			b.ShareGains += s.PL
+		case s.PL >= 0:
+			b.OtherGains += s.PL
+		case share:
+			b.ShareLosses -= s.PL
+		default:
+			b.OtherLosses -= s.PL
 		}
 	}
-
-	for _, vp := range in.PriorVP {
-		if vp.Amount <= 0 {
+	for _, e := range income {
+		if e.Year != in.Year || e.PrivateSale {
 			continue
 		}
-		b := get(vp.AccountID)
+		b := get(e.AccountID)
 		if b == nil {
 			continue
 		}
-		f := &b.Funds[fundTypeForTFS(vp.TFS)]
-		f.VP += vp.Amount
-		f.VPNet += vp.Amount * (1 - vp.TFS)
+		switch {
+		case e.Kind == "interest":
+			b.Interest += e.Amount
+		case e.Kind == "vorabpauschale":
+			f := &b.Funds[fundTypeForTFS(e.TFS)]
+			f.VP += e.Amount
+			f.VPNet += e.TaxableAmount()
+		case isFundAssetClass(e.AssetClass, e.TFS) && e.ISIN != "":
+			f := &b.Funds[fundTypeForTFS(e.TFS)]
+			f.Dist += e.Amount
+			f.DistNet += e.TaxableAmount()
+		default:
+			b.Dividends += e.Amount
+		}
 	}
 
 	for _, wt := range in.Withheld {
@@ -567,67 +477,6 @@ func aggregateCapitalIncome(in capitalIncomeInput) []*bankIncome {
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
-}
-
-// pooledNetting nets all banks together, as the tax office does once every
-// bank's losses are declared on Anlage KAP.
-func pooledNetting(banks []*bankIncome) capitalNetting {
-	var gi, gl, sg, sl float64
-	for _, b := range banks {
-		gi += b.generalIncome()
-		gl += b.generalLosses()
-		sg += b.ShareGains
-		sl += b.ShareLosses
-	}
-	return netCapitalIncome(gi, gl, sg, sl)
-}
-
-// attributeVorabpauschale splits each fund's Vorabpauschale for vpYear across
-// the depots that held it on 31 December of that year, by quantity.
-func attributeVorabpauschale(entries []analytics.VorabpauschaleEntry, txns []analytics.TaxTransaction, vpYear int, tfs map[string]float64) []accountVP {
-	if len(entries) == 0 {
-		return nil
-	}
-	qty := make(map[string]map[string]float64) // isin → account → qty
-	for _, t := range txns {
-		if t.Year > vpYear || t.ISIN == "" || t.Quantity <= 0 {
-			continue
-		}
-		m := qty[t.ISIN]
-		if m == nil {
-			m = make(map[string]float64)
-			qty[t.ISIN] = m
-		}
-		switch t.Type {
-		case "buy", "savings_plan", "transfer":
-			m[t.AccountID] += t.Quantity
-		case "sell", "transfer_out":
-			m[t.AccountID] = math.Max(0, m[t.AccountID]-t.Quantity)
-		}
-	}
-	var out []accountVP
-	for _, e := range entries {
-		if e.Vorabpauschale <= 0 {
-			continue
-		}
-		holders := qty[e.ISIN]
-		total := 0.0
-		accts := make([]string, 0, len(holders))
-		for a, q := range holders {
-			if q > 1e-9 {
-				total += q
-				accts = append(accts, a)
-			}
-		}
-		if total <= 0 {
-			continue
-		}
-		sort.Strings(accts)
-		for _, a := range accts {
-			out = append(out, accountVP{AccountID: a, ISIN: e.ISIN, TFS: tfs[e.ISIN], Amount: e.Vorabpauschale * holders[a] / total})
-		}
-	}
 	return out
 }
 
@@ -680,7 +529,8 @@ type anlageKAPResult struct {
 	TotalIncome      float64
 	TotalLosses      float64
 	TotalTeilfrei    float64
-	NetTaxable       float64
+	NetTaxable       float64 // after loss pots and losses carried in, before the allowance
+	LossCarryIn      float64 // losses carried in from earlier years (≤ 0), both pots
 	AllowanceApplied float64
 	EstimatedTax     float64
 	TotalWithheld    float64
@@ -881,15 +731,18 @@ func computeAnlageKAP(in anlageKAPInput) anlageKAPResult {
 		if hasInv[t][2] {
 			res.InvLines = append(res.InvLines, kapLine{Line: kapInvSaleLine[t], Section: "inv", Amount: round2c(inv[t].sale),
 				Description: "Gewinne/Verluste aus der Veräußerung von Anteilen an " + name,
-				Hint:        "Gain or loss from selling fund units, before Teilfreistellung. Vorabpauschalen taxed while you held the units reduce the gain (§ 19 Abs. 1 InvStG); this figure does not yet subtract them."})
+				Hint:        "Gain or loss from selling fund units, before Teilfreistellung, after subtracting the Vorabpauschalen already taxed while you held them (§ 19 Abs. 1 S. 3 InvStG)."})
 		}
 	}
 	sort.SliceStable(res.InvLines, func(i, j int) bool { return res.InvLines[i].Line < res.InvLines[j].Line })
 
-	pooled := pooledNetting(banks)
-	res.NetTaxable = pooled.Net
-	res.AllowanceApplied = math.Min(pooled.Net, res.Allowance)
-	res.EstimatedTax = math.Max(0, pooled.Net-res.Allowance) * analytics.CapitalIncomeTaxRate(in.ChurchRate)
+	// The tax office's view: the same engine as the Overview, pooling every
+	// bank (as if each bank's losses were declared) with losses carried in.
+	sum := analytics.ComputeTaxSummaryWithOptions(in.filingLedger(), in.Year, nil, analytics.TaxOptions{Joint: in.Joint, ChurchTaxRate: in.ChurchRate})
+	res.NetTaxable = sum.TaxableGain
+	res.LossCarryIn = sum.LossCarryInShare + sum.LossCarryInGeneral
+	res.AllowanceApplied = sum.FreistellungUsed
+	res.EstimatedTax = sum.EstimatedTax
 	res.TotalWithheld = germanTax + foreignTax
 	res.BalanceDue = res.EstimatedTax - res.TotalWithheld
 	res.CrossBrokerNote = crossBrokerNote(banks)
@@ -949,6 +802,7 @@ func (r anlageKAPResult) response() map[string]any {
 		"total_losses":      round2c(r.TotalLosses),
 		"total_teilfrei":    round2c(r.TotalTeilfrei),
 		"net_taxable":       round2c(r.NetTaxable),
+		"loss_carry_in":     round2c(r.LossCarryIn),
 		"allowance_applied": round2c(r.AllowanceApplied),
 		"estimated_tax":     round2c(r.EstimatedTax),
 		"total_withheld":    round2c(r.TotalWithheld),
@@ -1161,58 +1015,66 @@ func incomeTaxReturnDeadlines(taxYear int) (unadvised, advised time.Time) {
 // harvestResult describes realising every depot position that is at a loss.
 type harvestResult struct {
 	Positions    int
-	GrossLoss    float64 // FIFO sell-all loss before Teilfreistellung
+	GrossLoss    float64 // sell-all loss after the Vorabpauschale deduction, before Teilfreistellung
 	ShareLoss    float64 // after Teilfreistellung, Aktienverlusttopf
 	GeneralLoss  float64 // after Teilfreistellung, general pot
 	Saving       float64 // tax saved this year
 	CarryForward float64 // part of the loss that would only carry forward
 }
 
-// harvestAnalysis sells every depot position (account, ISIN) that is at a net
-// loss across all its FIFO lots, as a real sell-all would, and measures the
-// tax saved this year against the year's realised income in the same pots.
-// § 23 assets and pension wrappers are excluded.
-func harvestAnalysis(lots []analytics.TaxLot, assetClass map[string]string, excludedAccounts map[string]bool, ytd []*bankIncome, allowance, rate float64) harvestResult {
+// harvestAnalysis sells every depot position (account, ISIN) that a sale
+// today would close at a loss across all its FIFO lots — winners included, as
+// a real sell-all would — and prices the sales through the tax engine
+// (analytics.MarginalSaleTax). The saving therefore respects Teilfreistellung,
+// both loss pots, losses carried in and the remaining Sparer-Pauschbetrag:
+// a share loss saves nothing in a year without share gains, it only carries
+// forward. § 23 assets and pension wrappers are excluded; pass priced lots only.
+func harvestAnalysis(ledger []analytics.TaxTransaction, lots []analytics.TaxLot, excludedAccounts map[string]bool, year int, opts analytics.TaxOptions, asOf time.Time) harvestResult {
 	type depot struct{ acct, isin string }
-	pl := make(map[depot]float64)
-	tfs := make(map[depot]float64)
+	byDepot := make(map[depot][]analytics.TaxLot)
 	var order []depot
 	for _, l := range lots {
-		if excludedAccounts[l.AccountID] || analytics.IsPrivateSaleAssetClass(assetClass[l.ISIN]) {
+		if excludedAccounts[l.AccountID] || l.PrivateSale {
 			continue
 		}
 		k := depot{l.AccountID, l.ISIN}
-		if _, ok := pl[k]; !ok {
+		if _, ok := byDepot[k]; !ok {
 			order = append(order, k)
 		}
-		pl[k] += l.UnrealizedPL
-		tfs[k] = l.TFSRate
+		byDepot[k] = append(byDepot[k], l)
 	}
 	var res harvestResult
+	var losing []analytics.TaxLot
 	for _, k := range order {
-		if pl[k] >= -0.005 {
+		gross, taxable := 0.0, 0.0
+		for _, l := range byDepot[k] {
+			pl := l.CurrentValue - l.CostBasis - l.VorabpauschaleTaxed
+			gross += pl
+			taxable += pl * (1 - l.TFSRate)
+		}
+		if taxable >= -0.005 {
 			continue
 		}
-		loss := -pl[k]
 		res.Positions++
-		res.GrossLoss += loss
-		if analytics.IsShareAssetClass(assetClass[k.isin]) {
-			res.ShareLoss += loss
+		res.GrossLoss -= gross
+		if analytics.IsShareAssetClass(byDepot[k][0].AssetClass) {
+			res.ShareLoss -= taxable
 		} else {
-			res.GeneralLoss += loss * (1 - tfs[k])
+			res.GeneralLoss -= taxable
 		}
+		losing = append(losing, byDepot[k]...)
 	}
-	var gi, gl, sg, sl float64
-	for _, b := range ytd {
-		gi += b.generalIncome()
-		gl += b.generalLosses()
-		sg += b.ShareGains
-		sl += b.ShareLosses
+	if res.Positions == 0 {
+		return res
 	}
-	before := netCapitalIncome(gi, gl, sg, sl)
-	after := netCapitalIncome(gi, gl+res.GeneralLoss, sg, sl+res.ShareLoss)
-	res.Saving = (math.Max(0, before.Net-allowance) - math.Max(0, after.Net-allowance)) * rate
-	res.CarryForward = (after.UnusedGeneral + after.UnusedShare) - (before.UnusedGeneral + before.UnusedShare)
+	sales := analytics.HypotheticalSellTxns(losing, asOf)
+	without, with := analytics.MarginalSaleTax(ledger, sales, year, opts)
+	res.Saving = math.Max(0, without-with)
+
+	all := append(append(make([]analytics.TaxTransaction, 0, len(ledger)+len(sales)), ledger...), sales...)
+	base := analytics.ComputeTaxSummaryWithOptions(ledger, year, nil, opts)
+	after := analytics.ComputeTaxSummaryWithOptions(all, year, nil, opts)
+	res.CarryForward = math.Max(0, (base.LossCarryOutShare+base.LossCarryOutGeneral)-(after.LossCarryOutShare+after.LossCarryOutGeneral))
 	return res
 }
 
@@ -1240,6 +1102,9 @@ type taxFilingData struct {
 	names    map[string]string
 	tfsMap   map[string]float64
 	equity   map[string]bool
+	// ledger is taxTxns with the Vorabpauschale events of every completed
+	// year merged in, exactly as HandleTax builds it for the Overview.
+	ledger []analytics.TaxTransaction
 }
 
 func (h *AnalysisHandler) loadTaxFilingData(ctx context.Context) (*taxFilingData, error) {
@@ -1257,13 +1122,10 @@ func (h *AnalysisHandler) loadTaxFilingData(ctx context.Context) (*taxFilingData
 		d.secMap[s.ISIN] = s
 	}
 	d.taxTxns, d.names, d.tfsMap, d.equity = buildTaxTransactions(rows, secs, d.histFX, d.fxRates)
-	// buildTaxTransactions fills AssetClass once the tax-engine change lands;
-	// until then (and for any gap) take it from the security.
-	for i := range d.taxTxns {
-		if d.taxTxns[i].AssetClass == "" {
-			d.taxTxns[i].AssetClass = d.secMap[d.taxTxns[i].ISIN].AssetClass
-		}
-	}
+	// Vorabpauschalen of completed years: income in the following January
+	// (§ 18 Abs. 3 InvStG), deducted from later sale gains (§ 19 Abs. 1 S. 3).
+	vpEvents := h.vorabpauschaleEvents(ctx, d.taxTxns, d.secMap, d.tfsMap, d.histFX, d.fxRates, 0, time.Now().Year()-1, nil)
+	d.ledger = analytics.MergeVorabpauschaleEvents(d.taxTxns, vpEvents)
 	return d, nil
 }
 
@@ -1305,52 +1167,105 @@ func (d *taxFilingData) excludedAccounts() map[string]bool {
 	return out
 }
 
-// currentFundValues returns current EUR value and quantity per ISIN.
-func currentFundValues(enriched []enrichedHolding) (val, qty map[string]float64) {
-	val = make(map[string]float64)
-	qty = make(map[string]float64)
-	for _, eh := range enriched {
-		if eh.value > 0 {
-			val[eh.security.ISIN] += eh.value
-			qty[eh.security.ISIN] += numericToFloat(eh.holding.Quantity)
-		}
-	}
-	return val, qty
-}
-
-// capitalIncome assembles the inputs for one tax year, including the
-// previous year's Vorabpauschale, which counts as received in January.
-func (h *AnalysisHandler) capitalIncome(ctx context.Context, d *taxFilingData, year int, enriched []enrichedHolding) capitalIncomeInput {
-	val, qty := currentFundValues(enriched)
-	vpEntries := h.computeYearVorabpauschale(ctx, year-1, d.rows, d.secMap, d.tfsMap, val, qty, d.histFX, d.fxRates)
-	return d.capitalIncomeWithVP(year, vpEntries)
-}
-
-// capitalIncomeWithVP is capitalIncome with the previous year's Vorabpauschale
-// entries already computed.
-func (d *taxFilingData) capitalIncomeWithVP(year int, vpEntries []analytics.VorabpauschaleEntry) capitalIncomeInput {
+// capitalIncome assembles the inputs for one tax year.
+func (d *taxFilingData) capitalIncome(year int) capitalIncomeInput {
 	return capitalIncomeInput{
 		Year:     year,
-		Events:   realiseCapitalEvents(d.taxTxns),
+		Ledger:   d.ledger,
 		Withheld: d.withheld(),
-		PriorVP:  attributeVorabpauschale(vpEntries, d.taxTxns, year-1, d.tfsMap),
 		Accounts: d.accounts,
 	}
 }
 
-func parseJointParam(v string) bool {
-	return v == "1" || strings.EqualFold(v, "true")
+/* ───────────── CSV export ───────────── */
+
+// exportTaxReport computes the CSV export's figures: the Overview's summary
+// (same ledger with the Vorabpauschale events merged, same options) and the
+// Anlage KAP lines.
+func exportTaxReport(d *taxFilingData, year int, opts analytics.TaxOptions) (*analytics.TaxSummary, anlageKAPResult) {
+	summary := analytics.ComputeTaxSummaryWithOptions(d.ledger, year, nil, opts)
+	kap := computeAnlageKAP(anlageKAPInput{
+		capitalIncomeInput: d.capitalIncome(year),
+		Joint:              opts.Joint,
+		ChurchRate:         opts.ChurchTaxRate,
+	})
+	return summary, kap
 }
 
-// parseChurchTaxParam accepts a fraction (0.09) or a percentage (9) and clamps
-// to the legal range of 0-9 %.
-func parseChurchTaxParam(v string) float64 {
-	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
-	if err != nil || math.IsNaN(f) || f <= 0 {
-		return 0
+func writeTaxReportCSV(w io.Writer, year int, summary *analytics.TaxSummary, kap anlageKAPResult) {
+	yesNo := func(b bool) string {
+		if b {
+			return "Ja"
+		}
+		return "Nein"
 	}
-	if f > 1 {
-		f /= 100
+	rate := strings.Replace(strconv.FormatFloat(summary.TaxRate*100, 'f', 3, 64), ".", ",", 1)
+	fmt.Fprintf(w, "Steuerreport %d\n\n", year)
+	fmt.Fprintf(w, "Zusammenfassung\n")
+	fmt.Fprintf(w, "Zusammenveranlagung;%s\n", yesNo(summary.Joint))
+	fmt.Fprintf(w, "Kirchensteuersatz;%.0f%%\n", summary.ChurchTaxRate*100)
+	fmt.Fprintf(w, "Realisierte Gewinne;%.2f EUR\n", summary.RealizedGains)
+	fmt.Fprintf(w, "Realisierte Verluste;%.2f EUR\n", summary.RealizedLosses)
+	fmt.Fprintf(w, "Netto-Gewinn;%.2f EUR\n", summary.NetGain)
+	fmt.Fprintf(w, "Dividendeneinkuenfte;%.2f EUR\n", summary.DividendIncome)
+	fmt.Fprintf(w, "Zinseinkuenfte;%.2f EUR\n", summary.InterestIncome)
+	fmt.Fprintf(w, "Vorabpauschale %d (zugeflossen im Januar %d);%.2f EUR\n", summary.VorabpauschaleYear, year, summary.VorabpauschaleIncome)
+	fmt.Fprintf(w, "Teilfreistellung;%.2f EUR\n", summary.TeilfreistellungAmt)
+	fmt.Fprintf(w, "Verlustvortrag Aktien aus Vorjahren;%.2f EUR\n", summary.LossCarryInShare)
+	fmt.Fprintf(w, "Verlustvortrag allgemein aus Vorjahren;%.2f EUR\n", summary.LossCarryInGeneral)
+	fmt.Fprintf(w, "Steuerpflichtiger Gewinn;%.2f EUR\n", summary.TaxableGain)
+	fmt.Fprintf(w, "Sparerpauschbetrag;%.2f EUR\n", summary.Allowance)
+	fmt.Fprintf(w, "Sparerpauschbetrag genutzt;%.2f EUR\n", summary.FreistellungUsed)
+	fmt.Fprintf(w, "Sparerpauschbetrag verbleibend;%.2f EUR\n", summary.FreistellungRemain)
+	fmt.Fprintf(w, "Geschaetzte Steuer (%s %%);%.2f EUR\n", rate, summary.EstimatedTax)
+	fmt.Fprintf(w, "Effektiver Steuersatz;%.1f%%\n", summary.EffectiveRate)
+	fmt.Fprintf(w, "Verlustvortrag Aktien ins Folgejahr;%.2f EUR\n", summary.LossCarryOutShare)
+	fmt.Fprintf(w, "Verlustvortrag allgemein ins Folgejahr;%.2f EUR\n", summary.LossCarryOutGeneral)
+	if ps := summary.PrivateSales; ps != nil {
+		fmt.Fprintf(w, "Private Veraeusserungsgeschaefte (§ 23 EStG), steuerpflichtig;%.2f EUR\n", ps.TaxableAmount)
+		fmt.Fprintf(w, "Private Veraeusserungsgeschaefte (§ 23 EStG), steuerfrei nach 1 Jahr;%.2f EUR\n", ps.TaxFreePL)
 	}
-	return math.Min(f, 0.09)
+
+	if len(summary.BySecurity) > 0 {
+		fmt.Fprintf(w, "\nRealisierte Gewinne/Verluste nach Wertpapier\n")
+		fmt.Fprintf(w, "Datum;ISIN;Name;Realisierter G/V;Vorabpauschale abgezogen;Teilfreistellung;Steuerpflichtiger G/V;Topf;Aktienfonds\n")
+		for _, s := range summary.BySecurity {
+			pot := "allgemein"
+			if s.Pot == "share" {
+				pot = "Aktien"
+			}
+			fmt.Fprintf(w, "%s;%s;%s;%.2f;%.2f;%.2f;%.2f;%s;%s\n",
+				s.Date, csvField(s.ISIN), csvField(s.Name), s.RealizedPL, s.VorabpauschaleDeducted, s.Teilfreistellung, s.TaxablePL, pot, yesNo(s.IsEquityFund))
+		}
+	}
+
+	fmt.Fprintf(w, "\nAnlage KAP / KAP-INV %d\n", year)
+	fmt.Fprintf(w, "Formular;Zeile;Bezeichnung;Betrag;Hinweis\n")
+	writeKAPLines := func(form string, lines []kapLine) {
+		for _, l := range lines {
+			note := ""
+			amount := fmt.Sprintf("%.2f", l.Amount)
+			switch {
+			case l.Blank:
+				note = "Nur lt. Steuerbescheinigung eintragen, sonst leer lassen"
+				amount = ""
+			case l.Estimate:
+				note = "Schätzung, mit der Steuerbescheinigung abgleichen"
+			}
+			fmt.Fprintf(w, "%s;%d;%s;%s;%s\n", form, l.Line, csvField(l.Description), amount, csvField(note))
+		}
+	}
+	writeKAPLines("KAP", kap.Lines)
+	writeKAPLines("KAP-INV", kap.InvLines)
+	if kap.LayoutNote != "" {
+		fmt.Fprintf(w, "%s\n", csvField("Hinweis: Zeilennummern nach den Vordrucken 2024/2025; bitte anhand der Bezeichnung zuordnen."))
+	}
+}
+
+// csvField quotes a semicolon-separated CSV field when it needs it.
+func csvField(s string) string {
+	if strings.ContainsAny(s, ";\"\n\r") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
 }

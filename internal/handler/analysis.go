@@ -2010,7 +2010,7 @@ func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http
 
 // HandleExportTaxReport generates a CSV tax report for a given year: the tax
 // summary, realised P/L per security and the Anlage KAP / KAP-INV lines.
-// Accepts the same joint=1 and church_tax parameters as HandleAnlageKAP.
+// Query: year, joint=1 and church_tax, as for HandleTax and HandleAnlageKAP.
 func (h *AnalysisHandler) HandleExportTaxReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	yearStr := r.URL.Query().Get("year")
@@ -2026,73 +2026,13 @@ func (h *AnalysisHandler) HandleExportTaxReport(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
-	summary := analytics.ComputeTaxSummary(d.taxTxns, year, nil)
-	enriched, _ := h.loadEnrichedHoldings(ctx)
-	kap := computeAnlageKAP(anlageKAPInput{
-		capitalIncomeInput: h.capitalIncome(ctx, d, year, enriched),
-		Joint:              parseJointParam(r.URL.Query().Get("joint")),
-		ChurchRate:         parseChurchTaxParam(r.URL.Query().Get("church_tax")),
-	})
+	summary, kap := exportTaxReport(d, year, taxOptionsFromRequest(r))
 
 	filename := fmt.Sprintf("tax-report-%d.csv", year)
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 	w.Write([]byte{0xEF, 0xBB, 0xBF})
-	fmt.Fprintf(w, "Steuerreport %d\n\n", year)
-	fmt.Fprintf(w, "Zusammenfassung\n")
-	fmt.Fprintf(w, "Realisierte Gewinne;%.2f EUR\n", summary.RealizedGains)
-	fmt.Fprintf(w, "Realisierte Verluste;%.2f EUR\n", summary.RealizedLosses)
-	fmt.Fprintf(w, "Netto-Gewinn;%.2f EUR\n", summary.NetGain)
-	fmt.Fprintf(w, "Teilfreistellung;%.2f EUR\n", summary.TeilfreistellungAmt)
-	fmt.Fprintf(w, "Steuerpflichtiger Gewinn;%.2f EUR\n", summary.TaxableGain)
-	fmt.Fprintf(w, "Sparerpauschbetrag genutzt;%.2f EUR\n", summary.FreistellungUsed)
-	fmt.Fprintf(w, "Sparerpauschbetrag verbleibend;%.2f EUR\n", summary.FreistellungRemain)
-	fmt.Fprintf(w, "Dividendeneinkuenfte;%.2f EUR\n", summary.DividendIncome)
-	fmt.Fprintf(w, "Geschaetzte Steuer (26,375%%);%.2f EUR\n", summary.EstimatedTax)
-	fmt.Fprintf(w, "Effektiver Steuersatz;%.1f%%\n", summary.EffectiveRate)
-
-	if len(summary.BySecurity) > 0 {
-		fmt.Fprintf(w, "\nRealisierte Gewinne/Verluste nach Wertpapier\n")
-		fmt.Fprintf(w, "ISIN;Name;Realisierter G/V;Teilfreistellung;Steuerpflichtiger G/V;Aktienfonds\n")
-		for _, s := range summary.BySecurity {
-			equity := "Nein"
-			if s.IsEquityFund {
-				equity = "Ja"
-			}
-			fmt.Fprintf(w, "%s;%s;%.2f;%.2f;%.2f;%s\n",
-				csvField(s.ISIN), csvField(s.Name), s.RealizedPL, s.Teilfreistellung, s.TaxablePL, equity)
-		}
-	}
-
-	fmt.Fprintf(w, "\nAnlage KAP / KAP-INV %d\n", year)
-	fmt.Fprintf(w, "Formular;Zeile;Bezeichnung;Betrag;Hinweis\n")
-	writeKAPLines := func(form string, lines []kapLine) {
-		for _, l := range lines {
-			note := ""
-			amount := fmt.Sprintf("%.2f", l.Amount)
-			switch {
-			case l.Blank:
-				note = "Nur lt. Steuerbescheinigung eintragen, sonst leer lassen"
-				amount = ""
-			case l.Estimate:
-				note = "Schätzung, mit der Steuerbescheinigung abgleichen"
-			}
-			fmt.Fprintf(w, "%s;%d;%s;%s;%s\n", form, l.Line, csvField(l.Description), amount, csvField(note))
-		}
-	}
-	writeKAPLines("KAP", kap.Lines)
-	writeKAPLines("KAP-INV", kap.InvLines)
-	if kap.LayoutNote != "" {
-		fmt.Fprintf(w, "%s\n", csvField("Hinweis: Zeilennummern nach den Vordrucken 2024/2025; bitte anhand der Bezeichnung zuordnen."))
-	}
-}
-
-// csvField quotes a semicolon-separated CSV field when it needs it.
-func csvField(s string) string {
-	if strings.ContainsAny(s, ";\"\n\r") {
-		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
-	}
-	return s
+	writeTaxReportCSV(w, year, summary, kap)
 }
 
 // HandleExportDATEV generates a DATEV-compatible CSV for Steuerberater import.
@@ -2195,11 +2135,11 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
-	enriched, _ := h.loadEnrichedHoldings(ctx)
+	opts := taxOptionsFromRequest(r)
 	res := computeAnlageKAP(anlageKAPInput{
-		capitalIncomeInput: h.capitalIncome(ctx, d, year, enriched),
-		Joint:              parseJointParam(r.URL.Query().Get("joint")),
-		ChurchRate:         parseChurchTaxParam(r.URL.Query().Get("church_tax")),
+		capitalIncomeInput: d.capitalIncome(year),
+		Joint:              opts.Joint,
+		ChurchRate:         opts.ChurchTaxRate,
 	})
 	writeJSON(w, http.StatusOK, res.response())
 }
@@ -2929,10 +2869,9 @@ func (h *AnalysisHandler) HandleFSAStatus(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
-	enriched, _ := h.loadEnrichedHoldings(ctx)
 	res := computeFSAStatus(fsaInput{
-		capitalIncomeInput: h.capitalIncome(ctx, d, year, enriched),
-		Joint:              parseJointParam(r.URL.Query().Get("joint")),
+		capitalIncomeInput: d.capitalIncome(year),
+		Joint:              taxOptionsFromRequest(r).Joint,
 		Months:             months,
 	})
 	writeJSON(w, http.StatusOK, res.response())
@@ -3287,8 +3226,9 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 	ctx := r.Context()
 	now := time.Now().UTC()
 	year := now.Year()
-	joint := parseJointParam(r.URL.Query().Get("joint"))
-	rate := analytics.CapitalIncomeTaxRate(parseChurchTaxParam(r.URL.Query().Get("church_tax")))
+	opts := taxOptionsFromRequest(r)
+	joint := opts.Joint
+	rate := analytics.CapitalIncomeTaxRate(opts.ChurchTaxRate)
 	allowance := analytics.SparerPauschbetragForYear(year, joint)
 	allowanceLabel := fmtEUR(allowance) + " €"
 	if joint {
@@ -3308,18 +3248,16 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 	var events []calendarEvent
 
 	// Load data for amount computation
-	enriched, _ := h.loadEnrichedHoldings(ctx)
 	d, err := h.loadTaxFilingData(ctx)
 	if err != nil {
 		// The fixed dates still apply; only the amounts need transactions.
 		d = &taxFilingData{secMap: map[string]db.Security{}, tfsMap: map[string]float64{}}
 	}
-	valByISIN, qtyByISIN := currentFundValues(enriched)
 
 	// --- 1. Vorabpauschale (first working day of the year) ---
 	// The Vorabpauschale for `year - 1` counts as received on the first working
 	// day of `year` (§ 18 Abs. 3 InvStG); German banks debit the tax that day.
-	vpEntries := h.computeYearVorabpauschale(ctx, year-1, d.rows, d.secMap, d.tfsMap, valByISIN, qtyByISIN, d.histFX, d.fxRates)
+	vpEntries := analytics.VorabpauschaleForYear(d.ledger, year-1, opts)
 	fundValue, vpTotal, vpTax := 0.0, 0.0, 0.0
 	for _, vp := range vpEntries {
 		fundValue += vp.YearEndValue
@@ -3366,31 +3304,25 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 		Category:    "verlust", Urgency: "deadline",
 	})
 
-	// This year's realised capital income per bank, for the harvest and FSA checks.
-	ytdBanks := aggregateCapitalIncome(d.capitalIncomeWithVP(year, vpEntries))
+	// This year's realised capital income per bank, for the FSA check.
+	ytdBanks := aggregateCapitalIncome(d.capitalIncome(year))
 
 	// --- 5. Tax-Loss Harvesting Window (Q4) ---
 	// Sell-all per depot in FIFO order: a position's loss is the sum over all its
-	// lots, not just the lots under water. The saving is what that loss removes
-	// from this year's taxable income in the same pots, after the allowance.
-	prices := make(map[string]float64, len(valByISIN))
-	for isin, val := range valByISIN {
-		if qty := qtyByISIN[isin]; qty > 0 {
-			prices[isin] = val / qty
-		}
-	}
-	assetClass := make(map[string]string, len(d.secMap))
-	for isin, s := range d.secMap {
-		assetClass[isin] = s.AssetClass
-	}
-	lots := analytics.ComputeTaxLots(d.taxTxns, prices, d.names, d.equity)
+	// lots, not just the lots under water. The saving is priced through the tax
+	// engine, so it counts only against gains in the same pot, after losses
+	// carried in and the allowance.
+	prices := h.currentUnitPricesEUR(ctx)
+	filing := d.capitalIncome(year).filingLedger()
+	lots := analytics.ComputeTaxLots(filing, prices, d.names, d.equity)
 	priced := lots[:0:0]
 	for _, l := range lots {
 		if prices[l.ISIN] > 0 {
 			priced = append(priced, l)
 		}
 	}
-	harvest := harvestAnalysis(priced, assetClass, d.excludedAccounts(), ytdBanks, allowance, rate)
+	harvest := harvestAnalysis(filing, priced, d.excludedAccounts(), year, opts, now)
+
 	if harvest.GrossLoss > 500 {
 		desc := fmt.Sprintf("%d positions are at a loss: selling them in full (FIFO order) would realise %s € of losses.", harvest.Positions, fmtEUR(harvest.GrossLoss))
 		if harvest.Positions == 1 {
@@ -3399,7 +3331,7 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 		if harvest.Saving >= 1 {
 			desc += fmt.Sprintf(" Against this year's realised income that saves about %s € in tax.", fmtEUR(harvest.Saving))
 		} else {
-			desc += " There are no gains in the same loss pot to offset this year, so it would save no tax now."
+			desc += " It would save no tax this year: there are no gains in the same loss pot beyond your allowance and carried losses."
 		}
 		if harvest.CarryForward >= 1 {
 			desc += fmt.Sprintf(" %s € would carry forward to later years (share losses only against share gains).", fmtEUR(harvest.CarryForward))

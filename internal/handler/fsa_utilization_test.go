@@ -10,13 +10,12 @@ import (
 
 // These tests run computeFSAStatus, the function HandleFSAStatus serves.
 
-func fsaFor(t *testing.T, year int, accounts []db.Account, txns []analytics.TaxTransaction, priorVP []accountVP, joint bool, months int) fsaResult {
+func fsaFor(t *testing.T, year int, accounts []db.Account, txns []analytics.TaxTransaction, vpEvents []analytics.TaxTransaction, joint bool, months int) fsaResult {
 	t.Helper()
 	return computeFSAStatus(fsaInput{
 		capitalIncomeInput: capitalIncomeInput{
 			Year:     year,
-			Events:   realiseCapitalEvents(txns),
-			PriorVP:  priorVP,
+			Ledger:   analytics.MergeVorabpauschaleEvents(txns, vpEvents),
 			Accounts: accounts,
 		},
 		Joint:  joint,
@@ -120,10 +119,17 @@ func TestFSAStatus_ZeroIncomeAndYearAwareAllowance(t *testing.T) {
 // year's allowance (after Teilfreistellung).
 func TestFSAStatus_IncludesPriorYearVorabpauschale(t *testing.T) {
 	sc := testAccount("Scalable", "scalable_capital")
-	vp := []accountVP{{AccountID: sc.ID.String(), ISIN: "IE00B4L5Y983", TFS: 0.30, Amount: 200}}
-	res := fsaFor(t, 2026, []db.Account{sc}, nil, vp, false, 2)
-	if !approx(res.Used, 140) || len(res.Banks) != 1 || !approx(res.Banks[0].Vorabpauschale, 140) {
-		t.Errorf("used %.2f, banks %+v; want 140 from the 2025 Vorabpauschale", res.Used, res.Banks)
+	etf := "IE00B4L5Y983"
+	txns := []analytics.TaxTransaction{ttx(sc, "2024-01-10", "buy", etf, "etf", 100, 10000, 0.30)}
+	// 2025: 100 units × 100 € × 2.53 % × 0.7 = 177.10 €, received January 2026; 123.97 € after Teilfreistellung.
+	vp := []analytics.TaxTransaction{vpEvent(2025, etf, 0.30, 100, 110)}
+	res := fsaFor(t, 2026, []db.Account{sc}, txns, vp, false, 2)
+	if !approx(res.Used, 123.97) || len(res.Banks) != 1 || !approx(res.Banks[0].Vorabpauschale, 123.97) {
+		t.Errorf("used %.2f, banks %+v; want 123.97 from the 2025 Vorabpauschale", res.Used, res.Banks)
+	}
+	// It belongs to 2026, not to the year it was computed for.
+	if prev := fsaFor(t, 2025, []db.Account{sc}, txns, vp, false, 12); prev.Used != 0 {
+		t.Errorf("2025 used %.2f, want 0: the 2025 Vorabpauschale is received in January 2026", prev.Used)
 	}
 }
 

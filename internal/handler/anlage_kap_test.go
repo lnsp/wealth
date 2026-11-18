@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -38,14 +39,26 @@ func ttx(a db.Account, date, typ, isin, assetClass string, qty, amount, tfs floa
 	}
 }
 
-func kapFor(t *testing.T, year int, accounts []db.Account, txns []analytics.TaxTransaction, withheld []withheldTax, priorVP []accountVP, joint bool, church float64) anlageKAPResult {
+// kapFor runs computeAnlageKAP on a ledger built like loadTaxFilingData
+// does: the transactions with Vorabpauschale pseudo-events merged in.
+// vpEvent is the "vorabpauschale" pseudo-transaction vorabpauschaleEvents
+// builds for a fund and calendar year, with its EUR prices at the start and
+// end of the year.
+func vpEvent(year int, isin string, tfs, jan1Price, yearEndPrice float64) analytics.TaxTransaction {
+	return analytics.TaxTransaction{
+		Date: strconv.Itoa(year) + "-12-31", Year: year, Type: "vorabpauschale", ISIN: isin,
+		AssetClass: "etf", TFS: tfs, HasExplicitTFS: true, IsEquityFund: tfs >= analytics.TeilfreistellungEquity,
+		VPJan1Price: jan1Price, VPYearEndPrice: yearEndPrice,
+	}
+}
+
+func kapFor(t *testing.T, year int, accounts []db.Account, txns []analytics.TaxTransaction, withheld []withheldTax, vpEvents []analytics.TaxTransaction, joint bool, church float64) anlageKAPResult {
 	t.Helper()
 	return computeAnlageKAP(anlageKAPInput{
 		capitalIncomeInput: capitalIncomeInput{
 			Year:     year,
-			Events:   realiseCapitalEvents(txns),
+			Ledger:   analytics.MergeVorabpauschaleEvents(txns, vpEvents),
 			Withheld: withheld,
-			PriorVP:  priorVP,
 			Accounts: accounts,
 		},
 		Joint:      joint,
@@ -304,18 +317,20 @@ func TestAnlageKAP_FundsAtForeignBrokerGoOnKAPINV(t *testing.T) {
 	rev := testAccount("Revolut", "revolut")
 	equity, mixed := "IE00B4L5Y983", "IE00BMVB5R75"
 	txns := []analytics.TaxTransaction{
+		ttx(rev, "2023-03-01", "buy", equity, "etf", 100, 10000, 0.30),
 		ttx(rev, "2025-03-01", "dividend", equity, "etf", 0, 100, 0.30),
 		ttx(rev, "2025-03-01", "dividend", mixed, "etf", 0, 40, 0.15),
 	}
-	vp := []accountVP{{AccountID: rev.ID.String(), ISIN: equity, TFS: 0.30, Amount: 50}}
+	// 2024 Vorabpauschale on 100 units held all year: 100 × 2.29 % × 0.7 = 1.603 per unit.
+	vp := []analytics.TaxTransaction{vpEvent(2024, equity, 0.30, 100, 120)}
 	res := kapFor(t, 2025, []db.Account{rev}, txns, nil, vp, false, 0)
-	wantLine(t, res.InvLines, 4, 100) // Aktienfonds distributions, gross
-	wantLine(t, res.InvLines, 5, 40)  // Mischfonds
-	wantLine(t, res.InvLines, 9, 50)  // Vorabpauschale Aktienfonds
+	wantLine(t, res.InvLines, 4, 100)   // Aktienfonds distributions, gross
+	wantLine(t, res.InvLines, 5, 40)    // Mischfonds
+	wantLine(t, res.InvLines, 9, 160.3) // Vorabpauschale 2024, received January 2025
 	wantNoLine(t, res.Lines, 19)
-	// After Teilfreistellung: 70 + 34 + 35 = 139.
-	if math.Abs(res.NetTaxable-139) > 0.01 {
-		t.Errorf("net taxable = %.2f, want 139", res.NetTaxable)
+	// After Teilfreistellung: 70 + 34 + 112.21 = 216.21.
+	if math.Abs(res.NetTaxable-216.21) > 0.01 {
+		t.Errorf("net taxable = %.2f, want 216.21", res.NetTaxable)
 	}
 }
 
@@ -348,6 +363,102 @@ func TestAnlageKAP_DepotTransferIsNotASale(t *testing.T) {
 	res := kapFor(t, 2025, []db.Account{a, b}, txns, nil, nil, false, 0)
 	if len(res.Brokers) != 0 {
 		t.Errorf("a depot transfer must not realise gains or losses, got %+v", res.Brokers)
+	}
+}
+
+// C6: an in-kind depot transfer moves the original lots. 10 GOOG bought at ING
+// for 1,000 € and moved to Scalable (booked there at 2,500 € market value)
+// sell for 3,000 €: the gain is 2,000 €, not 500 €.
+func TestAnlageKAP_InKindTransferKeepsOriginalBasis(t *testing.T) {
+	ing := testAccount("ING", "ing")
+	sc := testAccount("Scalable", "scalable_capital")
+	txns := []analytics.TaxTransaction{
+		ttx(ing, "2022-01-10", "buy", goog, "stock", 10, 1000, 0),
+		ttx(ing, "2024-05-01", "transfer_out", goog, "stock", 10, 2500, 0),
+		ttx(sc, "2024-05-02", "transfer", goog, "stock", 10, 2500, 0),
+		ttx(sc, "2025-03-01", "sell", goog, "stock", 10, 3000, 0),
+	}
+	res := kapFor(t, 2025, []db.Account{ing, sc}, txns, nil, nil, false, 0)
+	wantLine(t, res.Lines, 7, 2000)
+	wantLine(t, res.Lines, 8, 2000)
+	if len(res.Brokers) != 1 || res.Brokers[0].BrokerName != "Scalable Capital" || !approx(res.Brokers[0].ShareGains, 2000) {
+		t.Errorf("brokers = %+v, want the 2,000 € gain at Scalable Capital only", res.Brokers)
+	}
+	if prev := kapFor(t, 2024, []db.Account{ing, sc}, txns, nil, nil, false, 0); len(prev.Brokers) != 0 {
+		t.Errorf("the transfer year must realise nothing, got %+v", prev.Brokers)
+	}
+}
+
+// C8: the 2024 Vorabpauschale (160.30 € on 100 units) is income of January 2025
+// and is subtracted from the gain when the units are sold in 2025
+// (§ 19 Abs. 1 S. 3 InvStG): KAP-INV line 14 is 13,000 − 10,000 − 160.30.
+func TestAnlageKAP_PriorVorabpauschaleReducesLaterFundSaleGain(t *testing.T) {
+	rev := testAccount("Revolut", "revolut")
+	etf := "IE00B4L5Y983"
+	txns := []analytics.TaxTransaction{
+		ttx(rev, "2023-03-01", "buy", etf, "etf", 100, 10000, 0.30),
+		ttx(rev, "2025-06-01", "sell", etf, "etf", 100, 13000, 0.30),
+	}
+	vp := []analytics.TaxTransaction{vpEvent(2024, etf, 0.30, 100, 120)}
+	res := kapFor(t, 2025, []db.Account{rev}, txns, nil, vp, false, 0)
+	wantLine(t, res.InvLines, 9, 160.30)
+	wantLine(t, res.InvLines, 14, 2839.70)
+	// (2,839.70 + 160.30) × 0.70 = 2,100 → (2,100 − 1,000) × 26.375 % = 290.125.
+	if !approx(res.NetTaxable, 2100) || math.Abs(res.EstimatedTax-290.125) > 0.01 {
+		t.Errorf("net taxable %.2f, tax %.2f; want 2,100 and 290.13", res.NetTaxable, res.EstimatedTax)
+	}
+	// Without the Vorabpauschale the full 3,000 € gain would be reported.
+	noVP := kapFor(t, 2025, []db.Account{rev}, txns, nil, nil, false, 0)
+	wantLine(t, noVP.InvLines, 14, 3000)
+}
+
+// The CSV export must show the Overview's figures for the same options: same
+// ledger (Vorabpauschale events merged), same ComputeTaxSummaryWithOptions.
+func TestExportTaxReport_MatchesOverviewSummary(t *testing.T) {
+	sc := testAccount("Scalable", "scalable_capital")
+	etf := "IE00B4L5Y983"
+	txns := []analytics.TaxTransaction{
+		ttx(sc, "2023-03-01", "buy", etf, "etf", 100, 10000, 0.30),
+		ttx(sc, "2024-01-10", "buy", goog, "stock", 10, 3000, 0),
+		ttx(sc, "2025-02-01", "sell", goog, "stock", 10, 1000, 0), // −2,000 share loss
+		ttx(sc, "2025-06-01", "sell", etf, "etf", 50, 6500, 0.30),
+		ttx(sc, "2025-07-01", "interest", "", "", 0, 400, 0),
+	}
+	vp := []analytics.TaxTransaction{vpEvent(2023, etf, 0.30, 100, 110), vpEvent(2024, etf, 0.30, 110, 125)}
+	opts := analytics.TaxOptions{Joint: true, ChurchTaxRate: 0.09}
+
+	// What HandleTax computes for the Overview.
+	overview := analytics.ComputeTaxSummaryWithOptions(analytics.MergeVorabpauschaleEvents(txns, vp), 2025, nil, opts)
+
+	d := &taxFilingData{accounts: []db.Account{sc}, taxTxns: txns, ledger: analytics.MergeVorabpauschaleEvents(txns, vp)}
+	summary, kap := exportTaxReport(d, 2025, opts)
+	if summary.EstimatedTax != overview.EstimatedTax || summary.TaxableGain != overview.TaxableGain ||
+		summary.FreistellungUsed != overview.FreistellungUsed || summary.VorabpauschaleIncome != overview.VorabpauschaleIncome ||
+		summary.LossCarryOutShare != overview.LossCarryOutShare {
+		t.Errorf("export summary %+v\ndiffers from the Overview %+v", summary, overview)
+	}
+	if !approx(kap.EstimatedTax, overview.EstimatedTax) {
+		t.Errorf("Anlage KAP estimate %.2f, Overview %.2f", kap.EstimatedTax, overview.EstimatedTax)
+	}
+
+	var buf strings.Builder
+	writeTaxReportCSV(&buf, 2025, summary, kap)
+	csv := buf.String()
+	for _, want := range []string{
+		fmt.Sprintf("Geschaetzte Steuer (27,995 %%);%.2f EUR", overview.EstimatedTax),
+		fmt.Sprintf("Sparerpauschbetrag;%.2f EUR", 2000.0),
+		fmt.Sprintf("Steuerpflichtiger Gewinn;%.2f EUR", overview.TaxableGain),
+		fmt.Sprintf("Vorabpauschale 2024 (zugeflossen im Januar 2025);%.2f EUR", overview.VorabpauschaleIncome),
+		fmt.Sprintf("Verlustvortrag Aktien ins Folgejahr;%.2f EUR", overview.LossCarryOutShare),
+		"Zusammenveranlagung;Ja",
+		"KAP;16;",
+	} {
+		if !strings.Contains(csv, want) {
+			t.Errorf("CSV is missing %q:\n%s", want, csv)
+		}
+	}
+	if overview.LossCarryOutShare >= 0 || overview.VorabpauschaleIncome <= 0 {
+		t.Errorf("fixture should carry a share loss forward and include a Vorabpauschale: %+v", overview)
 	}
 }
 

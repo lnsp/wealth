@@ -6,8 +6,11 @@ import { Callout, KeyValues, Loaded, Money, Statement, SubHeadingRow, TableRegio
 
 interface FsaStatus {
   year: number;
-  accounts?: { account_name: string; dividends: number; interest: number; realized_gains: number; total_income: number }[] | null;
+  /** One row per bank: a Freistellungsauftrag is filed per bank, which nets gains and losses first. */
+  accounts?: { account_name: string; dividends: number; interest: number; realized_gains: number; total_income: number; accepts_fsa?: boolean; vorabpauschale?: number }[] | null;
   total_income: number;
+  /** Income at foreign brokers, which use the allowance only through Anlage KAP. */
+  foreign_income?: number;
   allowance: number;
   joint: boolean;
   used: number;
@@ -172,8 +175,8 @@ function ExemptionOrders() {
   const fsa = useLoad(() => getJson<FsaStatus>(`/api/analysis/fsa-status${joint ? '?joint=1' : ''}`), [joint]);
 
   return (
-    <Section title="Freistellungsauftrag by Account"
-      subtitle="The Freistellungsauftrag (tax exemption order) tells each broker how much of your saver’s allowance it may apply. This shows the taxable income each account earned this year."
+    <Section title="Freistellungsauftrag by Bank"
+      subtitle="The Freistellungsauftrag (tax exemption order) tells each German bank how much of your saver’s allowance it may apply. Each bank first nets your gains and losses, so this shows the income left at each bank this year."
       actions={
         <label className="flex min-h-[44px] cursor-pointer items-center gap-2 text-[14px] text-ink">
           <input type="checkbox" checked={joint} onChange={e => setJoint(e.target.checked)} className="h-5 w-5 accent-forest" />
@@ -191,13 +194,16 @@ function ExemptionOrders() {
                 {accounts.map(a => {
                   const parts: string[] = [];
                   if (num(a.realized_gains) > 0) parts.push(`gains ${fmtEUR(a.realized_gains)}`);
+                  if (num(a.realized_gains) < 0) parts.push(`net losses ${fmtEUR(-num(a.realized_gains))}`);
                   if (num(a.dividends) > 0) parts.push(`dividends ${fmtEUR(a.dividends)}`);
                   if (num(a.interest) > 0) parts.push(`interest ${fmtEUR(a.interest)}`);
+                  if (num(a.vorabpauschale) > 0) parts.push(`Vorabpauschale ${fmtEUR(a.vorabpauschale)}`);
                   return (
                     <li key={a.account_name} className="flex items-center justify-between gap-4 py-2 text-[13px]">
                       <span className="min-w-0">
                         <span className="block font-medium text-ink">{a.account_name}</span>
                         {parts.length > 0 && <span className="block text-ink-muted first-letter:uppercase" data-privacy="blur">{parts.join(' · ')}</span>}
+                        {a.accepts_fsa === false && <span className="block text-ink-muted">Foreign broker: takes no Freistellungsauftrag; the allowance applies through Anlage KAP.</span>}
                       </span>
                       <Money value={a.total_income} className="shrink-0 text-[14px] text-ink" />
                     </li>
@@ -213,11 +219,16 @@ function ExemptionOrders() {
                   </span>
                 )}
               </div>
-              <ProgressBar className="mt-2" value={num(data.used)} max={num(data.allowance)} label="Allowance used across accounts" />
+              <ProgressBar className="mt-2" value={num(data.used)} max={num(data.allowance)} label="Allowance used across banks" />
+              {num(data.foreign_income) > 0 && (
+                <p className="mt-2 text-[12px] text-ink-muted">
+                  <Money value={data.foreign_income} /> of the income is at foreign brokers, which withhold no German tax; it uses the allowance when you file Anlage KAP.
+                </p>
+              )}
 
               {recs.length > 1 && (
                 <div className="mt-5">
-                  <Callout tone="info" label="Suggestion" title={`Split of the exemption order for ${num(data.year) + 1}`}>
+                  <Callout tone="info" label="Suggestion" title={`Split of the exemption order for ${num(data.year) + 1} across your German banks`}>
                     <ul className="mt-1 flex flex-col gap-1">
                       {recs.map(r => (
                         <li key={r.account} className="flex flex-wrap justify-between gap-x-4">

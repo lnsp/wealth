@@ -1862,7 +1862,9 @@ func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http
 	writeJSON(w, http.StatusOK, map[string]any{"history": snapshots, "holdings": holdingNames})
 }
 
-// HandleExportTaxReport generates a CSV tax report for a given year.
+// HandleExportTaxReport generates a CSV tax report for a given year: the tax
+// summary, realised P/L per security and the Anlage KAP / KAP-INV lines.
+// Accepts the same joint=1 and church_tax parameters as HandleAnlageKAP.
 func (h *AnalysisHandler) HandleExportTaxReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	yearStr := r.URL.Query().Get("year")
@@ -1873,17 +1875,18 @@ func (h *AnalysisHandler) HandleExportTaxReport(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	txns, err := listAllTransactionsRows(ctx, h.queries)
+	d, err := h.loadTaxFilingData(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-	secs, _ := h.queries.ListSecurities(ctx)
-	taxTxns, _, _, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
-
-	summary := analytics.ComputeTaxSummary(taxTxns, year, nil)
+	summary := analytics.ComputeTaxSummary(d.taxTxns, year, nil)
+	enriched, _ := h.loadEnrichedHoldings(ctx)
+	kap := computeAnlageKAP(anlageKAPInput{
+		capitalIncomeInput: h.capitalIncome(ctx, d, year, enriched),
+		Joint:              parseJointParam(r.URL.Query().Get("joint")),
+		ChurchRate:         parseChurchTaxParam(r.URL.Query().Get("church_tax")),
+	})
 
 	filename := fmt.Sprintf("tax-report-%d.csv", year)
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
@@ -1911,9 +1914,39 @@ func (h *AnalysisHandler) HandleExportTaxReport(w http.ResponseWriter, r *http.R
 				equity = "Ja"
 			}
 			fmt.Fprintf(w, "%s;%s;%.2f;%.2f;%.2f;%s\n",
-				s.ISIN, s.Name, s.RealizedPL, s.Teilfreistellung, s.TaxablePL, equity)
+				csvField(s.ISIN), csvField(s.Name), s.RealizedPL, s.Teilfreistellung, s.TaxablePL, equity)
 		}
 	}
+
+	fmt.Fprintf(w, "\nAnlage KAP / KAP-INV %d\n", year)
+	fmt.Fprintf(w, "Formular;Zeile;Bezeichnung;Betrag;Hinweis\n")
+	writeKAPLines := func(form string, lines []kapLine) {
+		for _, l := range lines {
+			note := ""
+			amount := fmt.Sprintf("%.2f", l.Amount)
+			switch {
+			case l.Blank:
+				note = "Nur lt. Steuerbescheinigung eintragen, sonst leer lassen"
+				amount = ""
+			case l.Estimate:
+				note = "Schätzung, mit der Steuerbescheinigung abgleichen"
+			}
+			fmt.Fprintf(w, "%s;%d;%s;%s;%s\n", form, l.Line, csvField(l.Description), amount, csvField(note))
+		}
+	}
+	writeKAPLines("KAP", kap.Lines)
+	writeKAPLines("KAP-INV", kap.InvLines)
+	if kap.LayoutNote != "" {
+		fmt.Fprintf(w, "%s\n", csvField("Hinweis: Zeilennummern nach den Vordrucken 2024/2025; bitte anhand der Bezeichnung zuordnen."))
+	}
+}
+
+// csvField quotes a semicolon-separated CSV field when it needs it.
+func csvField(s string) string {
+	if strings.ContainsAny(s, ";\"\n\r") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
 }
 
 // HandleExportDATEV generates a DATEV-compatible CSV for Steuerberater import.
@@ -1998,7 +2031,9 @@ func (h *AnalysisHandler) HandleExportDATEV(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// HandleAnlageKAP generates Anlage KAP preparation data with per-broker detail.
+// HandleAnlageKAP prepares Anlage KAP and Anlage KAP-INV for a tax year with
+// per-bank detail. Query: year (default: last year), joint=1 for joint filing,
+// church_tax=0.08|0.09 for the church-tax rate used to split withheld tax.
 func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	yearStr := r.URL.Query().Get("year")
@@ -2009,283 +2044,18 @@ func (h *AnalysisHandler) HandleAnlageKAP(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	txns, err := listAllTransactionsRows(ctx, h.queries)
+	d, err := h.loadTaxFilingData(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-	accts, _ := h.queries.ListAccounts(ctx)
-	secs, _ := h.queries.ListSecurities(ctx)
-
-	acctNames := make(map[string]string)
-	acctInstitution := make(map[string]string)
-	for _, a := range accts {
-		acctNames[a.ID.String()] = a.Name
-		acctInstitution[a.ID.String()] = a.Institution
-	}
-	tfsMap := make(map[string]float64, len(secs))
-	for _, s := range secs {
-		tfsMap[s.ISIN] = securityTFSRate(s)
-	}
-
-	// Per-broker aggregation
-	type brokerData struct {
-		BrokerName    string  `json:"broker_name"`
-		AccountName   string  `json:"account_name"`
-		Dividends     float64 `json:"dividends"`       // Zeile 7: Kapitalerträge
-		Interest      float64 `json:"interest"`        // Zeile 7: Zinsen
-		RealizedGains float64 `json:"realized_gains"`  // Zeile 7: Gewinne
-		RealizedLoss  float64 `json:"realized_losses"` // Zeile 12: Verluste
-		TeilfreiAmt   float64 `json:"teilfreistellung"` // Zeile 8: Teilfreistellung
-		WithheldTax   float64 `json:"withheld_tax"`    // Zeile 37: Einbehaltene KapESt (ohne Soli)
-		SoliPaid      float64 `json:"soli_paid"`       // Zeile 38: Solidaritätszuschlag
-		FSAUsed       float64 `json:"fsa_used"`        // Zeile 16: Beanspruchter FSA
-	}
-	brokers := make(map[string]*brokerData)
-	getBroker := func(acctID string) *brokerData {
-		key := acctInstitution[acctID]
-		if key == "" {
-			key = acctNames[acctID]
-		}
-		if key == "" {
-			key = "Unknown"
-		}
-		b, ok := brokers[key]
-		if !ok {
-			b = &brokerData{BrokerName: key, AccountName: acctNames[acctID]}
-			brokers[key] = b
-		}
-		return b
-	}
-
-	// Decompose total withheld broker tax (KapESt + Soli) into Zeile 37 KapESt
-	// and Zeile 38 Soli so Zeile 50 (37 + 38) equals the exact tax withheld.
-	addWithheldTax := func(b *brokerData, totalWithheld float64) {
-		if totalWithheld <= 0 {
-			return
-		}
-		kapESt := totalWithheld / (1 + analytics.Solidaritaetszuschlag)
-		soli := totalWithheld - kapESt
-		b.WithheldTax += kapESt
-		b.SoliPaid += soli
-	}
-
-	// Per-depot FIFO lots (§ 20 Abs. 4 Satz 7 EStG)
-	type depotKey struct {
-		acctID string
-		isin   string
-	}
-	type fifoLot struct {
-		qty     float64
-		costPer float64
-	}
-	lots := make(map[depotKey][]fifoLot)
-	consumeFIFO := func(k depotKey, qty float64) (soldQty, costBasis float64) {
-		rem := qty
-		q := lots[k]
-		for rem > 1e-9 && len(q) > 0 {
-			if q[0].qty <= rem+1e-9 {
-				soldQty += q[0].qty
-				costBasis += q[0].qty * q[0].costPer
-				rem -= q[0].qty
-				q = q[1:]
-			} else {
-				soldQty += rem
-				costBasis += rem * q[0].costPer
-				q[0].qty -= rem
-				rem = 0
-			}
-		}
-		lots[k] = q
-		return soldQty, costBasis
-	}
-
-	for i := len(txns) - 1; i >= 0; i-- { // chronological
-		txn := txns[i]
-		if txn.Date.Year() > year {
-			continue // future transactions
-		}
-		isin := ""
-		if txn.SecurityISIN.Valid {
-			isin = txn.SecurityISIN.String
-		}
-		amt := 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-		}
-		qty := 0.0
-		if txn.Quantity.Valid {
-			f, _ := txn.Quantity.Float64Value()
-			qty = f.Float64
-		}
-		fee := 0.0
-		if txn.Fee.Valid {
-			f, _ := txn.Fee.Float64Value()
-			fee = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-		}
-		tax := 0.0
-		if txn.Tax.Valid {
-			f, _ := txn.Tax.Float64Value()
-			tax = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-		}
-		acctID := txn.AccountID.String()
-		dk := depotKey{acctID: acctID, isin: isin}
-
-		switch txn.Type {
-		case "buy", "savings_plan", "transfer":
-			if isin == "" || qty <= 0 {
-				continue
-			}
-			lots[dk] = append(lots[dk], fifoLot{qty: qty, costPer: (amt + fee) / qty})
-		case "transfer_out":
-			if isin == "" || qty <= 0 {
-				continue
-			}
-			consumeFIFO(dk, qty)
-		case "sell":
-			if isin == "" || qty <= 0 {
-				continue
-			}
-			soldQty, costBasis := consumeFIFO(dk, qty)
-			if txn.Date.Year() != year || soldQty <= 1e-9 {
-				continue
-			}
-			proceeds := amt - fee
-			if soldQty < qty {
-				proceeds = (amt - fee) * (soldQty / qty)
-			}
-			gain := proceeds - costBasis
-
-			b := getBroker(acctID)
-			if gain > 0 {
-				tfs := tfsMap[isin]
-				if tfs > 0 {
-					b.TeilfreiAmt += gain * tfs
-					gain *= (1 - tfs)
-				}
-				b.RealizedGains += gain
-			} else {
-				// Preserved at full negative magnitude per anlage_kap_test.go contract
-				b.RealizedLoss += gain
-			}
-			addWithheldTax(b, tax)
-
-		case "dividend":
-			if txn.Date.Year() != year {
-				continue
-			}
-			b := getBroker(acctID)
-			divAmt := amt
-			tfs := tfsMap[isin]
-			if tfs > 0 {
-				b.TeilfreiAmt += divAmt * tfs
-				divAmt *= (1 - tfs)
-			}
-			b.Dividends += divAmt
-			addWithheldTax(b, tax)
-
-		case "interest":
-			if txn.Date.Year() != year {
-				continue
-			}
-			b := getBroker(acctID)
-			b.Interest += amt
-			addWithheldTax(b, tax)
-		}
-	}
-
-	// Build result
-	brokerList := make([]brokerData, 0)
-	for _, b := range brokers {
-		b.Dividends = math.Round(b.Dividends*100) / 100
-		b.Interest = math.Round(b.Interest*100) / 100
-		b.RealizedGains = math.Round(b.RealizedGains*100) / 100
-		b.RealizedLoss = math.Round(b.RealizedLoss*100) / 100
-		b.TeilfreiAmt = math.Round(b.TeilfreiAmt*100) / 100
-		b.WithheldTax = math.Round(b.WithheldTax*100) / 100
-		b.SoliPaid = math.Round(b.SoliPaid*100) / 100
-		brokerList = append(brokerList, *b)
-	}
-	sort.Slice(brokerList, func(i, j int) bool {
-		return (brokerList[i].Dividends + brokerList[i].RealizedGains) > (brokerList[j].Dividends + brokerList[j].RealizedGains)
+	enriched, _ := h.loadEnrichedHoldings(ctx)
+	res := computeAnlageKAP(anlageKAPInput{
+		capitalIncomeInput: h.capitalIncome(ctx, d, year, enriched),
+		Joint:              parseJointParam(r.URL.Query().Get("joint")),
+		ChurchRate:         parseChurchTaxParam(r.URL.Query().Get("church_tax")),
 	})
-
-	// Cross-broker aggregation for Anlage KAP
-	totalDividends := 0.0
-	totalInterest := 0.0
-	totalGains := 0.0
-	totalLosses := 0.0
-	totalTeilfrei := 0.0
-	totalWithheld := 0.0
-	totalSoli := 0.0
-	for _, b := range brokerList {
-		totalDividends += b.Dividends
-		totalInterest += b.Interest
-		totalGains += b.RealizedGains
-		totalLosses += b.RealizedLoss
-		totalTeilfrei += b.TeilfreiAmt
-		totalWithheld += b.WithheldTax
-		totalSoli += b.SoliPaid
-	}
-
-	grossIncome := totalDividends + totalInterest + totalGains
-	netTaxable := grossIncome + totalLosses // losses are negative
-	fsaApplied := math.Min(math.Max(netTaxable, 0), analytics.Sparerpauschbetrag)
-	afterFSA := math.Max(netTaxable-fsaApplied, 0)
-	estimatedTax := afterFSA * analytics.EffectiveTaxRate
-
-	type kapLine struct {
-		Line        int     `json:"line"`
-		Description string  `json:"description"`
-		Amount      float64 `json:"amount"`
-	}
-	anlageKAP := []kapLine{
-		{7, "Kapitalerträge (Dividenden, Zinsen, Gewinne)", math.Round(grossIncome*100) / 100},
-		{8, "Davon: Teilfreistellung nach §20 Abs.1 InvStG", math.Round(totalTeilfrei*100) / 100},
-		{12, "Verluste aus Kapitalvermögen", math.Round(totalLosses*100) / 100},
-		{14, "Steuerpflichtiger Betrag nach Teilfreistellung", math.Round(netTaxable*100) / 100},
-		{16, "In Anspruch genommener Sparer-Pauschbetrag", math.Round(fsaApplied*100) / 100},
-		{37, "Einbehaltene Kapitalertragsteuer", math.Round(totalWithheld*100) / 100},
-		{38, "Einbehaltener Solidaritätszuschlag", math.Round(totalSoli*100) / 100},
-		{50, "Anzurechnende Steuer (Zeile 37 + 38)", math.Round((totalWithheld+totalSoli)*100) / 100},
-	}
-
-	crossBrokerNote := ""
-	if len(brokerList) > 1 {
-		hasGainBroker := false
-		hasLossBroker := false
-		for _, b := range brokerList {
-			if b.RealizedGains > 0 {
-				hasGainBroker = true
-			}
-			if b.RealizedLoss < 0 {
-				hasLossBroker = true
-			}
-		}
-		if hasGainBroker && hasLossBroker {
-			crossBrokerNote = "Verluste bei einem Broker können mit Gewinnen bei einem anderen Broker verrechnet werden. Anlage KAP einreichen lohnt sich!"
-		} else {
-			crossBrokerNote = fmt.Sprintf("Einkünfte aus %d Banken — Anlage KAP einreichen, damit der Sparerpauschbetrag korrekt verrechnet wird.", len(brokerList))
-		}
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"year":              year,
-		"brokers":           brokerList,
-		"anlage_kap":        anlageKAP,
-		"total_income":      math.Round(grossIncome*100) / 100,
-		"total_losses":      math.Round(totalLosses*100) / 100,
-		"total_teilfrei":    math.Round(totalTeilfrei*100) / 100,
-		"net_taxable":       math.Round(netTaxable*100) / 100,
-		"fsa_applied":       math.Round(fsaApplied*100) / 100,
-		"estimated_tax":     math.Round(estimatedTax*100) / 100,
-		"total_withheld":    math.Round((totalWithheld+totalSoli)*100) / 100,
-		"cross_broker_note": crossBrokerNote,
-		"broker_count":      len(brokerList),
-	})
+	writeJSON(w, http.StatusOK, res.response())
 }
 
 // HandleInflation returns inflation-adjusted net worth data using German HVPI.
@@ -3047,195 +2817,37 @@ func (h *AnalysisHandler) HandleLossPots(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// HandleFSAStatus returns Freistellungsauftrag (Sparerpauschbetrag) usage per account.
-// Accepts ?joint=1 to double the allowance for married couples filing jointly
-// (Zusammenveranlagung), which raises the Sparerpauschbetrag to 2000 EUR.
+// HandleFSAStatus returns Freistellungsauftrag (Sparer-Pauschbetrag) usage per bank.
+// Each bank nets gains and losses before applying the order (§ 43a Abs. 3 EStG),
+// and the previous year's Vorabpauschale counts as income in January.
+// Accepts ?joint=1 for married couples filing jointly (Zusammenveranlagung),
+// which doubles the allowance, and ?year= for another tax year.
 func (h *AnalysisHandler) HandleFSAStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	year := time.Now().Year()
+	now := time.Now()
+	year := now.Year()
 	if y := r.URL.Query().Get("year"); y != "" {
-		if v, err := strconv.Atoi(y); err == nil {
+		if v, err := strconv.Atoi(y); err == nil && v >= 2020 && v <= 2100 {
 			year = v
 		}
 	}
-	allowance := analytics.Sparerpauschbetrag
-	joint := r.URL.Query().Get("joint") == "1"
-	if joint {
-		allowance *= 2
+	months := 12
+	if year == now.Year() {
+		months = int(now.Month())
 	}
 
-	txns, _ := listAllTransactionsRows(ctx, h.queries)
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-	accts, _ := h.queries.ListAccounts(ctx)
-	secs, _ := h.queries.ListSecurities(ctx)
-	taxTxns, _, tfsMap, _ := buildTaxTransactions(txns, secs, histFX, fxRates)
-
-	acctNames := make(map[string]string)
-	for _, a := range accts {
-		acctNames[a.ID.String()] = a.Name
+	d, err := h.loadTaxFilingData(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
+		return
 	}
-
-	type acctIncome struct {
-		AccountID   string  `json:"account_id"`
-		AccountName string  `json:"account_name"`
-		Dividends   float64 `json:"dividends"`
-		Interest    float64 `json:"interest"`
-		Gains       float64 `json:"realized_gains"`
-		Total       float64 `json:"total_income"`
-	}
-	incomeByAcct := make(map[string]*acctIncome)
-	getAcct := func(id string) *acctIncome {
-		if a, ok := incomeByAcct[id]; ok {
-			return a
-		}
-		a := &acctIncome{AccountID: id, AccountName: acctNames[id]}
-		if a.AccountName == "" {
-			a.AccountName = "Unknown"
-		}
-		incomeByAcct[id] = a
-		return a
-	}
-
-	type depotKey struct {
-		acctID string
-		isin   string
-	}
-	type fifoLot struct {
-		qty     float64
-		costPer float64
-	}
-	lots := make(map[depotKey][]fifoLot)
-	consumeFIFO := func(k depotKey, qty float64) (soldQty, costBasis float64) {
-		rem := qty
-		q := lots[k]
-		for rem > 1e-9 && len(q) > 0 {
-			if q[0].qty <= rem+1e-9 {
-				soldQty += q[0].qty
-				costBasis += q[0].qty * q[0].costPer
-				rem -= q[0].qty
-				q = q[1:]
-			} else {
-				soldQty += rem
-				costBasis += rem * q[0].costPer
-				q[0].qty -= rem
-				rem = 0
-			}
-		}
-		lots[k] = q
-		return soldQty, costBasis
-	}
-
-	for _, txn := range taxTxns { // already chronological
-		if txn.Year > year {
-			continue
-		}
-		dk := depotKey{acctID: txn.AccountID, isin: txn.ISIN}
-
-		switch txn.Type {
-		case "buy", "savings_plan", "transfer":
-			if txn.ISIN == "" || txn.Quantity <= 0 {
-				continue
-			}
-			lots[dk] = append(lots[dk], fifoLot{qty: txn.Quantity, costPer: txn.Amount / txn.Quantity})
-
-		case "transfer_out":
-			if txn.ISIN == "" || txn.Quantity <= 0 {
-				continue
-			}
-			consumeFIFO(dk, txn.Quantity)
-
-		case "sell":
-			if txn.ISIN == "" || txn.Quantity <= 0 {
-				continue
-			}
-			// Always consume prior-year sells so sold shares don't inflate future basis!
-			soldQty, costBasis := consumeFIFO(dk, txn.Quantity)
-			if txn.Year != year || soldQty <= 1e-9 {
-				continue
-			}
-			proceeds := txn.Amount
-			if soldQty < txn.Quantity {
-				proceeds = txn.Amount * (soldQty / txn.Quantity)
-			}
-			gain := proceeds - costBasis
-			if gain > 0 {
-				gain *= (1 - tfsMap[txn.ISIN])
-				getAcct(txn.AccountID).Gains += gain
-			}
-
-		case "dividend":
-			if txn.Year != year {
-				continue
-			}
-			divAmt := txn.Amount * (1 - tfsMap[txn.ISIN])
-			getAcct(txn.AccountID).Dividends += divAmt
-
-		case "interest":
-			if txn.Year != year {
-				continue
-			}
-			getAcct(txn.AccountID).Interest += txn.Amount
-		}
-	}
-
-	accounts := []acctIncome{}
-	totalIncome := 0.0
-	for _, a := range incomeByAcct {
-		a.Total = math.Round((a.Dividends+a.Interest+a.Gains)*100) / 100
-		a.Dividends = math.Round(a.Dividends*100) / 100
-		a.Interest = math.Round(a.Interest*100) / 100
-		a.Gains = math.Round(a.Gains*100) / 100
-		totalIncome += a.Total
-		accounts = append(accounts, *a)
-	}
-	sort.Slice(accounts, func(i, j int) bool { return accounts[i].Total > accounts[j].Total })
-
-	used := math.Min(totalIncome, allowance)
-	remaining := allowance - used
-
-	// Recommendation: optimal FSA split for next year based on projected income
-	type recommendation struct {
-		Account       string  `json:"account"`
-		ProjectedIncome float64 `json:"projected_income"`
-		RecommendedFSA float64 `json:"recommended_fsa"`
-	}
-	recs := []recommendation{}
-	if len(accounts) > 0 {
-		// Annualize current YTD income to project full year
-		monthsElapsed := float64(time.Now().Month())
-		if monthsElapsed < 1 { monthsElapsed = 1 }
-		for _, a := range accounts {
-			projected := a.Total / monthsElapsed * 12
-			recs = append(recs, recommendation{
-				Account: a.AccountName, ProjectedIncome: math.Round(projected*100) / 100,
-			})
-		}
-		// Allocate FSA proportionally to projected income
-		totalProjected := 0.0
-		for _, r := range recs { totalProjected += r.ProjectedIncome }
-		for i := range recs {
-			if totalProjected > 0 {
-				recs[i].RecommendedFSA = math.Round(allowance * recs[i].ProjectedIncome / totalProjected)
-			}
-		}
-	}
-
-	utilization := 0.0
-	if allowance > 0 {
-		utilization = math.Round(used/allowance*10000) / 100
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"year":            year,
-		"accounts":        accounts,
-		"total_income":    math.Round(totalIncome*100) / 100,
-		"allowance":       allowance,
-		"joint":           joint,
-		"used":            math.Round(used*100) / 100,
-		"remaining":       math.Round(remaining*100) / 100,
-		"utilization_pct": utilization,
-		"recommendation":  recs,
+	enriched, _ := h.loadEnrichedHoldings(ctx)
+	res := computeFSAStatus(fsaInput{
+		capitalIncomeInput: h.capitalIncome(ctx, d, year, enriched),
+		Joint:              parseJointParam(r.URL.Query().Get("joint")),
+		Months:             months,
 	})
+	writeJSON(w, http.StatusOK, res.response())
 }
 
 // HandleAlternatives returns cheaper ETF alternatives for current holdings.
@@ -3582,10 +3194,18 @@ const taxCalendarFSATitle = "Freistellungsauftrag (tax exemption order) use belo
 
 // HandleTaxCalendar generates a 12-month German tax compliance calendar
 // with auto-computed amounts based on portfolio data.
+// Query: joint=1 for joint filing, church_tax=0.08|0.09 for the church-tax rate.
 func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	now := time.Now().UTC()
 	year := now.Year()
+	joint := parseJointParam(r.URL.Query().Get("joint"))
+	rate := analytics.CapitalIncomeTaxRate(parseChurchTaxParam(r.URL.Query().Get("church_tax")))
+	allowance := analytics.SparerPauschbetragForYear(year, joint)
+	allowanceLabel := fmtEUR(allowance) + " €"
+	if joint {
+		allowanceLabel += " (joint filing)"
+	}
 
 	type calendarEvent struct {
 		Month       int     `json:"month"` // 1-12
@@ -3601,39 +3221,29 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 
 	// Load data for amount computation
 	enriched, _ := h.loadEnrichedHoldings(ctx)
-	txns, _ := listAllTransactionsRows(ctx, h.queries)
-	secs, _ := h.queries.ListSecurities(ctx)
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-	secMap := make(map[string]db.Security, len(secs))
-	for _, s := range secs {
-		secMap[s.ISIN] = s
+	d, err := h.loadTaxFilingData(ctx)
+	if err != nil {
+		// The fixed dates still apply; only the amounts need transactions.
+		d = &taxFilingData{secMap: map[string]db.Security{}, tfsMap: map[string]float64{}}
 	}
-	taxTxns, names, tfsMap, equityMap := buildTaxTransactions(txns, secs, histFX, fxRates)
+	valByISIN, qtyByISIN := currentFundValues(enriched)
 
-	valByISIN := make(map[string]float64)
-	qtyByISIN := make(map[string]float64)
-	for _, eh := range enriched {
-		if eh.value > 0 {
-			valByISIN[eh.security.ISIN] += eh.value
-			qtyByISIN[eh.security.ISIN] += numericToFloat(eh.holding.Quantity)
-		}
-	}
-
-	// --- 1. Vorabpauschale (Jan 2) ---
-	// Jan 2 of `year` settles the Vorabpauschale for `year - 1` (§ 18 Abs. 3 InvStG).
-	vpEntries := h.computeYearVorabpauschale(ctx, year-1, txns, secMap, tfsMap, valByISIN, qtyByISIN, histFX, fxRates)
-	etfValueTotal := 0.0
-	vpTax := 0.0
+	// --- 1. Vorabpauschale (first working day of the year) ---
+	// The Vorabpauschale for `year - 1` counts as received on the first working
+	// day of `year` (§ 18 Abs. 3 InvStG); German banks debit the tax that day.
+	vpEntries := h.computeYearVorabpauschale(ctx, year-1, d.rows, d.secMap, d.tfsMap, valByISIN, qtyByISIN, d.histFX, d.fxRates)
+	fundValue, vpTotal, vpTax := 0.0, 0.0, 0.0
 	for _, vp := range vpEntries {
-		etfValueTotal += vp.YearEndValue
+		fundValue += vp.YearEndValue
+		vpTotal += vp.Vorabpauschale
 		vpTax += vp.TaxOnVP
 	}
 	if vpTax > 10 {
+		vpDate := firstWorkingDayOfYear(year)
 		events = append(events, calendarEvent{
-			Month: 1, Date: fmt.Sprintf("%d-01-02", year),
+			Month: int(vpDate.Month()), Date: vpDate.Format("2006-01-02"),
 			Title:       "Vorabpauschale (advance flat-rate fund tax) due",
-			Description: fmt.Sprintf("Tax on the %d Basisertrag (base return) of %s € in fund holdings. Your broker's settlement account must hold enough cash.", year-1, fmtEUR(etfValueTotal)),
+			Description: fmt.Sprintf("Tax on the %d Vorabpauschale of %s € (deemed income on funds worth %s € at year end). German brokers debit it from the settlement account, so keep enough cash there; it may be lower if your Freistellungsauftrag covers it.", year-1, fmtEUR(vpTotal), fmtEUR(fundValue)),
 			Amount:      math.Round(vpTax*100) / 100,
 			Category:    "vorabpauschale", Urgency: "deadline",
 			ActionURL: "/analysis",
@@ -3641,107 +3251,98 @@ func (h *AnalysisHandler) HandleTaxCalendar(w http.ResponseWriter, r *http.Reque
 	}
 
 	// --- 2. Freistellungsauftrag Review (Jan) ---
-	// Check if current FSA allocation is optimal
 	events = append(events, calendarEvent{
 		Month: 1, Date: fmt.Sprintf("%d-01-15", year),
 		Title:       "Review your Freistellungsauftrag (tax exemption order)",
-		Description: "Check that the 1.000 € Sparer-Pauschbetrag (saver's allowance) is split sensibly across your brokers.",
-		Amount:      analytics.Sparerpauschbetrag,
+		Description: fmt.Sprintf("Check that the %s Sparer-Pauschbetrag (saver's allowance) is split sensibly across your German banks. Foreign brokers such as Morgan Stanley cannot take one; their income gets the allowance through Anlage KAP.", allowanceLabel),
+		Amount:      allowance,
 		Category:    "fsa", Urgency: "action",
 		ActionURL: "/analysis",
 	})
 
-	// --- 3. Steuererklärung deadline (Jul 31 or Sep 30 with Steuerberater) ---
+	// --- 3. Steuererklärung deadline (§ 149 AO, rolled forward per § 108 Abs. 3 AO) ---
+	unadvised, advised := incomeTaxReturnDeadlines(year - 1)
 	events = append(events, calendarEvent{
-		Month: 7, Date: fmt.Sprintf("%d-07-31", year),
+		Month: int(unadvised.Month()), Date: unadvised.Format("2006-01-02"),
 		Title:       fmt.Sprintf("Steuererklärung (income tax return) %d due", year-1),
-		Description: fmt.Sprintf("File your %d income tax return. With a Steuerberater (tax adviser) the deadline is 28.02.%d.", year-1, year+1),
+		Description: fmt.Sprintf("File your %d income tax return, including Anlage KAP for income without German withholding. With a Steuerberater (tax adviser) the deadline is %s.", year-1, advised.Format("02.01.2006")),
 		Category:    "steuererklaerung", Urgency: "deadline",
 		ActionURL: "/analysis",
 	})
 
-	// --- 4. Verlustbescheinigung beantragen (Nov 15-Dec 15) ---
+	// --- 4. Verlustbescheinigung beantragen (Dec 15) ---
 	events = append(events, calendarEvent{
 		Month: 12, Date: fmt.Sprintf("%d-12-15", year),
 		Title:       "Request a Verlustbescheinigung (loss certificate)",
-		Description: "Ask your bank for a loss certificate for the tax return. The deadline is 15 December.",
+		Description: "To offset losses at one German bank against gains at another, ask the loss-making bank for a loss certificate by 15 December (§ 43a Abs. 3 S. 4 EStG) and file Anlage KAP. Without it the bank carries the loss forward.",
 		Category:    "verlust", Urgency: "deadline",
 	})
 
+	// This year's realised capital income per bank, for the harvest and FSA checks.
+	ytdBanks := aggregateCapitalIncome(d.capitalIncomeWithVP(year, vpEntries))
+
 	// --- 5. Tax-Loss Harvesting Window (Q4) ---
-	// Identify positions with unrealized losses > 500 EUR
+	// Sell-all per depot in FIFO order: a position's loss is the sum over all its
+	// lots, not just the lots under water. The saving is what that loss removes
+	// from this year's taxable income in the same pots, after the allowance.
 	prices := make(map[string]float64, len(valByISIN))
 	for isin, val := range valByISIN {
 		if qty := qtyByISIN[isin]; qty > 0 {
 			prices[isin] = val / qty
 		}
 	}
-	lots := analytics.ComputeTaxLots(taxTxns, prices, names, equityMap)
-
-	// Sum unrealized losses per ISIN
-	type lossPos struct {
-		name string
-		loss float64
+	assetClass := make(map[string]string, len(d.secMap))
+	for isin, s := range d.secMap {
+		assetClass[isin] = s.AssetClass
 	}
-	lossByISIN := make(map[string]*lossPos)
-	for _, lot := range lots {
-		if lot.UnrealizedPL < 0 && prices[lot.ISIN] > 0 {
-			lp := lossByISIN[lot.ISIN]
-			if lp == nil {
-				lp = &lossPos{name: lot.Name}
-				lossByISIN[lot.ISIN] = lp
-			}
-			lp.loss += lot.UnrealizedPL
+	lots := analytics.ComputeTaxLots(d.taxTxns, prices, d.names, d.equity)
+	priced := lots[:0:0]
+	for _, l := range lots {
+		if prices[l.ISIN] > 0 {
+			priced = append(priced, l)
 		}
 	}
-	totalHarvestable := 0.0
-	saving := 0.0
-	for isin, lp := range lossByISIN {
-		if lp.loss < -500 {
-			absLoss := math.Abs(lp.loss)
-			totalHarvestable += absLoss
-			saving += absLoss * (1 - tfsMap[isin]) * analytics.EffectiveTaxRate
+	harvest := harvestAnalysis(priced, assetClass, d.excludedAccounts(), ytdBanks, allowance, rate)
+	if harvest.GrossLoss > 500 {
+		desc := fmt.Sprintf("%d positions are at a loss: selling them in full (FIFO order) would realise %s € of losses.", harvest.Positions, fmtEUR(harvest.GrossLoss))
+		if harvest.Positions == 1 {
+			desc = fmt.Sprintf("One position is at a loss: selling it in full (FIFO order) would realise %s € of losses.", fmtEUR(harvest.GrossLoss))
 		}
-	}
-	if totalHarvestable > 500 {
+		if harvest.Saving >= 1 {
+			desc += fmt.Sprintf(" Against this year's realised income that saves about %s € in tax.", fmtEUR(harvest.Saving))
+		} else {
+			desc += " There are no gains in the same loss pot to offset this year, so it would save no tax now."
+		}
+		if harvest.CarryForward >= 1 {
+			desc += fmt.Sprintf(" %s € would carry forward to later years (share losses only against share gains).", fmtEUR(harvest.CarryForward))
+		}
+		urgency := "action"
+		if harvest.Saving < 1 {
+			urgency = "info"
+		}
 		events = append(events, calendarEvent{
 			Month: 10, Date: fmt.Sprintf("%d-10-01", year),
 			Title:       "Tax-loss harvesting window",
-			Description: fmt.Sprintf("%s € of losses could be realised. Potential tax saving: about %s €.", fmtEUR(totalHarvestable), fmtEUR(saving)),
-			Amount:      math.Round(saving),
-			Category:    "harvest", Urgency: "action",
+			Description: desc,
+			Amount:      math.Round(harvest.Saving),
+			Category:    "harvest", Urgency: urgency,
 			ActionURL: "/analysis",
 		})
 	}
 
 	// --- 6. FSA Mid-Year Check (Jul) ---
-	// Check YTD taxable income vs FSA usage
-	ytdIncome := 0.0
-	for _, txn := range txns {
-		if txn.Date.Year() != year {
-			continue
-		}
-		if txn.Type == "dividend" || txn.Type == "interest" {
-			if txn.Amount.Valid {
-				f, _ := txn.Amount.Float64Value()
-				amtEUR := convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-				if txn.Type == "dividend" && txn.SecurityISIN.Valid {
-					amtEUR *= 1 - tfsMap[txn.SecurityISIN.String]
-				}
-				ytdIncome += amtEUR
-			}
-		}
-	}
-	monthsElapsed := float64(now.Month())
+	// Projected use of the allowance: dividends and interest annualised, realised
+	// gains (net of losses per bank) and the Vorabpauschale as they are.
+	monthsElapsed := int(now.Month())
 	if monthsElapsed >= 6 {
-		projected := ytdIncome / monthsElapsed * 12
-		if projected < analytics.Sparerpauschbetrag*0.8 {
-			unused := analytics.Sparerpauschbetrag - projected
+		projected := projectedAllowanceUse(ytdBanks, monthsElapsed)
+		if projected < allowance*0.8 {
+			unused := allowance - projected
 			events = append(events, calendarEvent{
 				Month: 7, Date: fmt.Sprintf("%d-07-01", year),
 				Title:       taxCalendarFSATitle,
-				Description: fmt.Sprintf("On course to use only %s € of the 1.000 € Sparer-Pauschbetrag (saver's allowance). About %s € would go unused.", fmtEUR(projected), fmtEUR(unused)),
-				Amount:      math.Round(unused * analytics.EffectiveTaxRate),
+				Description: fmt.Sprintf("On course to use only %s € of the %s Sparer-Pauschbetrag (saver's allowance). About %s € would go unused; realising gains before year end would use it tax-free.", fmtEUR(projected), allowanceLabel, fmtEUR(unused)),
+				Amount:      math.Round(unused * rate),
 				Category:    "fsa", Urgency: "action",
 				ActionURL: "/analysis",
 			})

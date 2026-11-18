@@ -670,3 +670,8 @@ INSERT INTO price_index_points (series, period, value) VALUES ($1, $2, $3)
 ON CONFLICT (series, period) DO UPDATE SET value = EXCLUDED.value
     WHERE price_index_points.value IS DISTINCT FROM EXCLUDED.value
 RETURNING series;
+
+-- name: DeleteNetWorthSnapshotsBefore :execrows
+-- Snapshot rebuild: nothing tracked existed before the first transaction or
+-- physical asset, so earlier rows (all-zero leftovers) are removed.
+DELETE FROM net_worth_snapshots WHERE date < $1;

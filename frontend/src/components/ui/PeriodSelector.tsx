@@ -53,14 +53,74 @@ export function periodCutoff(period: Period): Date | null {
   }
 }
 
+/** A local calendar day as "YYYY-MM-DD" (no shift to UTC). */
+export function localDateKey(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 /**
- * Filter a time-series array by period.
- * Items must have a `date` field (ISO string).
+ * The calendar day of a series point. Snapshot and price dates are days sent
+ * as UTC midnight ("2026-01-01T00:00:00Z"); comparing them as Date objects
+ * with a local cutoff drops or shifts the boundary day, so compare the
+ * "YYYY-MM-DD" prefix instead.
+ */
+export function dateKeyOf(date: string): string {
+  return date.slice(0, 10);
+}
+
+/** A "YYYY-MM-DD" key as a local Date at midnight, for display. */
+export function keyToLocalDate(key: string): Date {
+  const [y, m, d] = key.slice(0, 10).split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+/**
+ * The day whose closing value a period's change is measured from: 31 Dec of
+ * last year for YTD, otherwise the same calendar day one period ago (month
+ * ends clamped, so 31 Mar − 1M is 28/29 Feb). Null for 'All'.
+ */
+export function periodBaseKey(period: Period, now: Date = new Date()): string | null {
+  const back = (months: number) => {
+    const first = new Date(now.getFullYear(), now.getMonth() - months, 1);
+    const lastDay = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+    return localDateKey(new Date(first.getFullYear(), first.getMonth(), Math.min(now.getDate(), lastDay)));
+  };
+  switch (period) {
+    case '1M': return back(1);
+    case '3M': return back(3);
+    case '6M': return back(6);
+    case 'YTD': return `${now.getFullYear() - 1}-12-31`;
+    case '1Y': return back(12);
+    case '3Y': return back(36);
+    case 'All': return null;
+  }
+}
+
+/**
+ * Filter a time-series array by period: every point from the period's base
+ * day (see periodBaseKey) on, compared as calendar days so the boundary day
+ * is kept in every time zone. Items must have a `date` field (ISO string).
  */
 export function filterByPeriod<T extends { date: string }>(data: T[], period: Period): T[] {
-  const cutoff = periodCutoff(period);
-  if (!cutoff) return data;
-  return data.filter(item => new Date(item.date) >= cutoff);
+  const base = periodBaseKey(period);
+  if (!base) return data;
+  return data.filter(item => dateKeyOf(item.date) >= base);
+}
+
+/**
+ * The points of a newest-first series that a period covers, and the one its
+ * change is measured from: the last point on or before the base day. When
+ * the history is shorter than the period, the oldest point is the base and
+ * `truncated` is true.
+ */
+export function periodWindow<T extends { date: string }>(newestFirst: T[], period: Period, now: Date = new Date()): { points: T[]; base: T | null; truncated: boolean } {
+  if (newestFirst.length === 0) return { points: [], base: null, truncated: false };
+  const key = periodBaseKey(period, now);
+  const oldest = newestFirst[newestFirst.length - 1];
+  if (!key) return { points: newestFirst, base: oldest, truncated: false };
+  const i = newestFirst.findIndex(p => dateKeyOf(p.date) <= key);
+  if (i < 0) return { points: newestFirst, base: oldest, truncated: true };
+  return { points: newestFirst.slice(0, i + 1), base: newestFirst[i], truncated: false };
 }
 
 /**

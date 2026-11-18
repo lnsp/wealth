@@ -395,10 +395,17 @@ func (h *SettingsHandler) HandleListGoals(w http.ResponseWriter, r *http.Request
 		TargetDate          string  `json:"target_date"`
 		MonthlyContribution float64 `json:"monthly_contribution"`
 		AssumedReturnPct    float64 `json:"assumed_return_pct"`
+		FundingAccountID    *string `json:"funding_account_id"`
+		Priority            int     `json:"priority"`
 	}
 
 	var items []goalResponse
 	for _, g := range goals {
+		var fundingID *string
+		if g.FundingAccountID != nil {
+			s := g.FundingAccountID.String()
+			fundingID = &s
+		}
 		items = append(items, goalResponse{
 			ID:                  g.ID.String(),
 			Name:                g.Name,
@@ -406,6 +413,8 @@ func (h *SettingsHandler) HandleListGoals(w http.ResponseWriter, r *http.Request
 			TargetDate:          g.TargetDate.Format("2006-01-02"),
 			MonthlyContribution: numericToFloat(g.MonthlyContribution),
 			AssumedReturnPct:    numericToFloat(g.AssumedReturnPct),
+			FundingAccountID:    fundingID,
+			Priority:            goalPriority(g),
 		})
 	}
 	if items == nil {
@@ -459,7 +468,16 @@ func (h *SettingsHandler) HandleCreateGoal(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusBadRequest, "invalid funding_account_id")
 			return
 		}
+		if _, err := h.queries.GetAccount(r.Context(), parsed); err != nil {
+			writeError(w, http.StatusBadRequest, "funding_account_id: no such account")
+			return
+		}
 		fundingID = &parsed
+	}
+	// Lower numbers are funded first (10 emergency … 50 long-term).
+	if req.Priority < 0 || req.Priority > 100 {
+		writeError(w, http.StatusBadRequest, "priority must be between 1 and 100")
+		return
 	}
 	priority := int32(req.Priority)
 	if priority == 0 {

@@ -479,7 +479,12 @@ export default function Portfolio() {
   const healthScore = useLoad<HealthScore>(() => api.getHealthScore());
   const savingsPlans = useLoad<SavingsPlans>(() => api.getSavingsPlans());
   const securities = useLoad<Security[]>(() => api.listSecurities().then(r => r.securities || []));
-  const goals = useLoad<GoalProgress[]>(() => api.listGoals().then(r => r.goals || []));
+  // /portfolio/goals carries progress, status and projection; /settings/goals is the bare list.
+  const goals = useLoad<GoalProgress[]>(() => api.getGoalsProgress().then(r => r.goals || []));
+  // Every account (cash included) can fund a goal.
+  const goalAccounts = useLoad<Account[]>(() => api.listAccounts().then(r => r.accounts || []));
+  const [goalFunding, setGoalFunding] = useState('');
+  const [goalPriority, setGoalPriority] = useState(50);
   const alerts = useLoad<PriceAlertEntry[]>(() => api.listAlerts().then(r => r.alerts || []));
   const notifications = useLoad<NotificationEntry[]>(() => api.listNotifications().then(r => r.notifications || []));
 
@@ -1241,8 +1246,9 @@ export default function Portfolio() {
     api.createGoal({
       name: goalName, target_amount: goalTarget, target_date: goalDate,
       monthly_contribution: goalContrib || 0, assumed_return_pct: goalReturn || 7,
+      funding_account_id: goalFunding || undefined, priority: goalPriority,
     })
-      .then(() => { setGoalName(''); setGoalTarget(0); setGoalDate(''); setGoalContrib(0); goals.reload(); })
+      .then(() => { setGoalName(''); setGoalTarget(0); setGoalDate(''); setGoalContrib(0); setGoalFunding(''); setGoalPriority(50); goals.reload(); })
       .catch((e: Error) => setGoalError(e.message || 'Request failed'));
   };
   const deleteGoal = async (g: GoalProgress) => {
@@ -1265,7 +1271,7 @@ export default function Portfolio() {
     api.deleteAlert(a.id).then(() => alerts.reload()).catch((e: Error) => setAlertError(e.message || 'Request failed'));
   };
 
-  const goalStatusTone = (s: GoalProgress['status']) => (s === 'behind' ? 'warning' as const : 'success' as const);
+  const goalStatusTone = (s: GoalProgress['status']) => (s === 'behind' ? 'danger' as const : s === 'at_risk' ? 'warning' as const : s === 'on_track' ? 'info' as const : 'success' as const);
   const alertName = (a: PriceAlertEntry) => (a.alert_type === 'portfolio_milestone' ? 'Net worth' : (a.security_name || a.security_isin || 'Unknown security'));
   const alertCondition = (a: PriceAlertEntry): ReactNode => {
     switch (a.alert_type) {
@@ -1280,7 +1286,7 @@ export default function Portfolio() {
   const renderGoals = () => {
     const list = goals.data || [];
     return (
-      <Section title="Financial Goals" first subtitle="A target amount and date; progress is measured against your current net worth.">
+      <Section title="Financial Goals" first subtitle="A target amount and date. Progress counts the balance of the goal’s funding account, or else a share of liquid wealth (cash and securities outside pension accounts) handed out in priority order, so no euro counts twice.">
         {goals.loading && !goals.data ? <LoadingState lines={3} />
           : goals.error && !goals.data ? <ErrorState message="Goals couldn’t be loaded." details={goals.error} onRetry={goals.reload} />
           : list.length === 0 ? <EmptyState title="No goals yet" message="Add a target amount and date below to track your progress towards it." />
@@ -1297,6 +1303,9 @@ export default function Portfolio() {
                       <p className="text-[13px] text-ink-body mt-0.5">
                         <Money>{fmtEUR(g.target_amount)}</Money> by {fmtDateLong(g.target_date)}
                         {g.monthly_contribution > 0 && <> · <Money>{fmtEUR(g.monthly_contribution)}</Money> per month</>}
+                        {' · from '}{g.funding_source === 'account'
+                          ? ((goalAccounts.data || []).find(a => a.id === g.funding_account_id)?.name ?? 'its funding account')
+                          : 'liquid wealth'}
                       </p>
                     </div>
                     <button type="button" className="apple-btn-danger apple-btn-sm min-h-[44px] md:min-h-[36px]" onClick={() => deleteGoal(g)} aria-label={`Delete goal ${g.name}…`}>Delete…</button>
@@ -1318,6 +1327,17 @@ export default function Portfolio() {
             <Field label="Target date" type="date" value={goalDate} onChange={e => setGoalDate(e.target.value)} />
             <NumberField label="Monthly contribution" unit="€ / month" value={goalContrib} onValueChange={v => setGoalContrib(Math.max(0, v))} hint="Optional." />
             <NumberField label="Assumed return" unit="% / year" value={goalReturn} onValueChange={setGoalReturn} hint="Used to project whether you are on track." />
+            <SelectField label="Funded from" value={goalFunding} onChange={e => setGoalFunding(e.target.value)} hint="Progress counts this account’s balance.">
+              <option value="">Liquid wealth (no single account)</option>
+              {(goalAccounts.data || []).map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </SelectField>
+            <SelectField label="Priority" value={String(goalPriority)} onChange={e => setGoalPriority(parseInt(e.target.value, 10) || 50)} hint="Higher priorities are funded first.">
+              <option value="10">Emergency</option>
+              <option value="20">Employer match</option>
+              <option value="30">Debt payoff</option>
+              <option value="40">Time-sensitive</option>
+              <option value="50">Long-term</option>
+            </SelectField>
           </div>
           {goalError && <div className="mt-4"><ErrorState message="That didn’t work. Nothing was changed." details={goalError} /></div>}
           <div className="mt-4 flex flex-wrap items-center gap-3">

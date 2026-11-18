@@ -698,6 +698,20 @@ func (q *Queries) DeleteLoanPaymentLinksForLoan(ctx context.Context, loanID uuid
 	return items, nil
 }
 
+const deleteNetWorthSnapshotsBefore = `-- name: DeleteNetWorthSnapshotsBefore :execrows
+DELETE FROM net_worth_snapshots WHERE date < $1
+`
+
+// Snapshot rebuild: nothing tracked existed before the first transaction or
+// physical asset, so earlier rows (all-zero leftovers) are removed.
+func (q *Queries) DeleteNetWorthSnapshotsBefore(ctx context.Context, date time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteNetWorthSnapshotsBefore, date)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteNotificationChannel = `-- name: DeleteNotificationChannel :exec
 DELETE FROM notification_channels WHERE id = $1
 `

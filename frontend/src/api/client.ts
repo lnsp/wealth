@@ -688,10 +688,33 @@ export interface GoalProgress {
   projected_value: number;
   monthly_contribution: number;
   assumed_return_pct: number;
-  status: 'on_track' | 'behind' | 'complete' | 'ahead';
+  /** Projection at the target date: ahead ≥ 110 %, on_track ≥ 100 %, at_risk ≥ 80 % of target. */
+  status: 'on_track' | 'at_risk' | 'behind' | 'complete' | 'ahead';
   months_remaining: number;
   funding_account_id: string | null;
   priority: number;
+  /** What current_value measures (/portfolio/goals only): the funding account, or a share of liquid wealth. */
+  funding_source?: 'account' | 'liquid';
+  /** Month ("YYYY-MM") the projection first reaches the target; empty if reached or never (/portfolio/goals only). */
+  estimated_date?: string;
+}
+
+/** /portfolio/attribution: the change between the two latest net-worth snapshots. */
+export interface DailyAttribution {
+  contributions: { isin: string; name: string; change: number }[];
+  /** Market move on held securities (price and FX) — same as market_change. */
+  total_change: number;
+  summary: string;
+  market_change?: number;
+  /** Deposits and RSU vests minus withdrawals dated between the snapshots. */
+  flows?: number;
+  /** Dividends and interest minus fees and taxes dated between the snapshots. */
+  income?: number;
+  /** The rest: FX on foreign cash, property revaluation, loan steps. */
+  other?: number;
+  net_change?: number;
+  from_date?: string;
+  to_date?: string;
 }
 
 export interface PasskeyEntry {
@@ -839,7 +862,7 @@ export const api = {
 
   getUnvested: () => request<UnvestedResponse>('/portfolio/unvested'),
 
-  getAttribution: () => request<{ contributions: { isin: string; name: string; change: number }[]; total_change: number; summary: string }>('/portfolio/attribution'),
+  getAttribution: () => request<DailyAttribution>('/portfolio/attribution'),
   getSavingsPlans: () => request<{ plans: { isin: string; name: string; monthly_amount: number; executions: number; total_invested: number; total_shares: number; avg_cost_basis: number; first_date: string; last_date: string; months_active: number; current_value: number; dca_return_pct: number; lump_sum_value: number; lump_sum_return_pct: number; dca_advantage_eur: number }[]; total_monthly: number; plan_count: number }>('/portfolio/savings-plans'),
   getSecurityDetail: (isin: string) => request<{
     isin: string; name: string; symbol: string; asset_class: string; ter: number; price: number;
@@ -874,7 +897,7 @@ export const api = {
     const qs = params.toString();
     return request<ProjectionData>(`/portfolio/projection${qs ? `?${qs}` : ''}`);
   },
-  createGoal: (data: { name: string; target_amount: number; target_date: string; monthly_contribution?: number; assumed_return_pct?: number }) =>
+  createGoal: (data: { name: string; target_amount: number; target_date: string; monthly_contribution?: number; assumed_return_pct?: number; funding_account_id?: string; priority?: number }) =>
     request<{ id: string; name: string }>('/settings/goals', { method: 'POST', body: JSON.stringify(data) }),
   deleteGoal: (id: string) =>
     request<{ status: string }>(`/settings/goals/${id}`, { method: 'DELETE' }),

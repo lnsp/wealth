@@ -1,15 +1,16 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { ReactNode } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { api, type Account, type HoldingRow, type NetWorthSnapshot, type GoalProgress, type ProjectionData } from '../api/client';
+import { api, type Account, type HoldingRow, type NetWorthSnapshot, type GoalProgress, type ProjectionData, type DailyAttribution } from '../api/client';
 import EChartWrapper from '../components/charts/EChartWrapper';
-import AccountCard, { institutionLabel } from '../components/AccountCard';
+import AccountCard, { institutionLabel, depositProtection, DEPOSIT_INSURANCE_LIMIT, DEPOSIT_INSURANCE_NEAR } from '../components/AccountCard';
 import {
   PageHeader, TabBar, TabPanel, useTabParam, Section, SubHeading, MetricCard, MetricGrid,
-  PeriodSelector, periodCutoff, formatDateForPeriod, LoadingState, ErrorState, EmptyState,
+  PeriodSelector, periodCutoff, filterByPeriod, formatDateForPeriod, LoadingState, ErrorState, EmptyState,
   SectionBoundary, useConfirm, Chip, RankedBars, ProgressBar,
 } from '../components/ui';
 import type { Period } from '../components/ui';
+import { periodWindow, dateKeyOf, localDateKey, keyToLocalDate } from '../components/ui/PeriodSelector';
 import { useThemeColors } from '../hooks/useThemeColors';
 import { useMarketRefresh } from '../hooks/useMarketRefresh';
 import UnvestedPanel from '../components/UnvestedPanel';
@@ -39,9 +40,9 @@ const PERIOD_PHRASE: Record<Period, string> = {
 /** Where the full list of alerts lives (Portfolio → Goals & Alerts). */
 const ALERTS_HREF = '/portfolio?tab=goals';
 
-interface NextAction { title: string; detail: string; impact_eur: number; urgency: string; category: string; link: string }
+interface NextAction { title: string; detail: string; impact_eur: number; impact_kind?: 'saving' | 'cost' | ''; urgency: string; category: string; link: string }
 interface WaterfallBar { label: string; value: number; type: string }
-interface AttributionMonth { month: string; contributions: number; market_return: number; dividends: number; interest: number; assets?: number; property_costs?: number; total: number }
+interface AttributionMonth { month: string; contributions: number; market_return: number; dividends: number; interest: number; assets?: number; property_costs?: number; fees?: number; taxes?: number; total: number }
 interface WaterfallData {
   waterfall: WaterfallBar[];
   time_series: AttributionMonth[];
@@ -55,6 +56,43 @@ type LoadStatus = 'loading' | 'ready' | 'error';
 
 const toneCls = (n: number) => (n > 0 ? 'text-sage' : n < 0 ? 'text-claret' : 'text-ink');
 const monthDate = (m: string) => (m.length === 7 ? `${m}-01` : m);
+
+/**
+ * Liquid wealth: cash and securities in every account except pension
+ * accounts and the legacy property / liability account types. The same rule
+ * as the backend's isLiquidAccountType, which funds goals without an account.
+ */
+const isLiquidAccountType = (type: string) => !['pension', 'real_estate', 'liability'].includes(type);
+
+/** Holdings asset classes counted as equities (allocation, glide path). */
+const EQUITY_CLASSES = new Set(['etf', 'stock', 'fund']);
+
+/** Mon–Fri for a "YYYY-MM-DD" day, independent of the browser's time zone. */
+const isWeekdayKey = (date: string) => {
+  const day = new Date(`${dateKeyOf(date)}T00:00:00Z`).getUTCDay();
+  return day !== 0 && day !== 6;
+};
+
+/** Drops the all-zero snapshots older than the first real one (newest-first input). */
+function trimLeadingZeroSnapshots(newestFirst: NetWorthSnapshot[]): NetWorthSnapshot[] {
+  const isZero = (s: NetWorthSnapshot) => !s.total && !s.cash_component && !s.investment_component && !s.physical_component && !s.debt_component;
+  let end = newestFirst.length;
+  while (end > 1 && isZero(newestFirst[end - 1])) end--;
+  return end === newestFirst.length ? newestFirst : newestFirst.slice(0, end);
+}
+
+/**
+ * Extra monthly saving that closes a shortfall by the target date when each
+ * payment earns the goal's return: shortfall · r / ((1 + r)^n − 1), with r
+ * the monthly rate. 10,000 € over 48 months at 5 % a year → 189.05 € (not
+ * 10,000 / 48 = 208.33 €).
+ */
+function monthlyTopUp(shortfall: number, months: number, annualReturnPct: number): number {
+  if (shortfall <= 0 || months <= 0) return 0;
+  const r = Math.pow(1 + annualReturnPct / 100, 1 / 12) - 1;
+  if (Math.abs(r) < 1e-9) return shortfall / months;
+  return (shortfall * r) / (Math.pow(1 + r, months) - 1);
+}
 /** "1 year 7 months", "7 months", "2 years". */
 function fmtDuration(months: number): string {
   const y = Math.floor(months / 12);
@@ -126,8 +164,11 @@ interface PeriodAttribution {
   startContrib: number;
 }
 
+// "Market and FX": the market figure is the residual after every named cause,
+// so it also carries currency moves on foreign cash. Fees and taxes are
+// separate both for the whole history and for a period.
 const WATERFALL_LABELS: Record<string, string> = {
-  'Market Returns': 'Market returns',
+  'Market Returns': 'Market and FX',
   'Physical Assets': 'Property and vehicles',
   'Purchase Costs': 'Purchase costs',
   'Loan Interest': 'Loan interest',
@@ -164,9 +205,10 @@ function computeAttribution(wf: WaterfallData | null, period: Period): PeriodAtt
   const market = d(m => m.market_return);
   const causes: Cause[] = [
     { label: 'Contributions', value: d(m => m.contributions) },
-    { label: 'Market returns', value: market },
+    { label: 'Market and FX', value: market },
     { label: 'Dividends', value: d(m => m.dividends) },
     { label: 'Interest', value: d(m => m.interest) },
+    { label: 'Fees and taxes', value: d(m => (m.fees ?? 0) + (m.taxes ?? 0)) },
     { label: 'Property and vehicles', value: d(m => m.assets ?? 0) },
     { label: 'Purchase costs and loan interest', value: d(m => m.property_costs ?? 0) },
   ].filter(c => Math.abs(c.value) >= 1);
@@ -191,10 +233,9 @@ export default function NetWorth() {
   const [actionsStatus, setActionsStatus] = useState<LoadStatus>('loading');
   const [unreadAlerts, setUnreadAlerts] = useState(0);
   const [jobErrors, setJobErrors] = useState(0);
-  const [attribution, setAttribution] = useState('');
-  // total_change from /api/portfolio/attribution — market-only price delta on held
-  // shares. Shown next to today's change so the gap (cash flows) is named.
-  const [attributionTotal, setAttributionTotal] = useState<number | null>(null);
+  // /api/portfolio/attribution: the latest snapshot change split into market,
+  // flows, income and the rest, plus the sentence naming the top movers.
+  const [attribution, setAttribution] = useState<DailyAttribution | null>(null);
   const [showAttribution, setShowAttribution] = useState(false);
   const [wfData, setWfData] = useState<WaterfallData | null>(null);
   const [wfStatus, setWfStatus] = useState<LoadStatus>('loading');
@@ -244,7 +285,14 @@ export default function NetWorth() {
 
   const loadActions = useCallback(() => {
     setActionsStatus('loading');
-    fetch('/api/portfolio/next-actions')
+    // Tax settings chosen on the Tax page (church tax, joint filing) size the tax actions.
+    const qs = new URLSearchParams();
+    try {
+      const church = parseFloat(localStorage.getItem('church_tax_rate') || '0');
+      if (church > 0) qs.set('church_tax', String(church));
+      if (localStorage.getItem('fsa_joint') === '1') qs.set('joint', '1');
+    } catch { /* storage unavailable: defaults */ }
+    fetch(`/api/portfolio/next-actions${qs.toString() ? `?${qs}` : ''}`)
       .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(d => { setNextActions(d.actions || []); setActionsStatus('ready'); })
       .catch(() => setActionsStatus('error'));
@@ -275,7 +323,7 @@ export default function NetWorth() {
   useEffect(() => {
     api.getGoalsProgress().then(r => setGoals(r.goals || [])).catch(() => {});
     api.listNotifications().then(r => setUnreadAlerts(r.unread_count)).catch(() => {});
-    api.getAttribution().then(r => { setAttribution(r.summary); setAttributionTotal(r.total_change ?? null); }).catch(() => {});
+    api.getAttribution().then(setAttribution).catch(() => {});
     fetch('/api/settings/scheduler-status')
       .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(d => setJobErrors((d.jobs || []).filter((j: { status: string }) => j.status === 'error').length))
@@ -285,16 +333,22 @@ export default function NetWorth() {
   }, [loadWaterfall, loadActions]);
 
   const totalNetWorth = allSnapshots.length > 0 ? allSnapshots[0].total : 0;
+  // Charts and period changes start at the first real snapshot, not at
+  // all-zero rows from before anything was tracked.
+  const seriesSnapshots = useMemo(() => trimLeadingZeroSnapshots(allSnapshots), [allSnapshots]);
 
   // The hero follows the Overview period. Tabs without a period control show a fixed year.
+  // The change is measured from the last snapshot on or before the period's
+  // base day (31 Dec for YTD), compared as calendar days.
   const heroPeriod: Period = activeTab === 'overview' ? period : '1Y';
-  const periodSnapshots = useMemo(() => {
-    const cutoff = periodCutoff(heroPeriod);
-    return cutoff ? allSnapshots.filter(s => new Date(s.date) >= cutoff) : allSnapshots;
-  }, [allSnapshots, heroPeriod]);
-  const periodStart = periodSnapshots.length > 1 ? periodSnapshots[periodSnapshots.length - 1].total : totalNetWorth;
+  const { points: periodSnapshots, base: periodBase, truncated: periodTruncated } = useMemo(
+    () => periodWindow(seriesSnapshots, heroPeriod), [seriesSnapshots, heroPeriod]);
+  const periodStart = periodSnapshots.length > 1 && periodBase ? periodBase.total : totalNetWorth;
   const change = totalNetWorth - periodStart;
   const changePct = periodStart !== 0 ? (change / periodStart) * 100 : 0;
+  const periodPhrase = periodTruncated && periodBase
+    ? `since ${fmtDateLong(keyToLocalDate(dateKeyOf(periodBase.date)))}`
+    : PERIOD_PHRASE[period];
 
   // Daily change: against the most recent snapshot from a previous day
   const { dailyChange, dailyPrev, dailyChangePct } = useMemo(() => {
@@ -307,11 +361,10 @@ export default function NetWorth() {
     return { dailyChange: dc, dailyPrev: dp, dailyChangePct: dp !== 0 ? (dc / dp) * 100 : 0 };
   }, [allSnapshots, totalNetWorth]);
 
-  // Sparkline: weekday snapshots of the hero period, oldest first
-  const sparkSnapshots = useMemo(() => {
-    const isWeekday = (d: string) => { const day = new Date(d).getDay(); return day !== 0 && day !== 6; };
-    return periodSnapshots.filter(s => isWeekday(s.date)).reverse();
-  }, [periodSnapshots]);
+  // Sparkline: weekday snapshots of the hero period plus its base, oldest first
+  const sparkSnapshots = useMemo(
+    () => periodSnapshots.filter((s, i) => i === periodSnapshots.length - 1 || isWeekdayKey(s.date)).reverse(),
+    [periodSnapshots]);
 
   if (loading) {
     return (
@@ -354,11 +407,24 @@ export default function NetWorth() {
     );
   }
 
-  const snapshotDate = new Date(allSnapshots[0].date);
-  const daysOld = Math.max(0, Math.floor((Date.now() - snapshotDate.getTime()) / (1000 * 60 * 60 * 24)));
-  const market = attributionTotal ?? 0;
-  const otherToday = dailyChange - market;
-  const showTodayGap = attributionTotal !== null && Math.abs(otherToday) >= 1;
+  const latestKey = dateKeyOf(allSnapshots[0].date);
+  const snapshotDate = keyToLocalDate(latestKey);
+  const todayMidnight = keyToLocalDate(localDateKey(new Date()));
+  const daysOld = Math.max(0, Math.round((todayMidnight.getTime() - snapshotDate.getTime()) / (1000 * 60 * 60 * 24)));
+  // The daily change is the latest snapshot against the one before; call it
+  // "today" only when the latest snapshot is today's.
+  const dayLabel = latestKey === localDateKey(new Date()) ? 'today' : `on ${fmtDateLong(snapshotDate)}`;
+  // The backend splits the same snapshot change; every part is a real
+  // measurement except "other", which is what remains.
+  const dayParts = attribution && attribution.to_date === latestKey
+    ? [
+      { label: 'Market', value: attribution.market_change ?? attribution.total_change },
+      { label: 'Deposits and withdrawals', value: attribution.flows ?? 0 },
+      { label: 'Dividends and interest, after fees and taxes', value: attribution.income ?? 0 },
+      { label: 'Other (FX, property, loans)', value: attribution.other ?? 0 },
+    ].filter(p => Math.abs(p.value) >= 1)
+    : [];
+  const hasExplanation = !!attribution && (!!attribution.summary || dayParts.length > 0);
 
   return (
     <div>
@@ -392,7 +458,7 @@ export default function NetWorth() {
               {change !== 0 && <span aria-hidden="true" className="mr-1">{change > 0 ? '▲' : '▼'}</span>}
               <span data-privacy="blur">{fmtEUR(change, { sign: true })}</span>
               {periodStart >= 100 && <> ({fmtPct(changePct, { sign: true })})</>}
-              {' '}<span>{PERIOD_PHRASE[period]}</span>
+              {' '}<span>{periodPhrase}</span>
             </p>
           )}
 
@@ -404,8 +470,8 @@ export default function NetWorth() {
                 <span data-privacy="blur">{fmtEUR(dailyChange, { sign: true })}</span>
                 {dailyPrev >= 100 && <> ({fmtPct(dailyChangePct, { sign: true, digits: 2 })})</>}
               </span>
-              <span>today</span>
-              {attribution && (
+              <span>{dayLabel}</span>
+              {hasExplanation && (
                 <button
                   type="button"
                   onClick={() => setShowAttribution(prev => !prev)}
@@ -417,14 +483,17 @@ export default function NetWorth() {
               )}
             </p>
           )}
-          {showAttribution && attribution && (
+          {showAttribution && attribution && hasExplanation && (
             <div className="mt-1 max-w-xl space-y-0.5 text-[13px] text-ink-muted">
-              <p>{attribution}</p>
-              {showTodayGap && (
+              {attribution.summary && <p>{attribution.summary}</p>}
+              {dayParts.length > 0 && (
                 <p>
-                  Market <span data-privacy="blur">{fmtEUR(market, { sign: true })}</span>
-                  {' · '}
-                  Cash flow today <span data-privacy="blur">{fmtEUR(otherToday, { sign: true })}</span>
+                  {dayParts.map((p, i) => (
+                    <span key={p.label}>
+                      {i > 0 && ' · '}
+                      {p.label} <span data-privacy="blur">{fmtEUR(p.value, { sign: true })}</span>
+                    </span>
+                  ))}
                 </p>
               )}
             </div>
@@ -463,7 +532,7 @@ export default function NetWorth() {
             />
           )}
           {activeTab === 'projection' && <ProjectionTab />}
-          {activeTab === 'accounts' && <AccountsTab accounts={accounts} allSnapshots={allSnapshots} />}
+          {activeTab === 'accounts' && <AccountsTab accounts={accounts} allSnapshots={seriesSnapshots} />}
           {activeTab === 'assets' && <AssetsTab onNetWorthChanged={loadData} snapshotNetWorth={totalNetWorth} />}
         </SectionBoundary>
       </TabPanel>
@@ -564,12 +633,12 @@ function OverviewTab({
   const physicalDebt = snapshot.debt_component ?? 0;
   const grossAssets = totalNetWorth + physicalDebt;
 
-  // Liquid wealth: every account except property, pension and liability accounts.
-  const illiquidTypes = new Set(['real_estate', 'pension', 'liability']);
-  const liquidAccounts = accounts.filter(a => !illiquidTypes.has(a.type));
+  // Liquid wealth (isLiquidAccountType): cash and securities outside pension
+  // accounts. Goals without a funding account draw on this same amount. The
+  // Projection tab starts from investable wealth instead, which includes pension.
+  const liquidAccounts = accounts.filter(a => isLiquidAccountType(a.type));
   const liquidNetWorth = liquidAccounts.reduce((sum, a) => sum + (a.balance ?? 0), 0);
-  const onlySecuritiesAndCash = liquidAccounts.every(a => ['brokerage', 'checking', 'savings'].includes(a.type));
-  const illiquidAccounts = accounts.filter(a => illiquidTypes.has(a.type));
+  const illiquidAccounts = accounts.filter(a => !isLiquidAccountType(a.type));
   const illiquidBalance = illiquidAccounts.reduce((sum, a) => sum + (a.balance ?? 0), 0);
 
   const attr = useMemo(() => computeAttribution(wfData, period), [wfData, period]);
@@ -583,7 +652,7 @@ function OverviewTab({
       </div>
 
       <MetricGrid className="mt-5">
-        <MetricCard label="Liquid wealth" value={fmtEUR(liquidNetWorth)} sublabel={onlySecuritiesAndCash ? 'Securities and cash' : 'Securities, cash and other liquid accounts'} />
+        <MetricCard label="Liquid wealth" value={fmtEUR(liquidNetWorth)} sublabel="Cash and securities, pension accounts excluded" />
         {physicalValue > 0 && (
           <MetricCard label="Property and vehicles" value={fmtEUR(physicalValue)} sublabel="At current valuation" />
         )}
@@ -600,7 +669,7 @@ function OverviewTab({
           tone={attr ? (attr.market > 0 ? 'positive' : attr.market < 0 ? 'negative' : 'neutral') : 'neutral'}
           money={!!attr}
           sublabel={attr
-            ? `Securities only, ${attr.fromZero ? 'since tracking began' : `since ${fmtMonthShort(monthDate(attr.startMonth as string))}`}`
+            ? `Market and FX, before fees and taxes, ${attr.fromZero ? 'since tracking began' : `since ${fmtMonthShort(monthDate(attr.startMonth as string))}`}`
             : wfStatus === 'loading' ? 'Loading…' : 'Not available'}
         />
       </MetricGrid>
@@ -642,7 +711,7 @@ function OverviewTab({
 
       {goals.length > 0 && (
         <SectionBoundary>
-          <GoalsSections goals={goals} accounts={accounts} />
+          <GoalsSections goals={goals} accounts={accounts} holdings={holdings} />
         </SectionBoundary>
       )}
     </>
@@ -701,7 +770,10 @@ function RecommendedActions({ actions, status, onRetry, unreadAlerts, jobErrors 
                 <div className="flex-1 basis-60 min-w-0">
                   <p className="text-[14px] font-medium text-ink break-words">{a.title}</p>
                   {a.detail && <p className="text-[13px] text-ink-muted break-words">{a.detail}</p>}
-                  {a.impact_eur > 0 && (
+                  {a.impact_eur > 0 && a.impact_kind === 'cost' && (
+                    <p className="text-[13px] text-amber">Costs about <span data-privacy="blur">{fmtEUR(a.impact_eur)}</span></p>
+                  )}
+                  {a.impact_eur > 0 && a.impact_kind !== 'cost' && (
                     <p className="text-[13px] text-sage">Worth about <span data-privacy="blur">{fmtEUR(a.impact_eur, { sign: true })}</span></p>
                   )}
                 </div>
@@ -741,7 +813,7 @@ function AttributionSection({ attr, status, onRetry, period }: { attr: PeriodAtt
       <>
         Net worth {attr.net >= 0 ? 'rose' : 'fell'} from <span data-privacy="blur">{fmtEUR(attr.startNW)}</span> to <span data-privacy="blur">{fmtEUR(attr.endNW)}</span> between
         the end of {fmtMonth(monthDate(attr.startMonth as string))} and {fmtMonth(monthDate(attr.endMonth))}. Each bar is one cause, drawn from zero.
-        Causes are tracked per month, so the start is the month end closest to the selected period; fees and taxes are part of market returns here.
+        Causes are tracked per month, so the start is the month end closest to the selected period. Market and FX is what remains after the other causes, so it includes currency moves on foreign cash.
       </>
     );
   }
@@ -902,12 +974,12 @@ function GrowthSection({ attr, status, onRetry, crossoverMonth }: { attr: Period
 /* ─────────────────────────────── Asset allocation ─────────────────────────────── */
 
 function AllocationSection({ accounts, holdings, physicalValue }: { accounts: Account[]; holdings: HoldingRow[]; physicalValue: number }) {
-  // Holdings-aware bins: brokerage cash is split from securities, securities are
-  // binned by asset class, other accounts by account type.
-  const classLabelByType: Record<string, string> = {
-    checking: 'Cash', savings: 'Cash',
-    real_estate: 'Real estate', pension: 'Pension', precious_metals: 'Gold',
-    liability: 'Liabilities', credit: 'Credit',
+  // Holdings-aware bins: every account contributes only its cash (by account
+  // type), and every holding — in any account — is binned once by asset
+  // class. An account's `balance` already includes its holdings, so adding it
+  // as well would count pension, crypto and gold securities twice.
+  const cashLabelByType: Record<string, string> = {
+    real_estate: 'Real estate', pension: 'Pension', liability: 'Liabilities', credit: 'Credit',
   };
   const assetClassLabels: Record<string, string> = {
     etf: 'Equities', stock: 'Equities', fund: 'Equities',
@@ -920,11 +992,7 @@ function AllocationSection({ accounts, holdings, physicalValue }: { accounts: Ac
     byClass[label] = (byClass[label] || 0) + value;
   };
   for (const acc of accounts) {
-    if (acc.type === 'brokerage') {
-      add('Cash', acc.cash_balance ?? 0);
-      continue;
-    }
-    add(classLabelByType[acc.type] || 'Other', acc.balance ?? 0);
+    add(cashLabelByType[acc.type] || 'Cash', acc.cash_balance ?? 0);
   }
   // value_eur falls back to cost basis for unpriced positions, matching account balances.
   for (const h of holdings) {
@@ -974,11 +1042,11 @@ function AllocationSection({ accounts, holdings, physicalValue }: { accounts: Ac
 /* ───────────────────────────── Counterparty exposure ───────────────────────────── */
 
 function CounterpartySection({ accounts }: { accounts: Account[] }) {
-  const institutions: Record<string, { cash: number; securities: number; scheme: string }> = {};
+  const institutions: Record<string, { cash: number; securities: number }> = {};
   accounts.forEach(a => {
     const inst = a.institution;
     if (!institutions[inst]) {
-      institutions[inst] = { cash: 0, securities: 0, scheme: inst === 'sparkasse' ? 'Institutssicherung' : 'Einlagensicherung' };
+      institutions[inst] = { cash: 0, securities: 0 };
     }
     if (a.type === 'checking' || a.type === 'savings') {
       institutions[inst].cash += a.balance ?? 0;
@@ -989,14 +1057,15 @@ function CounterpartySection({ accounts }: { accounts: Account[] }) {
   });
   const rows = Object.entries(institutions)
     .map(([inst, d]) => {
-      const pct = d.cash / 100_000 * 100;
+      const p = depositProtection(inst, d.cash);
       return {
         inst,
         name: institutionLabel(inst),
         cash: d.cash,
         securities: d.securities,
         exposure: d.cash + d.securities,
-        status: pct >= 100 ? 'over' as const : pct >= 80 ? 'near' as const : 'ok' as const,
+        scheme: p.scheme,
+        status: p.status,
       };
     })
     .filter(r => Math.abs(r.exposure) >= 0.005)
@@ -1007,7 +1076,8 @@ function CounterpartySection({ accounts }: { accounts: Account[] }) {
   const protection = (r: typeof rows[number]) => (
     <span className="flex flex-col items-start gap-1.5">
       {r.securities > 0 && <Chip>Segregated assets</Chip>}
-      {r.cash > 0 && (
+      {r.cash > 0 && r.status === 'other' && <Chip>Cash under {r.scheme} (US)</Chip>}
+      {r.cash > 0 && r.status !== 'other' && (
         <Chip tone={r.status === 'over' ? 'danger' : r.status === 'near' ? 'warning' : 'success'}>
           {r.status === 'over' ? 'Deposits over limit' : r.status === 'near' ? 'Deposits near limit' : 'Deposits insured'}
         </Chip>
@@ -1070,8 +1140,9 @@ function CounterpartySection({ accounts }: { accounts: Account[] }) {
           </div>
           <p className="text-[12px] text-ink-muted mt-2.5">
             Securities in a brokerage account are Sondervermögen (segregated assets) and stay yours if the institution fails.
-            Cash is covered by statutory deposit insurance (Einlagensicherung; at savings banks, Institutssicherung) up to {fmtEUR(100_000)} per institution;
-            “near limit” starts at 80 % of that.
+            Cash is covered by statutory deposit insurance (Einlagensicherung; at savings banks, Institutssicherung) up to {fmtEUR(DEPOSIT_INSURANCE_LIMIT)} per institution;
+            “near limit” starts at {fmtEUR(DEPOSIT_INSURANCE_NEAR)}.
+            {rows.some(r => r.status === 'other' && r.cash > 0) && ' Cash at a US broker such as Morgan Stanley is protected by SIPC (up to US$ 250,000 against the broker failing), not by EU deposit insurance.'}
           </p>
         </>
       )}
@@ -1083,19 +1154,27 @@ function CounterpartySection({ accounts }: { accounts: Account[] }) {
 
 function ConcentrationSection({ holdings, totalNetWorth }: { holdings: HoldingRow[]; totalNetWorth: number }) {
   if (holdings.length === 0 || totalNetWorth <= 0) return null;
-  // Any holding above 10 % of net worth; critical beyond 25 %.
-  const concentrated = holdings
-    .filter(h => h.market_value != null && h.market_value > 0 && (h.market_value / totalNetWorth) > 0.10)
-    .map(h => ({
-      name: h.name || h.security_isin,
-      value: h.market_value as number,
-      pct: ((h.market_value as number) / totalNetWorth) * 100,
-      critical: ((h.market_value as number) / totalNetWorth) > 0.25,
+  // Any security above 10 % of net worth; critical beyond 25 %. Rows are per
+  // account, so the same ISIN held at two brokers is summed first.
+  const byISIN = new Map<string, { name: string; value: number }>();
+  for (const h of holdings) {
+    const value = h.value_eur ?? h.market_value ?? 0;
+    const cur = byISIN.get(h.security_isin) ?? { name: h.name || h.security_isin, value: 0 };
+    cur.value += value;
+    byISIN.set(h.security_isin, cur);
+  }
+  const concentrated = [...byISIN.values()]
+    .filter(s => s.value > 0 && s.value / totalNetWorth > 0.10)
+    .map(s => ({
+      name: s.name,
+      value: s.value,
+      pct: (s.value / totalNetWorth) * 100,
+      critical: s.value / totalNetWorth > 0.25,
     }))
     .sort((a, b) => b.pct - a.pct);
   if (concentrated.length === 0) return null;
   return (
-    <Section title="Concentration Risk" subtitle="Single holdings above 10 % of net worth; critical above 25 %.">
+    <Section title="Concentration Risk" subtitle="Single securities above 10 % of net worth, summed across accounts; critical above 25 %.">
       <ul className="flex flex-col gap-2.5">
         {concentrated.map((c, i) => (
           <li key={i} className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-apple border border-divider bg-inset px-4 py-3">
@@ -1113,28 +1192,49 @@ function ConcentrationSection({ holdings, totalNetWorth }: { holdings: HoldingRo
 
 /* ──────────────────────────────────── Goals ──────────────────────────────────── */
 
-const GOAL_STATUS: Record<GoalProgress['status'], { label: string; tone: 'success' | 'info' | 'warning' }> = {
+const GOAL_STATUS: Record<GoalProgress['status'], { label: string; tone: 'success' | 'info' | 'warning' | 'danger' }> = {
   complete: { label: 'Complete', tone: 'success' },
   ahead: { label: 'Ahead', tone: 'success' },
   on_track: { label: 'On track', tone: 'info' },
-  behind: { label: 'Behind', tone: 'warning' },
+  at_risk: { label: 'At risk', tone: 'warning' },
+  behind: { label: 'Behind', tone: 'danger' },
 };
 
-function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: Account[] }) {
+function GoalsSections({ goals, accounts, holdings }: { goals: GoalProgress[]; accounts: Account[]; holdings: HoldingRow[] }) {
   const tc = useThemeColors();
+
+  // What funds each goal, as the backend measures it: its account, or the
+  // liquid accounts no goal is linked to.
+  const linkedIds = new Set(goals.map(g => g.funding_account_id).filter((id): id is string => !!id && accounts.some(a => a.id === id)));
+  const liquidPoolIds = new Set(accounts.filter(a => isLiquidAccountType(a.type) && !linkedIds.has(a.id)).map(a => a.id));
+  const fundingOf = (g: GoalProgress) => {
+    const account = g.funding_account_id ? accounts.find(a => a.id === g.funding_account_id) : undefined;
+    return account
+      ? { label: account.name, ids: new Set([account.id]) }
+      : { label: 'liquid wealth', ids: liquidPoolIds };
+  };
+  // Share of equities (by value) in those accounts; null when they hold nothing.
+  const equityPct = (ids: Set<string>): number | null => {
+    const total = accounts.filter(a => ids.has(a.id)).reduce((s, a) => s + (a.balance ?? 0), 0);
+    const equity = holdings
+      .filter(h => ids.has(h.account_id) && EQUITY_CLASSES.has(h.asset_class))
+      .reduce((s, h) => s + (h.value_eur ?? h.market_value ?? 0), 0);
+    return total > 0 ? Math.round(Math.min(100, Math.max(0, (equity / total) * 100))) : null;
+  };
 
   // Goal / asset mismatches
   const mismatches: { goal: string; severity: 'critical' | 'moderate' | 'info'; message: ReactNode }[] = [];
   goals.forEach(g => {
-    const fundingAccount = g.funding_account_id ? accounts.find(a => a.id === g.funding_account_id) : null;
+    const funding = fundingOf(g);
+    const equity = equityPct(funding.ids);
     const yearsLeft = g.months_remaining / 12;
-    // Critical: short-horizon goal (<3 years) funded by equities
-    if (yearsLeft > 0 && yearsLeft < 3 && fundingAccount?.type === 'brokerage') {
-      mismatches.push({ goal: g.name, severity: 'critical', message: `Due in ${fmtDuration(g.months_remaining)} but funded by a brokerage account (equities). A market crash could prevent reaching the target. Consider moving to cash or bonds.` });
+    // Critical: short-horizon goal (<3 years) funded mostly by equities
+    if (yearsLeft > 0 && yearsLeft < 3 && equity !== null && equity >= 50) {
+      mismatches.push({ goal: g.name, severity: 'critical', message: `Due in ${fmtDuration(g.months_remaining)} but ${equity} % of ${funding.label} is in equities. A market crash could prevent reaching the target. Consider moving to cash or bonds.` });
     }
     // Moderate: long-horizon goal (>10 years) sitting in cash
-    if (yearsLeft > 10 && fundingAccount && (fundingAccount.type === 'checking' || fundingAccount.type === 'savings')) {
-      mismatches.push({ goal: g.name, severity: 'moderate', message: `${Math.floor(yearsLeft)}-year horizon but funded by a ${fundingAccount.type} account. Cash returns may not keep pace with inflation. Consider equities for long-term growth.` });
+    if (yearsLeft > 10 && equity !== null && equity <= 10) {
+      mismatches.push({ goal: g.name, severity: 'moderate', message: `${Math.floor(yearsLeft)}-year horizon but ${funding.label} is ${equity === 0 ? 'all' : 'almost all'} cash. Cash returns may not keep pace with inflation. Consider equities for long-term growth.` });
     }
     // Over-funded
     if (g.progress_pct > 110) {
@@ -1144,20 +1244,19 @@ function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: A
     if (g.status === 'behind' && g.months_remaining > 0 && g.progress_pct < 50 && yearsLeft < 5) {
       const shortfall = g.target_amount - g.projected_value;
       if (shortfall > 0) {
-        mismatches.push({ goal: g.name, severity: 'critical', message: <>Projected shortfall of <span data-privacy="blur">{fmtEUR(shortfall)}</span>. Increase contributions by <span data-privacy="blur">{fmtEUR(shortfall / g.months_remaining)}</span> a month to close the gap.</> });
+        const topUp = monthlyTopUp(shortfall, g.months_remaining, g.assumed_return_pct);
+        mismatches.push({ goal: g.name, severity: 'critical', message: <>Projected shortfall of <span data-privacy="blur">{fmtEUR(shortfall)}</span>. Increase contributions by <span data-privacy="blur">{fmtEUR(topUp)}</span> a month, at the assumed {fmtPct(g.assumed_return_pct)} return, to close the gap.</> });
       }
     }
   });
 
   // Glide path: equity % = min(100, max(0, (years − 2) / 18 × 100))
   const glideEquity = (yearsLeft: number) => Math.min(100, Math.max(0, Math.round((yearsLeft - 2) / 18 * 100)));
-  const goalPaths = goals.filter(g => g.months_remaining > 0).map(g => {
+  const goalPaths = goals.filter(g => g.months_remaining > 0).flatMap(g => {
     const yearsLeft = g.months_remaining / 12;
     const recommended = glideEquity(yearsLeft);
-    const fundingAccount = g.funding_account_id ? accounts.find(a => a.id === g.funding_account_id) : null;
-    // Approximation: brokerage ~90 % equity, cash accounts 0 %, anything else 50 %
-    const actual = fundingAccount?.type === 'brokerage' ? 90 : fundingAccount?.type === 'savings' ? 0 : fundingAccount?.type === 'checking' ? 0 : 50;
-    return { name: g.name, yearsLeft, recommended, actual, drift: actual - recommended };
+    const actual = equityPct(fundingOf(g).ids);
+    return actual === null ? [] : [{ name: g.name, yearsLeft, recommended, actual, drift: actual - recommended }];
   });
   const glideCurve: number[][] = [];
   for (let y = 0; y <= 30; y++) glideCurve.push([y, glideEquity(y)]);
@@ -1167,10 +1266,10 @@ function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: A
   let budget = 0;
   try { budget = parseFloat(localStorage.getItem('monthly_invest_budget') || '') || 0; } catch { budget = 0; }
   const hasShortfall = budget > 0 && totalNeeded > budget;
-  const showPriority = goals.length > 1 && (hasShortfall || goals.some(g => g.status === 'behind'));
+  const showPriority = goals.length > 1 && (hasShortfall || goals.some(g => g.status === 'behind' || g.status === 'at_risk'));
   const priorityLabels: Record<number, string> = { 10: 'Emergency', 20: 'Employer match', 30: 'Debt payoff', 40: 'Time-sensitive', 50: 'Long-term' };
   let remaining = budget;
-  const allocations = [...goals].sort((a, b) => (a.priority || 50) - (b.priority || 50)).map(g => {
+  const allocations = [...goals].sort((a, b) => (a.priority || 50) - (b.priority || 50) || a.target_date.localeCompare(b.target_date)).map(g => {
     const needed = g.monthly_contribution;
     const allocated = hasShortfall ? Math.min(needed, Math.max(0, remaining)) : needed;
     remaining -= allocated;
@@ -1179,7 +1278,7 @@ function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: A
 
   return (
     <>
-      <Section title="Goals" subtitle="Progress towards each goal at its current pace.">
+      <Section title="Goals" subtitle="Each goal counts the balance of its funding account, or else a share of liquid wealth handed out in priority order, so no euro counts twice. The projection grows only that amount.">
         <ul className="divide-y divide-divider">
           {goals.map(g => {
             // Clamp the bar to [0, 100] — progress can overshoot.
@@ -1188,21 +1287,23 @@ function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: A
             if (g.status === 'complete') {
               estimate = 'Reached';
             } else if (g.months_remaining > 0) {
-              const est = new Date();
-              est.setMonth(est.getMonth() + g.months_remaining);
-              estimate = `${fmtDuration(g.months_remaining)} left, estimated ${fmtMonth(est)}`;
+              // When the projection first reaches the target, not the target date.
+              estimate = g.estimated_date
+                ? `${fmtDuration(g.months_remaining)} left, reached ${fmtMonth(keyToLocalDate(`${g.estimated_date}-01`))} at this pace`
+                : `${fmtDuration(g.months_remaining)} left, not reached at this pace`;
             } else if (g.target_date) {
-              estimate = `Target ${fmtMonth(g.target_date)} — past due`;
+              estimate = `Target ${fmtMonth(keyToLocalDate(g.target_date))} — past due`;
             } else {
               estimate = 'Past due';
             }
             const st = GOAL_STATUS[g.status] ?? GOAL_STATUS.behind;
+            const fundingLabel = fundingOf(g).label;
             return (
               <li key={g.id} className="py-3 first:pt-0">
                 <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 mb-2">
                   <span className="text-[15px] font-medium text-ink min-w-0 break-words">{g.name}</span>
                   <span className="inline-flex flex-wrap items-center gap-2 text-[12px] text-ink-muted">
-                    {g.status === 'behind' && <span>projected <span data-privacy="blur">{fmtEUR(g.projected_value)}</span></span>}
+                    {(g.status === 'behind' || g.status === 'at_risk') && <span>projected <span data-privacy="blur">{fmtEUR(g.projected_value)}</span></span>}
                     <Chip tone={st.tone}>{st.label}</Chip>
                   </span>
                 </div>
@@ -1210,7 +1311,7 @@ function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: A
                 <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-0.5 mt-1.5 text-[12px] text-ink-muted">
                   <span>{fmtPct(g.progress_pct)} · {estimate}</span>
                   <span>
-                    <span data-privacy="blur">{fmtEUR(g.current_value)} of {fmtEUR(g.target_amount)}</span>
+                    <span data-privacy="blur">{fmtEUR(g.current_value)} of {fmtEUR(g.target_amount)}</span> from {fundingLabel}
                     {g.monthly_contribution > 0 && <> · <span data-privacy="blur">{fmtEUR(g.monthly_contribution)}</span> a month</>}
                   </span>
                 </div>
@@ -1240,7 +1341,7 @@ function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: A
       </Section>
 
       {goalPaths.length > 0 && (
-        <Section title="Glide Path" subtitle="The recommended share of equities falls as each goal approaches its target date. “Actual” is estimated from the type of the funding account.">
+        <Section title="Glide Path" subtitle="The recommended share of equities falls as each goal approaches its target date. “Actual” is the share of equities in the money funding the goal: its account, or liquid wealth.">
           <EChartWrapper
             height="240px"
             option={{
@@ -1282,7 +1383,7 @@ function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: A
           title="Goal Priority"
           subtitle={hasShortfall
             ? <>Budget shortfall: <span data-privacy="blur">{fmtEUR(totalNeeded)}</span> a month needed but only <span data-privacy="blur">{fmtEUR(budget)}</span> available. Contributions are allocated by priority.</>
-            : 'Goals ranked by priority. Adjust the priority in Settings to control the allocation order.'}
+            : 'Goals ranked by priority, which is set when a goal is added on the Portfolio page.'}
         >
           <ol className="divide-y divide-divider">
             {allocations.map((g, i) => (
@@ -1299,7 +1400,7 @@ function GoalsSections({ goals, accounts }: { goals: GoalProgress[]; accounts: A
                   {hasShortfall && g.shortfall > 0 && (
                     <p className="text-claret"><span data-privacy="blur">{fmtEUR(g.shortfall)}</span> unfunded</p>
                   )}
-                  {!hasShortfall && g.status === 'behind' && <p className="text-amber">Behind schedule</p>}
+                  {!hasShortfall && (g.status === 'behind' || g.status === 'at_risk') && <p className="text-amber">{g.status === 'behind' ? 'Behind schedule' : 'At risk'}</p>}
                 </div>
               </li>
             ))}
@@ -1371,7 +1472,7 @@ function ProjectionTab() {
   useEffect(() => { loadInitial(); }, [loadInitial]);
 
   // Re-project when a slider moves (debounced). FIRE sizing parameters live on
-  // the Planning page; this tab only asks "where does liquid wealth go under
+  // the Planning page; this tab only asks "where does investable wealth go under
   // these contribution / return / horizon assumptions?".
   useEffect(() => {
     if (!projContrib && !projReturn) return;
@@ -1459,7 +1560,7 @@ function ProjectionTab() {
         title="Wealth Projection"
         subtitle={
           <>
-            Liquid wealth (securities and cash) so far, and where it goes under the assumptions below. Property, vehicles and their loans are not projected.
+            Investable wealth (cash and securities in every account, pension included) so far, and where it goes under the assumptions below. Property, vehicles and their loans are not projected.
             {projData.target_amount > 0 && <> Target: <span data-privacy="blur">{fmtEUR(projData.target_amount)}</span>.</>}
           </>
         }
@@ -1582,7 +1683,7 @@ function ProjectionTab() {
         <SectionBoundary>
           <Section
             title="Projection Milestones"
-            subtitle={<>Projected liquid wealth, assuming a return of {fmtPct(projData.return_pct)} per year and <span data-privacy="blur">{fmtEUR(projData.contribution)}</span> paid in each month. “Real” is in today’s money at 2 % inflation.</>}
+            subtitle={<>Projected investable wealth, assuming a return of {fmtPct(projData.return_pct)} per year and <span data-privacy="blur">{fmtEUR(projData.contribution)}</span> paid in each month. “Real” is in today’s money at 2 % inflation.</>}
           >
             {/* Phones: cards */}
             <ul className="md:hidden flex flex-col gap-2.5">
@@ -1639,8 +1740,8 @@ function ProjectionTab() {
           <Section
             title="Projection Accuracy"
             subtitle={acc.diff_pct >= 0
-              ? `Liquid wealth is ${fmtPct(acc.diff_pct)} above what was projected ${acc.months_ago} months ago.`
-              : `Liquid wealth is ${fmtPct(Math.abs(acc.diff_pct))} below what was projected ${acc.months_ago} months ago.`}
+              ? `Investable wealth is ${fmtPct(acc.diff_pct)} above what was projected ${acc.months_ago} months ago.`
+              : `Investable wealth is ${fmtPct(Math.abs(acc.diff_pct))} below what was projected ${acc.months_ago} months ago.`}
           >
             <MetricGrid>
               <MetricCard label={`${acc.months_ago} months ago`} value={fmtEUR(acc.past_value)} sublabel="Starting value" />
@@ -1675,7 +1776,7 @@ function SensitivitySection({ bars, baseline }: { bars: NonNullable<ProjectionDa
   return (
     <Section
       title="Sensitivity Analysis"
-      subtitle={<>Projected liquid wealth at the end of the horizon when one assumption changes. Bars start at the baseline of <span data-privacy="blur">{fmtEUR(baseline)}</span>; the labels show the resulting value.</>}
+      subtitle={<>Projected investable wealth at the end of the horizon when one assumption changes. Bars start at the baseline of <span data-privacy="blur">{fmtEUR(baseline)}</span>; the labels show the resulting value.</>}
       actions={<ChartLegend items={[{ label: 'Pessimistic', color: tc.claret, style: 'box' }, { label: 'Optimistic', color: tc.forest, style: 'box' }]} />}
     >
       <EChartWrapper
@@ -1733,12 +1834,9 @@ function AccountsTab({ accounts, allSnapshots }: { accounts: Account[]; allSnaps
   const [period, setPeriod] = useState<Period>('1Y');
 
   // Weekday snapshots within the period, oldest first
-  const chartSnapshots = useMemo(() => {
-    const isWeekday = (d: string) => { const day = new Date(d).getDay(); return day !== 0 && day !== 6; };
-    const cutoff = periodCutoff(period);
-    const base = cutoff ? allSnapshots.filter(s => new Date(s.date) >= cutoff) : allSnapshots;
-    return base.filter(s => isWeekday(s.date)).reverse();
-  }, [allSnapshots, period]);
+  const chartSnapshots = useMemo(
+    () => filterByPeriod(allSnapshots, period).filter(s => isWeekdayKey(s.date)).reverse(),
+    [allSnapshots, period]);
   const breakdownLabels = chartSnapshots.map(s => formatDateForPeriod(s.date, period));
   const hasPhysical = chartSnapshots.some(s => (s.physical_component ?? 0) > 0);
   const bands: { name: string; color: string; pick: (s: NetWorthSnapshot) => number }[] = [
@@ -1774,7 +1872,8 @@ function AccountsTab({ accounts, allSnapshots }: { accounts: Account[]; allSnaps
   const sparkSnaps = useMemo(() => {
     const cutoff90 = new Date();
     cutoff90.setDate(cutoff90.getDate() - 90);
-    return allSnapshots.filter(s => new Date(s.date) >= cutoff90).reverse();
+    const key = localDateKey(cutoff90);
+    return allSnapshots.filter(s => dateKeyOf(s.date) >= key).reverse();
   }, [allSnapshots]);
   const investSpark = sparkSnaps.map(s => s.investment_component);
   const cashSpark = sparkSnaps.map(s => s.cash_component);

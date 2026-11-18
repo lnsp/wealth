@@ -1216,7 +1216,8 @@ type benchmarkPrice struct {
 	price float64
 }
 
-// loadBenchmarkPrices loads benchmark prices from DB, falling back to Yahoo Finance.
+// loadBenchmarkPrices loads benchmark prices in EUR (each converted at its
+// date's ECB rate) from DB, falling back to weekly Yahoo Finance closes.
 func loadBenchmarkPrices(ctx context.Context, q *db.Queries, isin, ticker string) []benchmarkPrice {
 	if isin == "" {
 		isin = benchmarkISIN
@@ -1224,13 +1225,17 @@ func loadBenchmarkPrices(ctx context.Context, q *db.Queries, isin, ticker string
 	if ticker == "" {
 		ticker = benchmarkTicker
 	}
+	fxRates := loadFXRatesMap(ctx, q)
+	histFX := loadHistoricalFXRates(ctx, q)
 	rows, err := q.ListPriceHistory(ctx, isin)
 	if err == nil && len(rows) > 0 {
 		var prices []benchmarkPrice
 		for _, r := range rows {
 			if r.Close.Valid {
 				f, _ := r.Close.Float64Value()
-				prices = append(prices, benchmarkPrice{date: r.Date, price: f.Float64})
+				if p := convertAmountToEURAtDate(f.Float64, r.Currency, r.Date, histFX, fxRates); p > 0 {
+					prices = append(prices, benchmarkPrice{date: r.Date, price: p})
+				}
 			}
 		}
 		if len(prices) > 5 {
@@ -1248,7 +1253,9 @@ func loadBenchmarkPrices(ctx context.Context, q *db.Queries, isin, ticker string
 
 	var prices []benchmarkPrice
 	for _, h := range hist {
-		prices = append(prices, benchmarkPrice{date: h.Date, price: h.Close})
+		if p := convertAmountToEURAtDate(h.Close, h.Currency, h.Date, histFX, fxRates); p > 0 {
+			prices = append(prices, benchmarkPrice{date: h.Date, price: p})
+		}
 	}
 	return prices
 }
@@ -3947,22 +3954,8 @@ func (h *PortfolioHandler) HandleSparplanStreak(w http.ResponseWriter, r *http.R
 	fxRates := loadFXRatesMap(ctx, h.queries)
 	histFX := loadHistoricalFXRates(ctx, h.queries)
 
-	// Find months with savings_plan or regular deposit transactions
-	monthlyInvest := make(map[string]float64) // YYYY-MM -> total invested
-	for _, txn := range txns {
-		if txn.Type != "savings_plan" && txn.Type != "buy" {
-			continue
-		}
-		amt := 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-		}
-		month := txn.Date.Format("2006-01")
-		monthlyInvest[month] += amt
-	}
-
-	if len(monthlyInvest) == 0 {
+	st := computeSparplanStreak(sparplanMonthlyAmounts(txns, histFX, fxRates), time.Now().UTC())
+	if st.TotalMonths == 0 {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"current_streak":  0,
 			"longest_streak":  0,
@@ -3972,94 +3965,141 @@ func (h *PortfolioHandler) HandleSparplanStreak(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Build sorted month list from first to last
+	writeJSON(w, http.StatusOK, map[string]any{
+		"current_streak":     st.CurrentStreak,
+		"longest_streak":     st.LongestStreak,
+		"total_months":       st.TotalMonths,
+		"active_months":      st.ActiveMonths,
+		"missed_months":      st.MissedMonths,
+		"consistency_pct":    math.Round(st.ConsistencyPct*10) / 10,
+		"avg_monthly":        math.Round(st.AvgMonthly*100) / 100,
+		"missed_cost":        math.Round(st.MissedCost),
+		"assumed_return_pct": sparplanAssumedReturn * 100,
+		"total_invested":     math.Round(st.TotalInvested*100) / 100,
+		"first_month":        st.FirstMonth,
+		"last_month":         st.LastMonth,
+		"history":            st.History,
+	})
+}
+
+// sparplanAssumedReturn is the annual return used to estimate what missed
+// Sparplan months would have earned. It is an assumption, shown as such.
+const sparplanAssumedReturn = 0.07
+
+// sparplanMonthlyAmounts sums savings-plan executions per month (YYYY-MM) in
+// EUR. One-off buys are not part of a savings plan and are not counted.
+func sparplanMonthlyAmounts(txns []db.ListTransactionsRow, histFX []market.HistoricalFXRate, fxRates map[string]float64) map[string]float64 {
+	monthly := make(map[string]float64)
+	for _, txn := range txns {
+		if txn.Type != "savings_plan" {
+			continue
+		}
+		amt := math.Abs(convertAmountToEURAtDate(numericToFloat(txn.Amount), txn.Currency, txn.Date, histFX, fxRates))
+		monthly[txn.Date.Format("2006-01")] += amt
+	}
+	return monthly
+}
+
+type sparplanMonth struct {
+	Month  string  `json:"month"`
+	Amount float64 `json:"amount"`
+	Active bool    `json:"active"`
+}
+
+type sparplanStreak struct {
+	CurrentStreak, LongestStreak            int
+	TotalMonths, ActiveMonths, MissedMonths int
+	ConsistencyPct                          float64
+	AvgMonthly, MissedCost, TotalInvested   float64
+	FirstMonth, LastMonth                   string
+	History                                 []sparplanMonth
+}
+
+// computeSparplanStreak measures a savings plan from its first execution up
+// to today: the current month counts once it has an execution, otherwise the
+// range ends with the last complete month, so a plan that stopped shows its
+// missed months and a current streak of 0. AvgMonthly is the average
+// execution over the active months of the last 12 months of the range (the
+// whole history if none fall in it), and MissedCost is what that amount
+// would have earned at sparplanAssumedReturn from each missed month to now.
+func computeSparplanStreak(monthly map[string]float64, now time.Time) sparplanStreak {
+	var st sparplanStreak
 	var months []string
-	for m := range monthlyInvest {
-		months = append(months, m)
+	for m, amt := range monthly {
+		if amt > 0 {
+			months = append(months, m)
+		}
+	}
+	if len(months) == 0 {
+		return st
 	}
 	sort.Strings(months)
 
 	firstMonth, _ := time.Parse("2006-01", months[0])
-	lastMonth, _ := time.Parse("2006-01", months[len(months)-1])
+	curMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	endMonth := addMonthsFirstOfMonth(curMonth, -1)
+	if monthly[curMonth.Format("2006-01")] > 0 || endMonth.Before(firstMonth) {
+		endMonth = curMonth
+	}
+	if lastExec, _ := time.Parse("2006-01", months[len(months)-1]); lastExec.After(endMonth) {
+		endMonth = lastExec // executions dated in the future
+	}
 
-	// Generate all months in range
 	var allMonths []string
-	for m := firstMonth; !m.After(lastMonth); m = addMonthsFirstOfMonth(m, 1) {
+	for m := firstMonth; !m.After(endMonth); m = addMonthsFirstOfMonth(m, 1) {
 		allMonths = append(allMonths, m.Format("2006-01"))
 	}
 
-	// Compute streaks
-	currentStreak := 0
-	longestStreak := 0
 	streak := 0
-	activeMonths := 0
 	for _, m := range allMonths {
-		if monthlyInvest[m] > 0 {
+		amt := monthly[m]
+		if amt > 0 {
 			streak++
-			activeMonths++
-			if streak > longestStreak {
-				longestStreak = streak
+			st.ActiveMonths++
+			st.TotalInvested += amt
+			if streak > st.LongestStreak {
+				st.LongestStreak = streak
 			}
 		} else {
 			streak = 0
 		}
+		st.History = append(st.History, sparplanMonth{Month: m, Amount: math.Round(amt*100) / 100, Active: amt > 0})
 	}
-	currentStreak = streak // streak at the end of the range
+	st.CurrentStreak = streak
+	st.TotalMonths = len(allMonths)
+	st.MissedMonths = st.TotalMonths - st.ActiveMonths
+	st.ConsistencyPct = float64(st.ActiveMonths) / float64(st.TotalMonths) * 100
+	st.FirstMonth, st.LastMonth = allMonths[0], allMonths[len(allMonths)-1]
 
-	// Consistency percentage
-	consistencyPct := 0.0
-	if len(allMonths) > 0 {
-		consistencyPct = float64(activeMonths) / float64(len(allMonths)) * 100
+	recent := allMonths
+	if len(recent) > 12 {
+		recent = recent[len(recent)-12:]
 	}
-
-	// Compute cost of missed months (opportunity cost)
-	totalInvested := 0.0
-	for _, amt := range monthlyInvest {
-		totalInvested += amt
-	}
-	avgMonthly := 0.0
-	if activeMonths > 0 {
-		avgMonthly = totalInvested / float64(activeMonths)
-	}
-	missedMonths := len(allMonths) - activeMonths
-
-	// Opportunity cost: missed_months × avg_monthly × portfolio_return_since
-	missedCost := 0.0
-	if missedMonths > 0 {
-		annualReturn := 0.07
-		monthlyReturn := math.Pow(1+annualReturn, 1.0/12.0) - 1
-		// Each missed month's contribution would have grown
-		for i := 0; i < missedMonths; i++ {
-			// Average remaining months after a missed investment
-			remainingMonths := float64(len(allMonths)) / 2
-			missedCost += avgMonthly * (math.Pow(1+monthlyReturn, remainingMonths) - 1)
+	sum, n := 0.0, 0
+	for _, m := range recent {
+		if monthly[m] > 0 {
+			sum += monthly[m]
+			n++
 		}
 	}
-
-	// Monthly investment history for chart
-	type monthPoint struct {
-		Month  string  `json:"month"`
-		Amount float64 `json:"amount"`
-		Active bool    `json:"active"`
+	if n == 0 && st.ActiveMonths > 0 {
+		sum, n = st.TotalInvested, st.ActiveMonths
 	}
-	history := make([]monthPoint, 0)
+	if n > 0 {
+		st.AvgMonthly = sum / float64(n)
+	}
+
 	for _, m := range allMonths {
-		amt := monthlyInvest[m]
-		history = append(history, monthPoint{Month: m, Amount: math.Round(amt*100) / 100, Active: amt > 0})
+		if monthly[m] > 0 {
+			continue
+		}
+		missed, _ := time.Parse("2006-01", m)
+		years := now.Sub(missed).Hours() / 24 / 365.25
+		if years > 0 {
+			st.MissedCost += st.AvgMonthly * (math.Pow(1+sparplanAssumedReturn, years) - 1)
+		}
 	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"current_streak":   currentStreak,
-		"longest_streak":   longestStreak,
-		"total_months":     len(allMonths),
-		"active_months":    activeMonths,
-		"missed_months":    missedMonths,
-		"consistency_pct":  math.Round(consistencyPct*10) / 10,
-		"avg_monthly":      math.Round(avgMonthly*100) / 100,
-		"missed_cost":      math.Round(missedCost),
-		"total_invested":   math.Round(totalInvested*100) / 100,
-		"history":          history,
-	})
+	return st
 }
 
 // HandleWealthWaterfall computes a waterfall decomposition of current net worth.

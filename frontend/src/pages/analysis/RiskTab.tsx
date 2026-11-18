@@ -15,8 +15,12 @@ import {
 
 interface VolContext {
   elevated: boolean;
+  /** Why the flag is set: 'deep_drawdown' | 'drawdown' | 'volatility' | ''. */
+  reason?: string;
   drawdown_pct?: number;
+  peak_date?: string;
   vol_30d?: number;
+  avg_recovery_days?: number;
   message?: string;
   past_drawdowns?: { from_date: string; trough_date: string; recovery_date: string; max_drawdown_pct: number; recovery_days: number }[] | null;
 }
@@ -24,17 +28,63 @@ interface VolContext {
 interface StressTest {
   scenarios?: { name: string; period: string; description: string }[] | null;
   portfolio_impact?: { name: string; drawdown_pct: number; drawdown_eur: number; recovery_months: number; worst_month_pct: number; worst_month_eur: number }[] | null;
-  holding_impacts?: { name: string; isin: string; value: number; is_equity: boolean; drawdown_eur: number; drawdown_pct: number }[] | null;
+  holding_impacts?: { name: string; isin: string; value: number; is_equity: boolean; equity_pct?: number; is_crypto?: boolean; drawdown_eur: number; drawdown_pct: number }[] | null;
   dca_recovery?: { name: string; without_dca_months: number; with_dca_months: number; acceleration_months: number }[] | null;
+  /** Net contributions per month over the last 12 months, the rate used for "with monthly investing". */
+  monthly_contribution?: number;
   portfolio_value?: number;
   equity_pct?: number;
+  crypto_pct?: number;
   cash_buffer?: number;
   cash_buffer_months?: number;
+  monthly_spending?: number;
+  /** 'recorded': average checking withdrawals; 'assumed': 5 % of securities a year. */
+  spending_basis?: 'recorded' | 'assumed';
+  spending_months?: number;
 }
 
 interface SparplanStreak {
   current_streak: number; longest_streak: number; total_months: number; active_months: number; missed_months: number;
-  consistency_pct: number; avg_monthly: number; missed_cost: number; total_invested: number;
+  consistency_pct: number; avg_monthly: number; missed_cost: number; total_invested: number; assumed_return_pct?: number;
+}
+
+/**
+ * Largest peak-to-trough fall inside a window of return-index levels, in % (positive).
+ * Example: levels 100, 120, 90, 130, 117 → the fall from 120 to 90 is 25 %; the later
+ * 130 → 117 (10 %) is smaller, so { pct: 25, start: date of 120, end: date of 90 }.
+ */
+function periodMaxDrawdown(points: { date: string; value?: number }[]): { pct: number; start: string; end: string; days: number } {
+  let peak = 0;
+  let peakDate = '';
+  let best = { pct: 0, start: '', end: '', days: 0 };
+  for (const p of points) {
+    const v = num(p.value);
+    if (v <= 0) continue;
+    if (v >= peak) { peak = v; peakDate = p.date; continue; }
+    const pct = (1 - v / peak) * 100;
+    if (pct > best.pct) {
+      const days = Math.max(0, Math.round((new Date(p.date).getTime() - new Date(peakDate).getTime()) / 86_400_000));
+      best = { pct, start: peakDate, end: p.date, days };
+    }
+  }
+  return best;
+}
+
+/** The elevated-volatility sentence, worded from the backend's reason so numbers use the page's formatting. */
+function volMessage(v: VolContext): string {
+  const dd = Math.abs(num(v.drawdown_pct));
+  const episodes = arr(v.past_drawdowns).length;
+  switch (v.reason) {
+    case 'deep_drawdown':
+      return `Returns are ${fmtPct(dd)} below their peak of ${fmtDateLong(v.peak_date)}.`
+        + (episodes > 0 ? ` The portfolio has recovered from ${plural(episodes, 'drawdown', 'drawdowns')} of more than 5 % before, in ${plural(num(v.avg_recovery_days), 'day', 'days')} on average.` : '');
+    case 'drawdown':
+      return `Returns are ${fmtPct(dd)} below their peak. This is within normal market fluctuation.`;
+    case 'volatility':
+      return `30-day volatility is elevated at ${fmtPct(v.vol_30d, { digits: 0 })} (annualised). Markets are choppy, but returns are near their peak.`;
+    default:
+      return v.message ?? '';
+  }
 }
 
 interface Journal {
@@ -58,13 +108,13 @@ export default function RiskTab() {
 function RiskAnalytics() {
   const risk = useLoad(() => api.getRisk());
   return (
-    <Section first title="Risk Analytics" subtitle="Volatility, drawdown and risk-adjusted return, computed from daily portfolio valuations.">
+    <Section first title="Risk Analytics" subtitle="Volatility, drawdown and risk-adjusted return of your cash and securities, from daily valuations with deposits, withdrawals and share grants taken out. Property, vehicles and their loans are not included.">
       <Loaded state={risk} lines={6}>
         {data => (num(data?.risk?.annualized_volatility) > 0
           ? <RiskBody data={data} />
           : <EmptyState
               title="Not enough history yet"
-              message="Risk figures need a few weeks of daily portfolio valuations. They appear once enough history has built up."
+              message="Risk figures need a few weeks of daily valuations of your cash and securities. They appear once enough history has built up."
               action={{ label: 'Import transactions', href: '/transactions' }}
             />)}
       </Loaded>
@@ -81,25 +131,12 @@ function RiskBody({ data }: { data: RiskData }) {
   const bench = data.benchmark_risk;
 
   const series = filterByPeriod(arr(r.drawdown_series), drawdownPeriod);
-  // Per-window peak-to-trough so the Max Drawdown tile matches the chart's selected period.
-  // drawdown_series carries the running "% below peak" per snapshot: the minimum in the
-  // window is the window's maximum drawdown, and the most recent point at or above zero
-  // before it is the peak the trough fell from.
-  const dd = (() => {
-    if (drawdownPeriod === 'All') {
-      return { pct: num(r.max_drawdown), start: r.max_drawdown_start, end: r.max_drawdown_end, days: num(r.max_drawdown_days), peakKnown: true };
-    }
-    if (series.length === 0) return { pct: 0, start: '', end: '', days: 0, peakKnown: true };
-    let troughIdx = 0;
-    for (let i = 1; i < series.length; i++) if (series[i].drawdown < series[troughIdx].drawdown) troughIdx = i;
-    const trough = series[troughIdx];
-    let peakIdx = 0;
-    let peakKnown = false;
-    for (let i = troughIdx; i >= 0; i--) if (series[i].drawdown >= 0) { peakIdx = i; peakKnown = true; break; }
-    const peakDate = series[peakIdx].date;
-    const days = Math.max(0, Math.round((new Date(trough.date).getTime() - new Date(peakDate).getTime()) / 86_400_000));
-    return { pct: -trough.drawdown, start: peakDate, end: trough.date, days, peakKnown };
-  })();
+  // The Max Drawdown tile matches the chart's selected period: the largest peak-to-trough
+  // fall inside the window, measured on the index levels the backend sends with each point
+  // (the backend's downsampling keeps every bucket's peak and trough).
+  const dd = drawdownPeriod === 'All'
+    ? { pct: num(r.max_drawdown), start: r.max_drawdown_start, end: r.max_drawdown_end, days: num(r.max_drawdown_days) }
+    : periodMaxDrawdown(series);
 
   const ratioTone = (v: number) => (v < 0 ? 'negative' : 'neutral') as 'negative' | 'neutral';
   const benchLine = (text: string) => (bench ? `Benchmark ${text}` : undefined);
@@ -155,7 +192,7 @@ function RiskBody({ data }: { data: RiskData }) {
     <>
       {num(r.current_drawdown) > 0 && (
         <p className="mb-4 text-[14px] text-ink-body">
-          Currently {fmtPct(r.current_drawdown)} below the all-time high of <Money value={r.all_time_high} /> reached on {fmtDateLong(r.ath_date)}.
+          Returns are currently {fmtPct(r.current_drawdown)} below their peak of {fmtDateLong(r.peak_date || r.ath_date)}. Deposits and withdrawals do not count towards this.
         </p>
       )}
 
@@ -168,16 +205,21 @@ function RiskBody({ data }: { data: RiskData }) {
           sublabel={benchLine(fmtNum(bench?.sortino_ratio, 2))} />
         <MetricCard money={false} label={`Max drawdown${drawdownPeriod !== 'All' ? ` (${drawdownPeriod})` : ''}`}
           value={fmtPct(-Math.abs(dd.pct), { digits: 2 })} tone={dd.pct > 0 ? 'negative' : 'neutral'}
-          sublabel={dd.start && dd.end
-            ? `${dd.peakKnown ? '' : 'From before '}${fmtDate(dd.start)} to ${fmtDate(dd.end)} (${plural(dd.days, 'day', 'days')})`
+          sublabel={dd.pct > 0 && dd.start && dd.end
+            ? `${fmtDate(dd.start)} to ${fmtDate(dd.end)}${dd.days > 0 ? ` (${plural(dd.days, 'day', 'days')})` : ''}`
             : 'No drawdown in this period'} />
-        <MetricCard label="Value at risk (95 %, 1 day)" value={fmtEUR(r.value_at_risk_95)} sublabel="Loss exceeded on 1 day in 20" />
+        <MetricCard label="Value at risk (95 %, 1 day)" value={fmtEUR(r.value_at_risk_95)} sublabel="Loss exceeded on 1 trading day in 20" />
       </MetricGrid>
+      {data.risk_free_rate != null && (
+        <p className="mt-3 text-[13px] text-ink-muted">
+          Sharpe and Sortino are measured against the ECB deposit rate, which averaged {fmtPct(data.risk_free_rate, { digits: 2 })} over this period.
+        </p>
+      )}
 
-      {vol.data?.elevated && vol.data.message && (
+      {vol.data?.elevated && volMessage(vol.data) && (
         <div className="mt-5">
           <Callout tone="warning" label="Elevated volatility" title="Market context">
-            <p>{vol.data.message}</p>
+            <p>{volMessage(vol.data)}</p>
             <p className="mt-1 text-ink-muted">
               Now {fmtPct(vol.data.drawdown_pct)} from the peak · 30-day volatility {fmtPct(vol.data.vol_30d, { digits: 0 })} · {plural(past.length, 'earlier drawdown', 'earlier drawdowns')} recovered
             </p>
@@ -248,16 +290,16 @@ function RiskBody({ data }: { data: RiskData }) {
 function Concentration() {
   const alerts = useLoad(() => api.getAlerts());
   return (
-    <Section title="Concentration" subtitle="Single-stock exposure and overlap between your ETFs, checked against the thresholds in Settings.">
+    <Section title="Concentration" subtitle="Exposure to single companies across all your securities, held directly or inside ETFs, and overlap between your ETFs, checked against the thresholds in Settings.">
       <Loaded state={alerts} lines={2}>
         {data => {
           const list = arr<ConcentrationAlert>(data?.alerts);
-          if (list.length === 0) return <Statement>No concentration warnings. No single stock or ETF pair is above your thresholds.</Statement>;
+          if (list.length === 0) return <Statement>No concentration warnings. No single holding or ETF pair is above your thresholds.</Statement>;
           return (
             <div className="flex flex-col gap-4">
               {list.map((a, i) => (
                 <Callout key={i} tone={a.level === 'critical' ? 'danger' : 'warning'} label={a.level === 'critical' ? 'Critical' : 'Warning'} title={a.message}>
-                  {a.type === 'overlap' ? 'High overlap between ETFs can mean you hold the same stocks twice.' : 'A large share of the portfolio depends on one company.'}
+                  {a.type === 'overlap' ? 'High overlap between ETFs can mean you hold the same stocks twice.' : 'Share of all your securities, counting direct holdings and ETF look-through. A large share depends on one company or asset.'}
                 </Callout>
               ))}
             </div>
@@ -273,9 +315,9 @@ function Concentration() {
 function StressTestSection() {
   const stress = useLoad(() => getJson<StressTest>('/api/analysis/crisis-stress-test'));
   return (
-    <Section title="Historical Crisis Stress Test" subtitle="What past market crises would do to today’s portfolio, scaled by its share of equities.">
+    <Section title="Historical Crisis Stress Test" subtitle="What past market crises would do to today’s securities, scaled by how much of each holding moves with equities.">
       <Loaded state={stress} lines={6}>
-        {data => (arr(data?.portfolio_impact).length > 0
+        {data => (arr(data?.portfolio_impact).length > 0 && num(data?.portfolio_value) > 0
           ? <StressBody data={data} />
           : <EmptyState
               title="No holdings to test"
@@ -287,17 +329,30 @@ function StressTestSection() {
   );
 }
 
+/** Label for how a holding is shocked: equity share, crypto, or not at all. */
+function exposureLabel(h: { is_equity: boolean; equity_pct?: number; is_crypto?: boolean }): string {
+  if (h.is_crypto) return 'Crypto';
+  const eq = h.equity_pct ?? (h.is_equity ? 100 : 0);
+  if (eq >= 100) return 'Equity';
+  if (eq <= 0) return 'Not equity';
+  return `${fmtPct(eq, { digits: 0 })} equity`;
+}
+
 function StressBody({ data }: { data: StressTest }) {
   const impacts = [...arr(data.portfolio_impact)].sort((a, b) => a.drawdown_pct - b.drawdown_pct);
   const scenarios = arr(data.scenarios);
   const dca = arr(data.dca_recovery);
   const holdings = arr(data.holding_impacts).filter(h => h.value > 0).sort((a, b) => a.drawdown_eur - b.drawdown_eur);
   const equityPct = num(data.equity_pct);
+  const cryptoPct = num(data.crypto_pct);
   const cashMonths = num(data.cash_buffer_months);
+  const monthlyContribution = num(data.monthly_contribution);
+  const showDca = monthlyContribution > 0;
   const worstEur = [...impacts].sort((a, b) => a.drawdown_eur - b.drawdown_eur)[0];
   const worstPct = impacts[0];
   const avgRecovery = impacts.reduce((s, i) => s + num(i.recovery_months), 0) / impacts.length;
   const months = (n: number) => plural(n, 'month', 'months');
+  const cashMonthsText = `${fmtNum(cashMonths, 1)} ${cashMonths === 1 ? 'month' : 'months'}`;
 
   const rows = impacts.map(impact => {
     const d = dca.find(x => x.name === impact.name);
@@ -308,9 +363,13 @@ function StressBody({ data }: { data: StressTest }) {
     };
   });
 
-  // The backend's "months" figure divides cash by 5 % of securities value per year (÷ 12).
-  // It is not based on recorded spending, so the copy says exactly that.
-  const bufferBasis = 'withdrawals at 5 % of securities value a year';
+  // Months of recorded spending (average checking withdrawals) when there is any; otherwise
+  // the 5 % rule of thumb, and the copy says which one it is.
+  const recorded = data.spending_basis === 'recorded';
+  const bufferBasis = recorded
+    ? `your average spending of ${fmtEUR(data.monthly_spending)} a month (checking withdrawals over the last ${plural(Math.round(num(data.spending_months)), 'month', 'months')})`
+    : 'withdrawals at 5 % of securities value a year, a rule of thumb because no spending is recorded';
+  const bufferAdvice = recorded ? '' : ' Compare it with your monthly spend on the Cashflow page.';
   const suggestions: { title: string; detail: string; severity: 'high' | 'medium' | 'low' }[] = [];
   if (equityPct > 90) {
     suggestions.push({ severity: 'high', title: 'High equity concentration', detail: `${fmtPct(equityPct, { digits: 0 })} in equities means nearly full exposure to every crisis. Adding 10 to 20 % in bonds or gold could reduce the worst-case drawdown by 5 to 10 percentage points without much effect on long-term returns.` });
@@ -318,15 +377,15 @@ function StressBody({ data }: { data: StressTest }) {
     suggestions.push({ severity: 'medium', title: 'Consider diversifiers', detail: `At ${fmtPct(equityPct, { digits: 0 })} equity the portfolio tracks the major indices closely. A 5 to 10 % allocation to bonds, gold or property funds could smooth volatility.` });
   }
   if (cashMonths < 3) {
-    suggestions.push({ severity: 'high', title: 'Build a cash buffer', detail: `Cash covers ${months(cashMonths)} of ${bufferBasis}. This is a rule of thumb, not your recorded spending; compare it with your monthly spend on the Cashflow page. A buffer of 3 to 6 months of real expenses prevents forced selling in a drawdown.` });
+    suggestions.push({ severity: 'high', title: 'Build a cash buffer', detail: `Cash covers ${cashMonthsText} of ${bufferBasis}.${bufferAdvice} A buffer of 3 to 6 months of real expenses prevents forced selling in a drawdown.` });
   } else if (cashMonths < 6) {
-    suggestions.push({ severity: 'low', title: 'Strengthen the cash buffer', detail: `Cash covers ${months(cashMonths)} of ${bufferBasis}. This is a rule of thumb, not your recorded spending; compare it with your monthly spend on the Cashflow page.` });
+    suggestions.push({ severity: 'low', title: 'Strengthen the cash buffer', detail: `Cash covers ${cashMonthsText} of ${bufferBasis}.${bufferAdvice}` });
   }
   if (worstPct && worstPct.drawdown_pct < -40) {
     suggestions.push({ severity: 'medium', title: 'Severe drawdown exposure', detail: `Worst case: a drawdown of ${fmtPct(worstPct.drawdown_pct, { digits: 0 })} (${fmtEUR(worstPct.drawdown_eur)}). If that would force you to sell, consider less equity or a larger cash buffer.` });
   }
   if (avgRecovery > 30) {
-    suggestions.push({ severity: 'low', title: 'Long average recovery', detail: `Average recovery across these crises: ${months(Math.round(avgRecovery))}. Continuing to invest through a drawdown shortens it noticeably.` });
+    suggestions.push({ severity: 'low', title: 'Long average recovery', detail: `In these historical crises the index took ${months(Math.round(avgRecovery))} on average to recover from its low. Continuing to invest through a drawdown shortens it noticeably.` });
   }
   const severity = {
     high: { tone: 'danger' as const, label: 'High priority' },
@@ -337,7 +396,7 @@ function StressBody({ data }: { data: StressTest }) {
   return (
     <>
       <p className="mb-4 text-[14px] text-ink-body">
-        Applied to <Money value={data.portfolio_value} /> with {fmtPct(equityPct, { digits: 0 })} in equities.
+        Applied to <Money value={data.portfolio_value} /> of securities with {fmtPct(equityPct, { digits: 0 })} in equities{cryptoPct > 0 ? ` and ${fmtPct(cryptoPct, { digits: 0 })} in crypto` : ''}.
       </p>
 
       {/* Phones: one card per crisis, nothing cut off. */}
@@ -350,8 +409,8 @@ function StressBody({ data }: { data: StressTest }) {
               { label: 'Drawdown', value: <span className="text-claret">{fmtPct(row.drawdown_pct)}</span> },
               { label: 'Impact', value: <Money value={row.drawdown_eur} tone="negative" /> },
               { label: 'Worst month', value: fmtPct(row.worst_month_pct) },
-              { label: 'Recovery', value: months(row.recovery_months) },
-              { label: 'With monthly investing', value: row.withDca },
+              { label: 'Index recovery', value: months(row.recovery_months) },
+              ...(showDca ? [{ label: 'With monthly investing', value: row.withDca }] : []),
             ]} />
           </li>
         ))}
@@ -365,8 +424,8 @@ function StressBody({ data }: { data: StressTest }) {
               <th scope="col" className="num">Drawdown</th>
               <th scope="col" className="num">Impact</th>
               <th scope="col" className="num">Worst month</th>
-              <th scope="col" className="num">Recovery</th>
-              <th scope="col" className="num">With monthly investing</th>
+              <th scope="col" className="num">Index recovery</th>
+              {showDca && <th scope="col" className="num">With monthly investing</th>}
             </tr>
           </thead>
           <tbody>
@@ -380,17 +439,33 @@ function StressBody({ data }: { data: StressTest }) {
                 <td className="num"><Money value={row.drawdown_eur} tone="negative" /></td>
                 <td className="num">{fmtPct(row.worst_month_pct)}</td>
                 <td className="num">{months(row.recovery_months)}</td>
-                <td className="num">{row.withDca}</td>
+                {showDca && <td className="num">{row.withDca}</td>}
               </tr>
             ))}
           </tbody>
         </table>
       </TableRegion>
 
+      <div className="mt-3 flex flex-col gap-1 text-[13px] text-ink-muted">
+        <p>
+          Drawdowns and recovery times are historical MSCI World price-index figures in US dollars; in euros the falls were different.
+          Recovery counts the months from the index’s low back to its previous peak.
+          Funds count with their recorded equity share (without one, equity funds in full and mixed funds by half){cryptoPct > 0 ? '; crypto is assumed to fall twice as far as equities, by at most 90 %' : ''}. Bonds and gold are not shocked.
+        </p>
+        {showDca ? (
+          <p>
+            With monthly investing assumes your net contributions of the last 12 months, <Money value={monthlyContribution} /> a month, continue through the crisis.
+            Recovery then means the portfolio is worth everything you put in.
+          </p>
+        ) : (
+          <p>Your net contributions over the last 12 months were not positive, so there is no monthly-investing scenario.</p>
+        )}
+      </div>
+
       <MetricGrid className="mt-6">
-        <MetricCard label="Cash buffer" value={fmtEUR(data.cash_buffer)} sublabel={`Covers ${months(cashMonths)} of ${bufferBasis}`} />
+        <MetricCard label="Cash buffer" value={fmtEUR(data.cash_buffer)} sublabel={`Checking, savings and broker cash; covers ${cashMonthsText} of ${recorded ? 'average spending' : 'spending at the 5 % rule of thumb'}`} />
         <MetricCard label="Worst-case loss" value={fmtEUR(worstEur?.drawdown_eur)} tone={num(worstEur?.drawdown_eur) < 0 ? 'negative' : 'neutral'} sublabel={worstEur?.name ?? '—'} />
-        <MetricCard money={false} label="Equity exposure" value={fmtPct(equityPct, { digits: 0 })} sublabel="Share of securities in stocks and equity funds" />
+        <MetricCard money={false} label="Equity exposure" value={fmtPct(equityPct, { digits: 0 })} sublabel="Share of securities in stocks and the equity part of funds" />
       </MetricGrid>
 
       {holdings.length > 0 && (
@@ -401,7 +476,7 @@ function StressBody({ data }: { data: StressTest }) {
               <li key={h.isin} className="flex items-center justify-between gap-4 py-2 text-[13px]">
                 <span className="min-w-0">
                   <span className="block truncate text-ink" title={h.name}>{h.name}</span>
-                  <span className="block text-[12px] text-ink-muted">{h.is_equity ? 'Equity' : 'Not equity'} · <Money value={h.value} /></span>
+                  <span className="block text-[12px] text-ink-muted">{exposureLabel(h)} · <Money value={h.value} /></span>
                 </span>
                 <span className="shrink-0 text-right">
                   {h.drawdown_eur < 0 ? <Money value={h.drawdown_eur} tone="negative" /> : <span className="text-ink-muted">No impact</span>}
@@ -431,7 +506,7 @@ function StressBody({ data }: { data: StressTest }) {
 function SparplanConsistency() {
   const streak = useLoad(() => getJson<SparplanStreak>('/api/portfolio/sparplan-streak'));
   return (
-    <Section title="Sparplan Consistency" subtitle="How regularly your Sparplan (monthly savings plan) has actually been invested.">
+    <Section title="Sparplan Consistency" subtitle="How regularly your Sparplan (monthly savings plan) has actually been invested, from its first execution to the last complete month (this month counts once it has run).">
       <Loaded state={streak} lines={3}>
         {s => (num(s?.total_months) > 0 ? (
           <>
@@ -440,10 +515,11 @@ function SparplanConsistency() {
               <MetricCard money={false} label="Longest streak" value={plural(num(s.longest_streak), 'month', 'months')} />
               <MetricCard money={false} label="Consistency" value={fmtPct(s.consistency_pct, { digits: 0 })}
                 sublabel={`${num(s.active_months)} of ${plural(num(s.total_months), 'month', 'months')} invested, ${num(s.missed_months)} missed`} />
-              <MetricCard label="Cost of missed months" value={num(s.missed_cost) > 0 ? fmtEUR(s.missed_cost) : '—'} sublabel="Estimated growth forgone" />
+              <MetricCard label="Cost of missed months" value={num(s.missed_cost) > 0 ? fmtEUR(s.missed_cost) : '—'}
+                sublabel={`Growth forgone at an assumed ${fmtPct(s.assumed_return_pct ?? 7, { digits: 0 })} a year`} />
             </MetricGrid>
             <p className="mt-3 text-[13px] text-ink-muted">
-              Average <Money value={s.avg_monthly} /> a month · <Money value={s.total_invested} /> invested in total
+              Typically <Money value={s.avg_monthly} /> per execution over the last 12 months · <Money value={s.total_invested} /> invested in total
             </p>
           </>
         ) : (

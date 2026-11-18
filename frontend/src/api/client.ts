@@ -410,6 +410,8 @@ export interface SectorHistoryPoint {
 export interface DrawdownPoint {
   date: string;
   drawdown: number;
+  /** Level of the return index on that date, for peak-to-trough within a sub-period. */
+  value?: number;
 }
 
 export interface RiskMetrics {
@@ -420,10 +422,15 @@ export interface RiskMetrics {
   max_drawdown_start: string;
   max_drawdown_end: string;
   max_drawdown_days: number;
+  /** One trading day, 95 %, EUR (negative = loss). */
   value_at_risk_95: number;
+  /** % below the return index's peak on `peak_date`. */
   current_drawdown: number;
+  peak_date?: string;
+  /** Highest recorded value (not the index). */
   all_time_high: number;
   ath_date: string;
+  series_start?: string;
   drawdown_series: DrawdownPoint[];
 }
 
@@ -437,6 +444,8 @@ export interface RiskData {
   risk: RiskMetrics;
   benchmark_risk?: RiskMetrics;
   rolling?: Record<string, RollingMetric[]>;
+  /** Average ECB deposit facility rate over the measured window, in %. */
+  risk_free_rate?: number;
 }
 
 export interface TaxBySecurity {
@@ -841,8 +850,9 @@ export const api = {
     transactions: { date: string; type: string; quantity: number; amount: number; running_qty: number }[];
   }>(`/portfolio/security/${isin}`),
   getHealthScore: () => request<{ score: number; subscores: { name: string; score: number; weight: number; status: string; detail: string }[] }>('/analysis/health-score'),
-  getBenchmarkComparison: (isin?: string) => request<{ benchmark_name: string; benchmark_isin?: string; actual_value: number; benchmark_value: number; difference: number; comparison: { date: string; actual: number; benchmark: number }[]; /** false when the benchmark has too few price rows; `have` of `need` rows are loaded. */ available?: boolean; reason?: string; have?: number; need?: number }>(`/analysis/benchmark-comparison${isin ? `?isin=${isin}` : ''}`),
-  getInflation: () => request<{ history: { date: string; nominal: number; real: number }[]; nominal_return?: number; real_return?: number; purchasing_power_lost?: number }>('/analysis/inflation'),
+  getBenchmarkComparison: (isin?: string) => request<{ benchmark_name: string; benchmark_isin?: string; actual_value: number; benchmark_value: number; difference: number; comparison: { date: string; actual: number; benchmark: number }[]; /** false when the benchmark has too few price rows; `have` of `need` rows are loaded. */ available?: boolean; reason?: string; have?: number; need?: number; /** First day both lines share; the benchmark starts with the same value. */ start_date?: string }>(`/analysis/benchmark-comparison${isin ? `?isin=${isin}` : ''}`),
+  /** Cash and securities (property, vehicles and their loans excluded) against the German VPI. Returns are time-weighted over window_start → window_end. */
+  getInflation: () => request<{ history: { date: string; nominal: number; real: number; cpi_index?: number }[]; nominal_return?: number; real_return?: number; inflation_pct?: number; purchasing_power_lost?: number; window_start?: string; window_end?: string }>('/analysis/inflation'),
   getCashFlow: () => request<{ history: { month: string; income: number; expenses: number; net: number }[]; projection: { month: string; income: number; expenses: number; net: number }[]; avg_income: number; avg_expenses: number; avg_net: number }>('/analysis/cash-flow'),
 
   // Settings

@@ -41,6 +41,7 @@ type Category string
 
 const (
 	CatSalary        Category = "salary"
+	CatBenefits      Category = "benefits" // Kindergeld, Elterngeld and other state transfers
 	CatInterest      Category = "interest"
 	CatDividend      Category = "dividend"
 	CatRefund        Category = "refund"
@@ -76,7 +77,7 @@ const (
 // BucketOf maps a Category to its top-level Bucket.
 func BucketOf(c Category) Bucket {
 	switch c {
-	case CatSalary, CatInterest, CatDividend, CatRefund:
+	case CatSalary, CatBenefits, CatInterest, CatDividend, CatRefund:
 		return BucketIncome
 	case CatHousing, CatUtilities, CatInsurance, CatSubscriptions, CatFees:
 		return BucketFixed
@@ -207,7 +208,13 @@ type rule struct {
 	keywords []string
 	category Category
 	dir      direction
+	// unless skips the rule when any of these keywords also matches.
+	unless []string
 }
+
+// loanKeywords mark loan instalments. A payment to the user's own bank that
+// carries one of them is a debt payment, not an own-account transfer.
+var loanKeywords = []string{"DARLEHEN", "TILGUNG", "HYPOTHEK", "BAUFINANZIERUNG", "IMMOBILIENKREDIT", "RATENKREDIT", "KREDITRATE", "ANNUITÄT", "ANNUITAET"}
 
 // rules are matched in order against UPPER(counterparty + " " + reference).
 //
@@ -221,44 +228,50 @@ var rules = []rule{
 	// exchange legs, transfers between the user's banks.
 	{[]string{"UMBUCHUNG", "ÜBERTRAG", "UEBERTRAG", "EIGENES KONTO", "EIGENE KONTEN", "EIGENKONTO",
 		"INTERNAL TRANSFER", "OWN ACCOUNT", "TAGESGELD", "FESTGELD", "SPARKONTO", "SPARBUCH",
-		"TOPUP", "TOP-UP", "EXCHANGED TO", "EXCHANGED FROM", "EXCHANGE", "REVOLUT", "DKB"}, CatInternal, anyDir},
+		"TOPUP", "TOP-UP", "EXCHANGED TO", "EXCHANGED FROM", "EXCHANGE"}, CatInternal, anyDir, nil},
+	// Banks the user typically holds a second account at. A bare bank name is
+	// an own-account transfer, except for loan instalments, which must stay
+	// visible as spending when no tracked loan claims them.
+	{[]string{"REVOLUT", "DKB"}, CatInternal, anyDir, loanKeywords},
 	// Income tax payments and refunds. Ahead of salary because "LOHN" is in "LOHNSTEUER".
-	{[]string{"FINANZAMT", "LOHNSTEUER", "EINKOMMENSTEUER", "EINKOMMENSSTEUER", "STEUERERSTATTUNG"}, CatTax, anyDir},
+	{[]string{"FINANZAMT", "LOHNSTEUER", "EINKOMMENSTEUER", "EINKOMMENSSTEUER", "STEUERERSTATTUNG"}, CatTax, anyDir, nil},
 
 	// Pay and pensions ("RENTE" but not "RENTENVERSICHERUNG").
-	{[]string{"GEHALT", "LOHN", "SALARY", "PAYROLL", "BEZÜGE", "BEZUEGE", "RENTE"}, CatSalary, inOnly},
-	{[]string{"ZINSEN", "INTEREST"}, CatInterest, inOnly},
+	{[]string{"GEHALT", "LOHN", "SALARY", "PAYROLL", "BEZÜGE", "BEZUEGE", "RENTE"}, CatSalary, inOnly, nil},
+	// State benefits are household income, not salary.
+	{[]string{"KINDERGELD", "FAMILIENKASSE", "ELTERNGELD", "KINDERZUSCHLAG", "KRANKENGELD", "ARBEITSLOSENGELD", "BUNDESAGENTUR FUER ARBEIT", "BUNDESAGENTUR FÜR ARBEIT", "WOHNGELD", "BAFOEG", "BAFÖG"}, CatBenefits, inOnly, nil},
+	{[]string{"ZINSEN", "INTEREST"}, CatInterest, inOnly, nil},
 
 	// Brokers, savings plans and RSU sale proceeds: money moved into or out of
 	// investments, not income or spending.
 	{[]string{"SCALABLE", "TRADE REPUBLIC", "TRADEREPUBLIC", "COMDIRECT", "FLATEX", "SMARTBROKER",
 		"ONVISTA", "CONSORSBANK", "FINANZEN.NET ZERO", "JUSTTRADE", "JUST TRADE", "BAADER BANK",
 		"DEGIRO", "INTERACTIVE BROKERS", "MORGAN STANLEY", "SCHWAB", "E*TRADE", "ETRADE", "E-TRADE",
-		"EQUATEPLUS", "COMPUTERSHARE", "SHAREWORKS", "SPARPLAN", "WERTPAPIER", "DEPOT"}, CatInvestment, anyDir},
+		"EQUATEPLUS", "COMPUTERSHARE", "SHAREWORKS", "SPARPLAN", "WERTPAPIER", "DEPOT"}, CatInvestment, anyDir, nil},
 
-	{[]string{"ERSTATTUNG", "REFUND", "RÜCKZAHLUNG", "RUECKZAHLUNG", "CASHBACK"}, CatRefund, inOnly},
+	{[]string{"ERSTATTUNG", "REFUND", "RÜCKZAHLUNG", "RUECKZAHLUNG", "CASHBACK"}, CatRefund, inOnly, nil},
 	// An incoming wire with no payroll keyword is almost always a broker payout
 	// (RSU sale proceeds), not earned income.
-	{[]string{"WIRE"}, CatInvestment, inOnly},
+	{[]string{"WIRE"}, CatInvestment, inOnly, nil},
 
 	{[]string{"KONTOFÜHRUNG", "KONTOFUEHRUNG", "KONTOENTGELT", "ENTGELTABSCHLUSS", "KARTENGEBÜHR",
 		"KARTENGEBUEHR", "BANKGEBÜHR", "BANKGEBUEHR", "SOLLZINS", "DISPOZINS", "ÜBERZIEHUNGSZINS",
-		"UEBERZIEHUNGSZINS"}, CatFees, outOnly},
+		"UEBERZIEHUNGSZINS"}, CatFees, outOnly, nil},
 
-	{[]string{"MIETE", "KALTMIETE", "WARMMIETE", "NEBENKOSTEN", "HAUSGELD", "RENT"}, CatHousing, anyDir},
-	{[]string{"STROM", "ERDGAS", "GASAG", "GASWERK", "GASVERSORG", "GAS", "WASSER", "ABWASSER", "MUELL", "MÜLL", "STADTWERKE", "VATTENFALL", "EON", "ENBW", "RWE", "TELEKOM", "VODAFONE", "1&1", "O2", "PYUR", "INTERNET", "RUNDFUNK", "GEZ", "HEIZUNG", "FERNWÄRME", "FERNWAERME"}, CatUtilities, anyDir},
-	{[]string{"VERSICHERUNG", "ALLIANZ", "HUK", "AXA", "ERGO", "DEVK", "DEBEKA", "GENERALI", "BARMER", "TECHNIKER KRANKENKASSE", "TK", "AOK", "DAK", "KRANKENKASSE", "KRANKENVERSICHERUNG", "INSURANCE", "HAFTPFLICHT"}, CatInsurance, anyDir},
-	{[]string{"NETFLIX", "SPOTIFY", "AMAZON PRIME", "DISNEY", "APPLE.COM", "GITHUB", "ADOBE", "MICROSOFT", "ICLOUD", "DROPBOX", "YOUTUBE", "PATREON", "SUBSCRIPTION", "MONATSABO", "JAHRESABO", "ABO"}, CatSubscriptions, anyDir},
+	{[]string{"MIETE", "KALTMIETE", "WARMMIETE", "NEBENKOSTEN", "HAUSGELD", "RENT"}, CatHousing, anyDir, nil},
+	{[]string{"STROM", "ERDGAS", "GASAG", "GASWERK", "GASVERSORG", "GAS", "WASSER", "ABWASSER", "MUELL", "MÜLL", "STADTWERKE", "VATTENFALL", "EON", "ENBW", "RWE", "TELEKOM", "VODAFONE", "1&1", "O2", "PYUR", "INTERNET", "RUNDFUNK", "GEZ", "HEIZUNG", "FERNWÄRME", "FERNWAERME"}, CatUtilities, anyDir, nil},
+	{[]string{"VERSICHERUNG", "ALLIANZ", "HUK", "AXA", "ERGO", "DEVK", "DEBEKA", "GENERALI", "BARMER", "TECHNIKER KRANKENKASSE", "TK", "AOK", "DAK", "KRANKENKASSE", "KRANKENVERSICHERUNG", "INSURANCE", "HAFTPFLICHT"}, CatInsurance, anyDir, nil},
+	{[]string{"NETFLIX", "SPOTIFY", "AMAZON PRIME", "DISNEY", "APPLE.COM", "GITHUB", "ADOBE", "MICROSOFT", "ICLOUD", "DROPBOX", "YOUTUBE", "PATREON", "SUBSCRIPTION", "MONATSABO", "JAHRESABO", "ABO"}, CatSubscriptions, anyDir, nil},
 
-	{[]string{"REWE", "EDEKA", "LIDL", "ALDI", "PENNY", "NETTO", "KAUFLAND", "DM-DROGERIE", "ROSSMANN", "BIO COMPANY", "BUDNI", "MARKTKAUF", "TEGUT", "BACKEREI", "BÄCKEREI", "BAECKEREI"}, CatGroceries, anyDir},
-	{[]string{"RESTAURANT", "GASTHAUS", "GASTSTÄTTE", "GASTSTAETTE", "MCDONALD", "BURGER KING", "STARBUCKS", "PIZZA", "SUSHI", "DOENER", "DÖNER", "DINER", "LIEFERANDO", "WOLT", "UBER EATS", "TOO GOOD TO GO"}, CatDining, anyDir},
-	{[]string{"APOTHEKE", "PHARMACY", "TIERARZT", "ZAHNARZT", "HAUSARZT", "FACHARZT", "ARZTPRAXIS", "DOCTOR", "PHYSIO", "OPTIKER", "FIELMANN"}, CatHealth, anyDir},
-	{[]string{"DB-VERTRIEB", "DEUTSCHE BAHN", "BVG", "MVV", "VRR", "RMV", "HVV", "9-EURO", "DEUTSCHLANDTICKET", "FLIXBUS", "FLIXTRAIN", "TAXI", "TANKE", "TANKSTELLE", "ESSO", "ARAL", "SHELL", "TOTAL", "JET", "BP-TANK", "ADAC", "UBER", "BOLT", "LIME", "TIER", "KFZ", "TÜV"}, CatTransport, anyDir},
-	{[]string{"KINO", "CINEMA", "THEATER", "KONZERT", "TICKETMASTER", "EVENTIM", "STEAM", "PLAYSTATION", "XBOX", "FITNESS", "FITX", "MCFIT", "URBAN SPORTS", "CLEVER FIT"}, CatEntertainment, anyDir},
-	{[]string{"AMAZON", "OTTO", "ZALANDO", "MEDIAMARKT", "SATURN", "IKEA", "H&M", "ZARA", "C&A", "GALERIA", "BAUHAUS", "OBI", "TOOM", "HORNBACH"}, CatShopping, anyDir},
-	{[]string{"SCHULE", "UNIVERSITÄT", "UNIVERSITAET", "HOCHSCHULE", "STUDIENGEBÜHR", "STUDIENGEBUEHR", "SEMESTERBEITRAG", "VHS", "UDEMY", "COURSERA"}, CatEducation, anyDir},
+	{[]string{"REWE", "EDEKA", "LIDL", "ALDI", "PENNY", "NETTO", "KAUFLAND", "DM-DROGERIE", "ROSSMANN", "BIO COMPANY", "BUDNI", "MARKTKAUF", "TEGUT", "BACKEREI", "BÄCKEREI", "BAECKEREI"}, CatGroceries, anyDir, nil},
+	{[]string{"RESTAURANT", "GASTHAUS", "GASTSTÄTTE", "GASTSTAETTE", "MCDONALD", "BURGER KING", "STARBUCKS", "PIZZA", "SUSHI", "DOENER", "DÖNER", "DINER", "LIEFERANDO", "WOLT", "UBER EATS", "TOO GOOD TO GO"}, CatDining, anyDir, nil},
+	{[]string{"APOTHEKE", "PHARMACY", "TIERARZT", "ZAHNARZT", "HAUSARZT", "FACHARZT", "ARZTPRAXIS", "DOCTOR", "PHYSIO", "OPTIKER", "FIELMANN"}, CatHealth, anyDir, nil},
+	{[]string{"DB-VERTRIEB", "DEUTSCHE BAHN", "BVG", "MVV", "VRR", "RMV", "HVV", "9-EURO", "DEUTSCHLANDTICKET", "FLIXBUS", "FLIXTRAIN", "TAXI", "TANKE", "TANKSTELLE", "ESSO", "ARAL", "SHELL", "TOTAL", "JET", "BP-TANK", "ADAC", "UBER", "BOLT", "LIME", "TIER", "KFZ", "TÜV"}, CatTransport, anyDir, nil},
+	{[]string{"KINO", "CINEMA", "THEATER", "KONZERT", "TICKETMASTER", "EVENTIM", "STEAM", "PLAYSTATION", "XBOX", "FITNESS", "FITX", "MCFIT", "URBAN SPORTS", "CLEVER FIT"}, CatEntertainment, anyDir, nil},
+	{[]string{"AMAZON", "OTTO", "ZALANDO", "MEDIAMARKT", "SATURN", "IKEA", "H&M", "ZARA", "C&A", "GALERIA", "BAUHAUS", "OBI", "TOOM", "HORNBACH"}, CatShopping, anyDir, nil},
+	{[]string{"SCHULE", "UNIVERSITÄT", "UNIVERSITAET", "HOCHSCHULE", "STUDIENGEBÜHR", "STUDIENGEBUEHR", "SEMESTERBEITRAG", "VHS", "UDEMY", "COURSERA"}, CatEducation, anyDir, nil},
 
-	{[]string{"STEUER", "TAX"}, CatTax, anyDir},
+	{[]string{"STEUER", "TAX"}, CatTax, anyDir, nil},
 }
 
 // taxFeeKeywords mark a `fee` row as withheld tax rather than a charge.
@@ -313,7 +326,7 @@ func ClassifyWith(env Env, txType, counterparty, reference string) Category {
 		if (r.dir == inOnly && f == flowOut) || (r.dir == outOnly && f == flowIn) {
 			continue
 		}
-		if matchesAny(hay, r.keywords) {
+		if matchesAny(hay, r.keywords) && !matchesAny(hay, r.unless) {
 			cat, matched = r.category, true
 			break
 		}
@@ -424,7 +437,7 @@ func ResolveCategoryWith(env Env, override, txType, counterparty, reference stri
 // assign. CatUnclassified is deliberately not one of them.
 func IsKnown(c Category) bool {
 	switch c {
-	case CatSalary, CatInterest, CatDividend, CatRefund,
+	case CatSalary, CatBenefits, CatInterest, CatDividend, CatRefund,
 		CatHousing, CatUtilities, CatInsurance, CatSubscriptions, CatFees,
 		CatGroceries, CatDining, CatTransport, CatHealth,
 		CatEntertainment, CatShopping, CatEducation, CatTax, CatInvestment,
@@ -437,7 +450,7 @@ func IsKnown(c Category) bool {
 // AllCategories returns every category a user can assign, in display order.
 func AllCategories() []Category {
 	return []Category{
-		CatSalary, CatInterest, CatDividend, CatRefund,
+		CatSalary, CatBenefits, CatInterest, CatDividend, CatRefund,
 		CatHousing, CatUtilities, CatInsurance, CatSubscriptions, CatFees,
 		CatGroceries, CatDining, CatTransport, CatHealth,
 		CatEntertainment, CatShopping, CatEducation, CatTax,

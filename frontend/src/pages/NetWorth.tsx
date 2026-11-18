@@ -1549,7 +1549,7 @@ function ProjectionTab() {
     { label: 'Historical', color: tc.forest, style: 'solid' },
     { label: 'Projected', color: tc.gold, style: 'dashed' },
     ...(projData.has_confidence ? [{ label: 'Range, 10th to 90th percentile', color: tc.gold, style: 'band' as const }] : []),
-    ...(projData.target_amount > 0 ? [{ label: 'Target', color: tc.slate, style: 'dotted' as const }] : []),
+    ...(projData.target_amount > 0 ? [{ label: projData.target_goal_name ? `Goal: ${projData.target_goal_name}` : 'Target', color: tc.slate, style: 'dotted' as const }] : []),
     ...shownScenarios.map(({ s }, k) => ({ label: s.name, color: scenarioColors[k % scenarioColors.length], style: 'dashed' as const })),
   ];
 
@@ -1561,7 +1561,7 @@ function ProjectionTab() {
         subtitle={
           <>
             Investable wealth (cash and securities in every account, pension included) so far, and where it goes under the assumptions below. Property, vehicles and their loans are not projected.
-            {projData.target_amount > 0 && <> Target: <span data-privacy="blur">{fmtEUR(projData.target_amount)}</span>.</>}
+            {projData.target_amount > 0 && <> {projData.target_goal_name ? <>Goal “{projData.target_goal_name}”</> : 'Target'}: <span data-privacy="blur">{fmtEUR(projData.target_amount)}</span>.</>}
           </>
         }
       >
@@ -1662,7 +1662,7 @@ function ProjectionTab() {
                 },
               ] : []),
               ...(projData.target_amount > 0 ? [{
-                name: 'Target', type: 'line' as const, color: tc.slate,
+                name: projData.target_goal_name ? `Goal: ${projData.target_goal_name}` : 'Target', type: 'line' as const, color: tc.slate,
                 data: [...hist.map(() => null), ...proj.map(() => projData.target_amount)],
                 showSymbol: false, lineStyle: { width: 1.5, type: 'dotted' as const },
               }] : []),
@@ -1683,7 +1683,7 @@ function ProjectionTab() {
         <SectionBoundary>
           <Section
             title="Projection Milestones"
-            subtitle={<>Projected investable wealth, assuming a return of {fmtPct(projData.return_pct)} per year and <span data-privacy="blur">{fmtEUR(projData.contribution)}</span> paid in each month. “Real” is in today’s money at 2 % inflation.</>}
+            subtitle={<>Projected investable wealth, assuming a return of {fmtPct(projData.return_pct)} per year and <span data-privacy="blur">{fmtEUR(projData.contribution)}</span> paid in each month. “Contributed” is what you pay in from today, on top of today’s value. “Real” is in today’s money at 2 % inflation.</>}
           >
             {/* Phones: cards */}
             <ul className="md:hidden flex flex-col gap-2.5">
@@ -1740,8 +1740,8 @@ function ProjectionTab() {
           <Section
             title="Projection Accuracy"
             subtitle={acc.diff_pct >= 0
-              ? `Investable wealth is ${fmtPct(acc.diff_pct)} above what was projected ${acc.months_ago} months ago.`
-              : `Investable wealth is ${fmtPct(Math.abs(acc.diff_pct))} below what was projected ${acc.months_ago} months ago.`}
+              ? `Investable wealth is ${fmtPct(acc.diff_pct)} above the default projection made ${acc.months_ago} months ago${acc.assumed_contribution != null ? ` (${fmtEUR(acc.assumed_contribution)} a month at ${fmtPct(acc.assumed_return_pct ?? 0)})` : ''}.`
+              : `Investable wealth is ${fmtPct(Math.abs(acc.diff_pct))} below the default projection made ${acc.months_ago} months ago${acc.assumed_contribution != null ? ` (${fmtEUR(acc.assumed_contribution)} a month at ${fmtPct(acc.assumed_return_pct ?? 0)})` : ''}.`}
           >
             <MetricGrid>
               <MetricCard label={`${acc.months_ago} months ago`} value={fmtEUR(acc.past_value)} sublabel="Starting value" />

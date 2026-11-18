@@ -16,10 +16,10 @@ const TXN_TYPES = [
 // Cash-flow categories user can override transactions with. Must match
 // internal/cashflow.AllCategories() — backend rejects unknown values.
 const CASHFLOW_CATEGORIES = [
-  'salary', 'interest', 'refund',
+  'salary', 'benefits', 'interest', 'dividend', 'refund',
   'housing', 'utilities', 'insurance', 'subscriptions',
-  'groceries', 'dining', 'transport', 'health',
-  'entertainment', 'shopping', 'tax',
+  'groceries', 'dining', 'transport', 'health', 'education',
+  'entertainment', 'shopping', 'fees', 'tax',
   'investment', 'internal', 'asset_purchase', 'loan_payment', 'loan_principal', 'other',
 ];
 const categoryLabel = (c: string) => (c === 'internal' ? 'Internal transfer' : labelFor(c));

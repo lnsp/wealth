@@ -99,6 +99,19 @@ export interface HoldingRow {
   fx_exposure?: string;
   fx_impact_pct?: number;
   asset_return_pct?: number;
+  /** Date of the close behind `current_price`. */
+  price_date?: string;
+  /** Moving-average cost of the units held, each purchase at the ECB rate of its date (EUR). Tax uses FIFO. */
+  cost_basis_eur?: number;
+  avg_cost_eur?: number;
+  /** Average cost per unit in the currency it was paid in; absent when purchases mix currencies. */
+  avg_cost_paid?: number;
+  avg_cost_currency?: string;
+  /** Dividends on this position in EUR at each payment date's rate: gross, and net of withheld tax and fees. */
+  dividends_eur?: number;
+  dividends_net_eur?: number;
+  /** The ISIN's share of the whole portfolio across all accounts (for concentration). */
+  isin_weight_pct?: number | null;
 }
 
 export interface NetWorthSnapshot {
@@ -319,16 +332,29 @@ export interface UnvestedResponse {
 }
 
 export interface PerformanceData {
-  irr: number;
-  twr: number;
+  /** Annualised money-weighted return (IRR), %; null when no rate exists. */
+  irr: number | null;
+  irr_start?: string | null;
+  irr_years?: number;
+  /** IRR compounded over the history (not annualised), %. */
+  irr_period_return?: number | null;
+  /** Chained time-weighted return over the trailing 12 months (or the shorter history), %; null without capital. */
+  twr: number | null;
+  twr_start?: string | null;
+  twr_end?: string | null;
+  /** Days the value fell to zero without a recorded withdrawal; the TWR restarts after them. */
+  twr_resets?: string[];
   total_invested: number;
   total_withdrawn: number;
   transferred_in: number;
+  transferred_out?: number;
   current_value: number;
   total_return: number;
-  total_return_pct: number;
+  /** Modified Dietz return since inception: total gain ÷ average capital invested, %. */
+  total_return_pct: number | null;
   realized_pl: number;
   unrealized_pl: number;
+  account_count?: number;
 }
 
 export interface PerformanceHistoryPoint {
@@ -336,8 +362,10 @@ export interface PerformanceHistoryPoint {
   portfolio_value: number;
   cash_invested: number;
   in_kind_invested: number;
-  return_pct: number;
-  benchmark_pct?: number;
+  /** Chained time-weighted return since the first day with capital, %; null before that. */
+  return_pct: number | null;
+  /** Benchmark price return since the series' first benchmark date, %. */
+  benchmark_pct?: number | null;
 }
 
 export interface DividendData {
@@ -347,9 +375,14 @@ export interface DividendData {
   by_security: { isin: string; name: string; amount: number }[];
   cumulative: { month: string; amount: number; cumulative: number }[];
   trailing_12m: number;
-  yield_on_cost: number;
-  dividend_growth: number;
+  /** Trailing payouts of ISINs still held ÷ their EUR cost basis, %; null without cost basis. */
+  yield_on_cost: number | null;
+  /** null when the prior 12 months paid nothing. */
+  dividend_growth: number | null;
   calendar?: { month: string; isin: string; name: string; expected: number }[];
+  /** Gross amounts above; these subtract withheld tax and fees. */
+  total_net?: number;
+  trailing_12m_net?: number;
 }
 
 export interface ETFHoldingEntry {
@@ -597,9 +630,13 @@ export interface AllocationEntry {
   name: string;
   actual_pct: number;
   target_pct: number;
+  /** Target drift is measured against: scaled to a 100 % total; 0 for a held ISIN without a target. */
+  effective_target_pct?: number;
   drift_pct: number;
   value: number;
   status: 'on_target' | 'underweight' | 'overweight';
+  /** Held but without a target while other targets exist: the rebalancer sells it. */
+  untargeted?: boolean;
 }
 
 export interface SavingsRateData {
@@ -667,6 +704,9 @@ export interface AllocationData {
   has_targets: boolean;
   max_drift: number;
   total_value: number;
+  /** Targets as stored; when they don't add up to 100 %, drift uses them scaled to 100 %. */
+  target_sum?: number;
+  targets_normalised?: boolean;
 }
 
 export interface GoalProgress {
@@ -738,7 +778,7 @@ export const api = {
 
   // Portfolio
   listHoldings: (accountId?: string) =>
-    request<{ holdings: HoldingRow[]; price_as_of?: string }>(
+    request<{ holdings: HoldingRow[]; price_as_of?: string; price_newest?: string }>(
       `/portfolio/holdings${accountId ? `?account_id=${accountId}` : ''}`
     ),
   getNetWorth: (days = 365) => request<{ snapshots: NetWorthSnapshot[] }>(`/portfolio/networth?days=${days}`),
@@ -775,12 +815,15 @@ export const api = {
   matchLoanPayments: () => request<{ matched: number }>('/loans/match', { method: 'POST' }),
   getPerformance: (accountId?: string) =>
     request<PerformanceData>(`/portfolio/performance${accountId ? `?account_id=${accountId}` : ''}`),
-  getPerformanceHistory: () => request<{ history: PerformanceHistoryPoint[] }>('/portfolio/performance-history'),
+  getPerformanceHistory: (accountId?: string) =>
+    request<{ history: PerformanceHistoryPoint[]; twr_resets?: string[] }>(
+      `/portfolio/performance-history${accountId ? `?account_id=${accountId}` : ''}`
+    ),
   getDividends: () => request<DividendData>('/portfolio/dividends'),
   getAllocation: () => request<AllocationData>('/portfolio/allocation'),
   getSavingsRate: () => request<SavingsRateData>('/portfolio/savings-rate'),
   getRebalance: (deposit?: number) =>
-    request<{ trades: RebalanceTrade[]; message: string; deposit: number }>(
+    request<{ trades: RebalanceTrade[]; message: string; deposit: number; unallocated?: number; target_sum?: number; targets_normalised?: boolean; min_trade?: number }>(
       `/portfolio/rebalance${deposit ? `?deposit=${deposit}` : ''}`
     ),
   setAllocation: (allocations: { isin: string; target_pct: number }[]) =>
@@ -812,7 +855,7 @@ export const api = {
       `/analysis/sell-simulator${qs}`, { method: 'POST', body: JSON.stringify(requests) });
   },
   getCorrelation: () => request<{ labels: string[]; matrix: number[][] }>('/analysis/correlation'),
-  getAllocationHistory: () => request<{ history: { date: string; weights: Record<string, number> }[]; holdings: string[] }>('/analysis/allocation-history'),
+  getAllocationHistory: () => request<{ history: { date: string; weights: Record<string, number> }[]; holdings: string[]; basis?: string }>('/analysis/allocation-history'),
   getFXHistory: () => request<{ rates: Record<string, { date: string; rate: number }[]> }>('/analysis/fx-history'),
   // Users
   listUsers: () => request<{ users: { id: string; username: string; role: string; is_active: boolean; created_at: string; totp_enabled: boolean }[] }>('/settings/users'),
@@ -831,12 +874,13 @@ export const api = {
   getUnvested: () => request<UnvestedResponse>('/portfolio/unvested'),
 
   getAttribution: () => request<{ contributions: { isin: string; name: string; change: number }[]; total_change: number; summary: string }>('/portfolio/attribution'),
-  getSavingsPlans: () => request<{ plans: { isin: string; name: string; monthly_amount: number; executions: number; total_invested: number; total_shares: number; avg_cost_basis: number; first_date: string; last_date: string; months_active: number; current_value: number; dca_return_pct: number; lump_sum_value: number; lump_sum_return_pct: number; dca_advantage_eur: number }[]; total_monthly: number; plan_count: number }>('/portfolio/savings-plans'),
+  getSavingsPlans: () => request<{ plans: { isin: string; name: string; monthly_amount: number; trailing_12m_monthly?: number; executions: number; total_invested: number; total_shares: number; avg_cost_basis: number; first_date: string; last_date: string; months_active: number; months_with_purchase?: number; lump_sum_count?: number; lump_sum_amount?: number; current_value: number; plan_value?: number; dca_return_pct: number; lump_sum_value: number; lump_sum_return_pct: number; dca_advantage_eur: number }[]; total_monthly: number; plan_count: number; inactive_count?: number }>('/portfolio/savings-plans'),
   getSecurityDetail: (isin: string) => request<{
     isin: string; name: string; symbol: string; asset_class: string; ter: number; price: number;
     positions: { account: string; quantity: number; cost_basis: number; value: number }[];
     total_quantity: number; total_cost: number; total_value: number; unrealized_pl: number;
     weight_pct: number; first_buy: string;
+    avg_cost_paid?: number | null; avg_cost_currency?: string;
     sparkline: { date: string; price: number }[];
     transactions: { date: string; type: string; quantity: number; amount: number; running_qty: number }[];
   }>(`/portfolio/security/${isin}`),

@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -49,6 +51,12 @@ type CreateAccountRequest struct {
 	TaxTreatment       string   `json:"tax_treatment"`
 	EmployerMatchPct   *float64 `json:"employer_match_pct"`
 	ImportSecurityISIN string   `json:"import_security_isin"`
+}
+
+// validEmployerMatchPct accepts a percentage of the employee contribution,
+// 0–100 (accounts.employer_match_pct is NUMERIC(7,4) since migration 032).
+func validEmployerMatchPct(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v <= 100
 }
 
 func (h *SettingsHandler) HandleCreateAccount(w http.ResponseWriter, r *http.Request) {
@@ -101,16 +109,16 @@ func (h *SettingsHandler) HandleCreateAccount(w http.ResponseWriter, r *http.Req
 
 	var employerMatch pgtype.Numeric
 	if req.EmployerMatchPct != nil {
-		if math.IsNaN(*req.EmployerMatchPct) || math.IsInf(*req.EmployerMatchPct, 0) || *req.EmployerMatchPct < 0 {
-			writeError(w, http.StatusBadRequest, "invalid employer_match_pct")
+		if !validEmployerMatchPct(*req.EmployerMatchPct) {
+			writeError(w, http.StatusBadRequest, "employer_match_pct must be a percentage between 0 and 100")
 			return
 		}
 		employerMatch.Scan(fmt.Sprintf("%f", *req.EmployerMatchPct))
 	}
 
 	importISIN := pgtype.Text{}
-	if req.ImportSecurityISIN != "" {
-		importISIN = pgtype.Text{String: req.ImportSecurityISIN, Valid: true}
+	if isin := strings.ToUpper(strings.TrimSpace(req.ImportSecurityISIN)); isin != "" {
+		importISIN = pgtype.Text{String: isin, Valid: true}
 	}
 
 	acc, err := h.queries.CreateAccount(r.Context(), db.CreateAccountParams{
@@ -203,8 +211,8 @@ func (h *SettingsHandler) HandleUpdateAccount(w http.ResponseWriter, r *http.Req
 	}
 	employerMatch := acc.EmployerMatchPct
 	if req.EmployerMatchPct != nil {
-		if math.IsNaN(*req.EmployerMatchPct) || math.IsInf(*req.EmployerMatchPct, 0) || *req.EmployerMatchPct < 0 {
-			writeError(w, http.StatusBadRequest, "invalid employer_match_pct")
+		if !validEmployerMatchPct(*req.EmployerMatchPct) {
+			writeError(w, http.StatusBadRequest, "employer_match_pct must be a percentage between 0 and 100")
 			return
 		}
 		employerMatch = pgtype.Numeric{}
@@ -212,10 +220,10 @@ func (h *SettingsHandler) HandleUpdateAccount(w http.ResponseWriter, r *http.Req
 	}
 	importISIN := acc.ImportSecurityISIN
 	if req.ImportSecurityISIN != nil {
-		if *req.ImportSecurityISIN == "" {
+		if isin := strings.ToUpper(strings.TrimSpace(*req.ImportSecurityISIN)); isin == "" {
 			importISIN = pgtype.Text{}
 		} else {
-			importISIN = pgtype.Text{String: *req.ImportSecurityISIN, Valid: true}
+			importISIN = pgtype.Text{String: isin, Valid: true}
 		}
 	}
 	currency := acc.Currency
@@ -331,42 +339,59 @@ func (h *SettingsHandler) HandleExportTransactions(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusInternalServerError, "list transactions: "+err.Error())
 		return
 	}
+	// Only the caller's accounts (nil = household scope, every account).
+	if allowedIDs := userAccountIDs(r.Context(), h.queries.DB()); allowedIDs != nil {
+		allowed := make(map[uuid.UUID]bool, len(allowedIDs))
+		for _, id := range allowedIDs {
+			allowed[id] = true
+		}
+		filtered := txns[:0]
+		for _, t := range txns {
+			if allowed[t.AccountID] {
+				filtered = append(filtered, t)
+			}
+		}
+		txns = filtered
+	}
 
 	filename := fmt.Sprintf("transactions-%s.csv", time.Now().UTC().Format("2006-01-02"))
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 
-	// Write BOM for Excel compatibility
-	w.Write([]byte{0xEF, 0xBB, 0xBF})
-	// Header
-	w.Write([]byte("date;type;account;counterparty;security_isin;quantity;price;amount;fee;tax;currency;reference\n"))
-
-	for _, t := range txns {
-		isin := ""
-		if t.SecurityISIN.Valid {
-			isin = t.SecurityISIN.String
-		}
-		counterparty := ""
-		if t.Counterparty.Valid {
-			counterparty = t.Counterparty.String
-		}
-		ref := ""
-		if t.Reference.Valid {
-			ref = t.Reference.String
-		}
-
-		qty := numericToFloat(t.Quantity)
-		price := numericToFloat(t.Price)
-		amt := numericToFloat(t.Amount)
-		fee := numericToFloat(t.Fee)
-		tax := numericToFloat(t.Tax)
-
-		line := fmt.Sprintf("%s;%s;%s;%s;%s;%.8f;%.8f;%.4f;%.4f;%.4f;%s;%s\n",
-			t.Date.Format("2006-01-02"), t.Type, t.AccountName,
-			counterparty, isin, qty, price, amt, fee, tax,
-			t.Currency, ref)
-		w.Write([]byte(line))
+	if err := writeTransactionsCSV(w, txns); err != nil {
+		log.Printf("WARNING: export transactions: %v", err)
 	}
+}
+
+// writeTransactionsCSV writes the export that WealthExportParser re-imports:
+// UTF-8 BOM (for Excel), semicolon-separated, fixed header and number
+// formats. encoding/csv quotes any field that contains the separator, a quote
+// or a line break, so a counterparty like "Miete; NK" stays one column.
+func writeTransactionsCSV(out io.Writer, txns []db.ListAllTransactionsForExportRow) error {
+	if _, err := out.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
+		return err
+	}
+	cw := csv.NewWriter(out)
+	cw.Comma = ';'
+	if err := cw.Write([]string{"date", "type", "account", "counterparty", "security_isin", "quantity", "price", "amount", "fee", "tax", "currency", "reference"}); err != nil {
+		return err
+	}
+	for _, t := range txns {
+		if err := cw.Write([]string{
+			t.Date.Format("2006-01-02"), t.Type, t.AccountName,
+			t.Counterparty.String, t.SecurityISIN.String,
+			fmt.Sprintf("%.8f", numericToFloat(t.Quantity)),
+			fmt.Sprintf("%.8f", numericToFloat(t.Price)),
+			fmt.Sprintf("%.4f", numericToFloat(t.Amount)),
+			fmt.Sprintf("%.4f", numericToFloat(t.Fee)),
+			fmt.Sprintf("%.4f", numericToFloat(t.Tax)),
+			t.Currency, t.Reference.String,
+		}); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	return cw.Error()
 }
 
 func numericToFloat(n pgtype.Numeric) float64 {

@@ -19,17 +19,18 @@ import (
 // be zero — otherwise the account would carry phantom cash that the rest
 // of the system never spends.
 //
-// "Cash flow" here = sum over txns of:
-//   +amount for type=deposit / dividend / interest / sell / cash_transfer_in
-//   −amount for type=withdrawal / fee / tax / buy / savings_plan / cash_transfer_out
-//   0       for type=transfer / transfer_out (in-kind, no cash impact)
+// "Cash flow" here mirrors txnSignedCashDelta (internal/handler/fx_cash.go):
+//   +amount − fee − tax for type=deposit / dividend / interest / sell / cash_transfer_in
+//   −amount − fee − tax for type=withdrawal / fee / tax / buy / savings_plan / cash_transfer_out
+//   0                   for type=transfer / transfer_out (in-kind, no cash impact)
+// (Fees are counted since the audit fix that stores MS sales gross plus fee.)
 
 func cashImpactOf(t Transaction) float64 {
 	switch t.Type {
 	case "deposit", "dividend", "interest", "sell", "cash_transfer_in":
-		return t.Amount
+		return t.Amount - t.Fee - t.Tax
 	case "withdrawal", "fee", "tax", "buy", "savings_plan", "cash_transfer_out":
-		return -t.Amount
+		return -t.Amount - t.Fee - t.Tax
 	}
 	return 0 // transfer / transfer_out are in-kind
 }
@@ -87,7 +88,8 @@ func TestMorganStanley_RemainsCashNeutralAcrossAllReports(t *testing.T) {
 		switch txn.Type {
 		case "sell":
 			sells++
-			sellByOrder[strings.TrimSuffix(txn.Reference, "-wire")] = txn.Amount
+			// The wire pays out the net proceeds: gross minus the fee.
+			sellByOrder[strings.TrimSuffix(txn.Reference, "-wire")] = txn.Amount - txn.Fee
 		case "withdrawal":
 			wires++
 			wireByOrder[strings.TrimSuffix(txn.Reference, "-wire")] = txn.Amount

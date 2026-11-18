@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -126,28 +127,32 @@ Please note that any Alphabet share sales, transfers, or deposits...`
 	}
 
 	var sells, withdrawals int
-	var sellAmount, withdrawalAmount float64
+	var sellNet, withdrawalAmount float64
 	for _, txn := range txns {
 		switch txn.Type {
 		case "sell":
 			sells++
-			sellAmount = txn.Amount
+			sellNet = txn.Amount - txn.Fee
 			if txn.Quantity != 39.972 {
 				t.Errorf("sell quantity = %v, want 39.972", txn.Quantity)
 			}
-			if txn.Amount < 3830.17 || txn.Amount > 3830.19 {
-				t.Errorf("sell amount = %v, want ~3830.18", txn.Amount)
+			// Gross = 39.972 × 96.01 = 3837.71; MS deducted 7.53 to pay out 3830.18.
+			if math.Abs(txn.Amount-3837.71) > 1e-9 || math.Abs(txn.Fee-7.53) > 1e-9 {
+				t.Errorf("sell amount = %v fee %v, want gross 3837.71 and fee 7.53", txn.Amount, txn.Fee)
 			}
 		case "withdrawal":
 			withdrawals++
 			withdrawalAmount = txn.Amount
+			if withdrawalAmount < 3830.17 || withdrawalAmount > 3830.19 {
+				t.Errorf("auto-wire = %v, want the net 3830.18", withdrawalAmount)
+			}
 		}
 	}
 	if sells != 1 || withdrawals != 1 {
 		t.Errorf("type breakdown: sell=%d withdrawal=%d, want 1/1", sells, withdrawals)
 	}
-	if sellAmount != withdrawalAmount {
-		t.Errorf("sell (%v) and auto-wire withdrawal (%v) must cancel out", sellAmount, withdrawalAmount)
+	if math.Abs(sellNet-withdrawalAmount) > 1e-9 {
+		t.Errorf("sell net (%v) and auto-wire withdrawal (%v) must cancel out", sellNet, withdrawalAmount)
 	}
 }
 

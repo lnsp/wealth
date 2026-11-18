@@ -17,32 +17,83 @@ function periodLabel(label: string): string {
   return /^\d{4}-\d{2}$/.test(label) ? fmtMonth(`${label}-01`) : label;
 }
 
+const changeTone = (v: number) => (v > 0 ? 'positive' : v < 0 ? 'negative' : 'neutral');
+
 function ReportDetail({ report, onClose }: { report: WealthReportDetail; onClose: () => void }) {
   const d = report.data;
+  const hasNetWorth = d.has_net_worth !== false;
+  const withheld = d.dividends_withheld ?? 0;
   return (
     <div className={`${FORM_CARD} mt-4`}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <SubHeading>Report for {periodLabel(report.period_label)}</SubHeading>
         <button type="button" onClick={onClose} className={ROW_BTN}>Close</button>
       </div>
-      <MetricGrid>
-        <MetricCard label="Net worth at start" value={fmtEUR(d.net_worth_start)} />
-        <MetricCard label="Net worth at end" value={fmtEUR(d.net_worth_end)} />
-        <MetricCard
-          label="Change"
-          value={fmtEUR(d.net_worth_change, { sign: true })}
-          tone={d.net_worth_change > 0 ? 'positive' : d.net_worth_change < 0 ? 'negative' : 'neutral'}
-          sublabel={fmtPct(d.net_worth_change_pct, { sign: true })}
-        />
-        <MetricCard label="Dividends" value={fmtEUR(d.total_dividends, { cents: true })} />
-      </MetricGrid>
+      {hasNetWorth ? (
+        <MetricGrid>
+          <MetricCard
+            label="Previous close"
+            value={fmtEUR(d.net_worth_start)}
+            sublabel={d.start_date ? `Net worth on ${fmtDate(d.start_date)}` : 'No earlier history'}
+          />
+          <MetricCard
+            label="Close"
+            value={fmtEUR(d.net_worth_end)}
+            sublabel={d.end_date ? `Net worth on ${fmtDate(d.end_date)}` : undefined}
+          />
+          <MetricCard
+            label="Change"
+            value={fmtEUR(d.net_worth_change, { sign: true })}
+            tone={changeTone(d.net_worth_change)}
+            sublabel={d.net_worth_start > 0 ? fmtPct(d.net_worth_change_pct, { sign: true }) : undefined}
+          />
+          {d.net_deposits != null && (
+            <MetricCard
+              label="Net deposits"
+              value={fmtEUR(d.net_deposits, { sign: true })}
+              sublabel="Deposits and vested shares, less withdrawals"
+            />
+          )}
+          {d.market_change != null && (
+            <MetricCard
+              label="Market and other"
+              value={fmtEUR(d.market_change, { sign: true })}
+              tone={changeTone(d.market_change)}
+              sublabel="Prices, income, fees and revaluations"
+            />
+          )}
+          <MetricCard
+            label="Dividends, net"
+            value={fmtEUR(d.total_dividends, { cents: true })}
+            sublabel={withheld > 0
+              ? `${fmtEUR(d.dividends_gross, { cents: true })} gross, ${fmtEUR(withheld, { cents: true })} withheld`
+              : 'As credited'}
+          />
+        </MetricGrid>
+      ) : (
+        <p className="text-[14px] text-ink-body">There is no net worth history for this period yet.</p>
+      )}
       <div className="text-[13px] text-ink-body flex flex-col gap-1">
         {d.top_gainer && <p>Best holding: {d.top_gainer.name} ({fmtPct(d.top_gainer.return_pct, { sign: true })})</p>}
         {d.top_loser && <p>Weakest holding: {d.top_loser.name} ({fmtPct(d.top_loser.return_pct, { sign: true })})</p>}
         <p>{plural(d.new_transactions ?? 0, 'transaction')} in the period</p>
+        {(d.warnings ?? []).map((w, i) => <p key={i} className="text-ink-muted">{w}</p>)}
+        <p className="text-ink-muted">
+          Figures are recalculated from the current net worth history each time a report is opened.
+          Foreign dividends use the exchange rate of the payment date.
+        </p>
       </div>
     </div>
   );
+}
+
+/** Period of a stored report ("2026-10" or "2026") as the generate request expects it. */
+function reportPeriod(rpt: WealthReportSummary): { report_type: string; year: number; month?: number } | null {
+  const m = /^(\d{4})(?:-(\d{2}))?$/.exec(rpt.period_label);
+  if (!m) return null;
+  return m[2]
+    ? { report_type: 'monthly', year: Number(m[1]), month: Number(m[2]) }
+    : { report_type: 'annual', year: Number(m[1]) };
 }
 
 function ReportsSection() {
@@ -50,6 +101,7 @@ function ReportsSection() {
   const reports: WealthReportSummary[] = data?.reports ?? [];
   const [selected, setSelected] = useState<WealthReportDetail | null>(null);
   const [generating, setGenerating] = useState(false);
+  const [regenerating, setRegenerating] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
   const [actionError, setActionError] = useState('');
 
@@ -65,6 +117,22 @@ function ReportsSection() {
       setActionError(errorText(err, 'The report couldn’t be generated.'));
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const regenerate = async (rpt: WealthReportSummary) => {
+    const period = reportPeriod(rpt);
+    if (!period) return;
+    setActionError('');
+    setRegenerating(rpt.id);
+    try {
+      await api.generateReport(period);
+      await reload();
+      if (selected?.id === rpt.id) setSelected(await api.getReport(rpt.id));
+    } catch (err) {
+      setActionError(errorText(err, `The report for ${periodLabel(rpt.period_label)} couldn’t be regenerated.`));
+    } finally {
+      setRegenerating(null);
     }
   };
 
@@ -114,6 +182,17 @@ function ReportsSection() {
                 <div className="flex flex-wrap gap-2">
                   <button type="button" onClick={() => view(rpt.id)} aria-label={`View report for ${periodLabel(rpt.period_label)}`} className={ROW_BTN}>View</button>
                   <a href={`/api/settings/reports/${rpt.id}/pdf`} download aria-label={`PDF of report for ${periodLabel(rpt.period_label)}`} className={ROW_BTN}>PDF</a>
+                  {reportPeriod(rpt) && (
+                    <button
+                      type="button"
+                      onClick={() => regenerate(rpt)}
+                      disabled={regenerating === rpt.id}
+                      aria-label={`Regenerate report for ${periodLabel(rpt.period_label)}`}
+                      className={ROW_BTN}
+                    >
+                      {regenerating === rpt.id ? 'Regenerating…' : 'Regenerate'}
+                    </button>
+                  )}
                 </div>
               </li>
             ))}

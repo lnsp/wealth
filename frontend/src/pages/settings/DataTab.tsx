@@ -227,7 +227,7 @@ export default function DataTab() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-[15px] font-medium text-ink">Export transactions</p>
-            <p className="text-[13px] text-ink-muted mt-0.5">Download all transactions as a CSV file.</p>
+            <p className="text-[13px] text-ink-muted mt-0.5">Download all transactions as a semicolon-separated CSV file that can be imported again.</p>
           </div>
           <a href="/api/settings/export-transactions" className="apple-btn-secondary min-h-[44px] md:min-h-[40px]">Download CSV</a>
         </div>

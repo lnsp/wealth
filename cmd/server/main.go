@@ -354,16 +354,7 @@ func main() {
 			}
 			r.Post("/settings/users/{id}/totp/verify", usersH.HandleVerifyTOTP)
 			r.Delete("/settings/users/{id}/totp", usersH.HandleDisableTOTP)
-			r.Get("/import-history", func(w http.ResponseWriter, req *http.Request) {
-				history, err := queries.ListImportHistory(req.Context(), 50)
-				if err != nil {
-					w.Header().Set("Content-Type", "application/json")
-					json.NewEncoder(w).Encode(map[string]any{"history": []any{}})
-					return
-				}
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]any{"history": history})
-			})
+			r.Get("/import-history", importH.HandleImportHistory)
 			r.Get("/settings/scheduler-status", func(w http.ResponseWriter, req *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]any{

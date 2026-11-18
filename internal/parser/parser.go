@@ -49,8 +49,13 @@ type Transaction struct {
 
 // ImportResult contains summary statistics from a CSV import.
 type ImportResult struct {
-	Imported      int      `json:"imported"`
-	Skipped       int      `json:"skipped"`
+	Imported int `json:"imported"`
+	// Skipped counts rows that were already stored unchanged (same import
+	// hash, or an equivalent row from an older importer version).
+	Skipped int `json:"skipped"`
+	// Updated counts rows already stored under the same import hash whose
+	// type, security, quantity or price the re-import corrected.
+	Updated       int      `json:"updated"`
 	RSUVests      int      `json:"rsu_vests,omitempty"`
 	NewSecurities []string `json:"new_securities"`
 	Institution   string   `json:"institution"`

@@ -5,16 +5,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-pdf/fpdf"
 	"github.com/google/uuid"
 
+	"github.com/lnsp/wealth/internal/analytics"
+	"github.com/lnsp/wealth/internal/assets"
 	db "github.com/lnsp/wealth/internal/database/generated"
+	"github.com/lnsp/wealth/internal/market"
 )
 
 type ReportsHandler struct {
@@ -25,29 +30,55 @@ func NewReportsHandler(q *db.Queries) *ReportsHandler {
 	return &ReportsHandler{queries: q}
 }
 
-// ReportData is the JSON structure stored in wealth_reports.data.
+// ReportData is the JSON structure of a wealth report. The figures are
+// recomputed from the current snapshots and transactions every time a report
+// is opened or downloaded, so a rebuilt net worth history or a corrected
+// import shows up in old reports too; wealth_reports.data keeps the copy from
+// the last (re)generation for the digest and as a fallback.
 type ReportData struct {
-	NetWorthStart    float64          `json:"net_worth_start"`
-	NetWorthEnd      float64          `json:"net_worth_end"`
-	NetWorthChange   float64          `json:"net_worth_change"`
-	NetWorthChangePct float64         `json:"net_worth_change_pct"`
-	TotalDividends   float64          `json:"total_dividends"`
-	NewTransactions  int              `json:"new_transactions"`
-	Holdings         []ReportHolding  `json:"holdings"`
-	TopGainer        *ReportHolding   `json:"top_gainer,omitempty"`
-	TopLoser         *ReportHolding   `json:"top_loser,omitempty"`
+	// HasNetWorth is false when no net worth snapshot (after the first
+	// non-zero one) falls in the period; the net worth figures are then 0.
+	HasNetWorth bool `json:"has_net_worth"`
+	// StartDate is the snapshot used as the opening value: the last one
+	// before the period (the previous period's close). Empty when there is
+	// no earlier history, in which case the opening value is 0.
+	StartDate         string  `json:"start_date,omitempty"`
+	EndDate           string  `json:"end_date,omitempty"`
+	NetWorthStart     float64 `json:"net_worth_start"`
+	NetWorthEnd       float64 `json:"net_worth_end"`
+	NetWorthChange    float64 `json:"net_worth_change"`
+	NetWorthChangePct float64 `json:"net_worth_change_pct"`
+	// NetDeposits is money and shares that entered net worth from outside
+	// (deposits, RSU vests and other in-kind receipts, minus withdrawals);
+	// MarketChange is the rest of the change: price moves, income, fees,
+	// taxes and revaluations of physical assets.
+	NetDeposits  float64 `json:"net_deposits"`
+	MarketChange float64 `json:"market_change"`
+	// TotalDividends is net: what was credited after tax and fees withheld
+	// at source. DividendsGross is the booked dividend amount and
+	// DividendsWithheld the tax and fees booked on the same rows. Foreign
+	// dividends use the ECB rate of the payment date.
+	TotalDividends    float64         `json:"total_dividends"`
+	DividendsGross    float64         `json:"dividends_gross"`
+	DividendsWithheld float64         `json:"dividends_withheld"`
+	NewTransactions   int             `json:"new_transactions"`
+	Holdings          []ReportHolding `json:"holdings"`
+	// TopGainer and TopLoser are only set with at least two holdings.
+	TopGainer *ReportHolding `json:"top_gainer,omitempty"`
+	TopLoser  *ReportHolding `json:"top_loser,omitempty"`
+	Warnings  []string       `json:"warnings,omitempty"`
 }
 
 type ReportHolding struct {
-	ISIN       string  `json:"isin"`
-	Name       string  `json:"name"`
-	Value      float64 `json:"value"`
-	Weight     float64 `json:"weight"`
-	ReturnPct  float64 `json:"return_pct,omitempty"`
+	ISIN      string  `json:"isin"`
+	Name      string  `json:"name"`
+	Value     float64 `json:"value"`
+	Weight    float64 `json:"weight"`
+	ReturnPct float64 `json:"return_pct,omitempty"`
 }
 
 func (h *ReportsHandler) HandleListReports(w http.ResponseWriter, r *http.Request) {
-	reports, err := h.queries.ListWealthReports(r.Context(), 24)
+	reports, err := h.queries.ListWealthReports(r.Context(), 240)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list reports: "+err.Error())
 		return
@@ -75,6 +106,19 @@ func (h *ReportsHandler) HandleListReports(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{"reports": items})
 }
 
+// currentReportData recomputes a stored report's figures from today's data,
+// falling back to the stored copy if that fails.
+func (h *ReportsHandler) currentReportData(ctx context.Context, rpt db.WealthReport) ReportData {
+	data, err := h.loadReportData(ctx, rpt.PeriodStart, rpt.PeriodEnd)
+	if err == nil {
+		return data
+	}
+	log.Printf("WARNING: recompute report %s: %v; using stored figures", rpt.PeriodLabel, err)
+	var stored ReportData
+	_ = json.Unmarshal(rpt.Data, &stored)
+	return stored
+}
+
 func (h *ReportsHandler) HandleGetReport(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
@@ -88,8 +132,7 @@ func (h *ReportsHandler) HandleGetReport(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var data ReportData
-	json.Unmarshal(rpt.Data, &data)
+	data := h.currentReportData(r.Context(), rpt)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":           rpt.ID.String(),
@@ -98,11 +141,13 @@ func (h *ReportsHandler) HandleGetReport(w http.ResponseWriter, r *http.Request)
 		"period_start": rpt.PeriodStart.Format("2006-01-02"),
 		"period_end":   rpt.PeriodEnd.Format("2006-01-02"),
 		"generated_at": rpt.GeneratedAt.Format(time.RFC3339),
+		"computed_at":  time.Now().UTC().Format(time.RFC3339),
 		"data":         data,
 	})
 }
 
-// HandleGenerateReport triggers generation of a report for a given period.
+// HandleGenerateReport generates the report for a period, replacing the
+// stored figures when the period already has a report (regenerate).
 func (h *ReportsHandler) HandleGenerateReport(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ReportType string `json:"report_type"` // "monthly" or "annual"
@@ -141,16 +186,29 @@ func (h *ReportsHandler) HandleGenerateReport(w http.ResponseWriter, r *http.Req
 		periodLabel = periodStart.Format("2006")
 	}
 
-	// Check if report already exists
-	exists, _ := h.queries.ReportExistsForPeriod(ctx, db.ReportExistsForPeriodParams{ReportType: req.ReportType, PeriodLabel: periodLabel})
-	if exists {
-		writeError(w, http.StatusConflict, "report already exists for "+periodLabel)
+	data, err := h.loadReportData(ctx, periodStart, periodEnd)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "compute report: "+err.Error())
+		return
+	}
+	dataJSON, err := json.Marshal(data)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "encode report: "+err.Error())
 		return
 	}
 
-	data := h.computeReport(ctx, periodStart, periodEnd)
-	dataJSON, _ := json.Marshal(data)
-
+	replaced, err := h.queries.UpdateWealthReportForPeriod(ctx, db.UpdateWealthReportForPeriodParams{
+		ReportType: req.ReportType, PeriodLabel: periodLabel, Data: dataJSON,
+		PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "save report: "+err.Error())
+		return
+	}
+	if replaced > 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "period": periodLabel, "regenerated": true})
+		return
+	}
 	if err := h.queries.InsertWealthReport(ctx, db.InsertWealthReportParams{
 		ReportType: req.ReportType, PeriodLabel: periodLabel, PeriodStart: periodStart, PeriodEnd: periodEnd, Data: dataJSON,
 	}); err != nil {
@@ -158,139 +216,233 @@ func (h *ReportsHandler) HandleGenerateReport(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{"status": "ok", "period": periodLabel})
+	writeJSON(w, http.StatusCreated, map[string]any{"status": "ok", "period": periodLabel, "regenerated": false})
 }
 
-func (h *ReportsHandler) computeReport(ctx context.Context, start, end time.Time) ReportData {
-	// Get net worth at start and end of period
-	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 5000)
+// loadReportData loads everything a report needs and computes it for the
+// calendar period [start, end].
+func (h *ReportsHandler) loadReportData(ctx context.Context, start, end time.Time) (ReportData, error) {
+	snaps, err := h.queries.ListNetWorthSnapshots(ctx, 100000)
+	if err != nil {
+		return ReportData{}, fmt.Errorf("list snapshots: %w", err)
+	}
+	txns, err := listAllTransactionsRows(ctx, h.queries)
+	if err != nil {
+		return ReportData{}, fmt.Errorf("list transactions: %w", err)
+	}
+	accounts, err := h.queries.ListAccounts(ctx)
+	if err != nil {
+		return ReportData{}, fmt.Errorf("list accounts: %w", err)
+	}
+	secs, err := h.queries.ListSecurities(ctx)
+	if err != nil {
+		log.Printf("WARNING: list securities for report: %v; holdings show ISINs", err)
+	}
+	hist := loadHistoricalFXRates(ctx, h.queries)
+	latest := loadFXRatesMap(ctx, h.queries)
 
-	nwStart, nwEnd := 0.0, 0.0
+	holdings, err := assets.Load(ctx, h.queries)
+	if err != nil {
+		log.Printf("WARNING: load assets for report: %v", err)
+	}
+	physical := buildPhysicalAttributionWithFX(holdings, txns, assets.CivilDate(time.Now()), hist, latest)
+
+	chrono := make([]db.ListTransactionsRow, len(txns))
+	for i := range txns {
+		chrono[i] = txns[len(txns)-1-i]
+	}
+
+	secNames := make(map[string]string, len(secs))
+	for _, s := range secs {
+		secNames[s.ISIN] = s.Name
+	}
+
+	return buildReportData(reportInputs{
+		start:    start,
+		end:      end,
+		snaps:    snaps,
+		txns:     txns,
+		implicit: computeImplicitCashClampEvents(accounts, chrono, hist, latest),
+		physical: physical,
+		fx:       newReportFX(hist, latest),
+		secNames: secNames,
+		priceAt: func(isin string, at time.Time) (float64, string, bool) {
+			row, err := h.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{SecurityISIN: isin, Date: at})
+			if err != nil || !row.Close.Valid {
+				return 0, "", false
+			}
+			return numericToFloat(row.Close), row.Currency, true
+		},
+	}), nil
+}
+
+// reportInputs is everything buildReportData reads; it touches no database.
+type reportInputs struct {
+	start, end time.Time // calendar period, both days inclusive
+	snaps      []db.NetWorthSnapshot
+	txns       []db.ListTransactionsRow // newest first, as ListAllTransactions returns them
+	implicit   []implicitCashFlowEvent
+	physical   physicalAttribution
+	fx         reportFX
+	secNames   map[string]string
+	priceAt    func(isin string, at time.Time) (close float64, currency string, ok bool)
+}
+
+// reportFX converts to EUR at the ECB rate of a given day.
+type reportFX struct {
+	byCur  map[string][]market.HistoricalFXRate // per currency, date ascending
+	latest map[string]float64
+}
+
+func newReportFX(hist []market.HistoricalFXRate, latest map[string]float64) reportFX {
+	byCur := make(map[string][]market.HistoricalFXRate)
+	for _, r := range hist {
+		if r.Rate > 0 {
+			byCur[r.Currency] = append(byCur[r.Currency], r)
+		}
+	}
+	for _, pts := range byCur {
+		sort.SliceStable(pts, func(i, j int) bool { return pts[i].Date.Before(pts[j].Date) })
+	}
+	return reportFX{byCur: byCur, latest: latest}
+}
+
+// toEUR converts amount at the rate of the last ECB business day on or before
+// date (the earliest stored rate for dates before the history starts, the
+// latest known rate when the currency has no history). With no rate at all it
+// returns ok=false instead of counting 1 USD as 1 €.
+func (f reportFX) toEUR(amount float64, currency string, date time.Time) (float64, bool) {
+	norm, scale := normalizeCurrencyAndScale(currency)
+	scaled := amount * scale
+	if norm == "EUR" || amount == 0 {
+		return scaled, true
+	}
+	if pts := f.byCur[norm]; len(pts) > 0 {
+		day := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
+		i := sort.Search(len(pts), func(i int) bool { return pts[i].Date.After(day) })
+		if i > 0 {
+			return scaled / pts[i-1].Rate, true
+		}
+		return scaled / pts[0].Rate, true
+	}
+	if rate := f.latest[norm]; rate > 0 {
+		return scaled / rate, true
+	}
+	return 0, false
+}
+
+// buildReportData computes a report for the calendar period [start, end].
+//
+// Net worth runs from the previous period's close (the last snapshot before
+// start) to the last snapshot in the period, so consecutive reports chain and
+// a month's first-day move is not lost. Snapshots before the first non-zero
+// one are placeholders written before any data existed. The change splits
+// into net deposits (external flows between the two snapshots, classified
+// like the attribution waterfall) and the market residual.
+func buildReportData(in reportInputs) ReportData {
+	out := ReportData{Holdings: []ReportHolding{}}
+	missingFX := map[string]bool{}
+	toEUR := func(amount float64, currency string, at time.Time) float64 {
+		v, ok := in.fx.toEUR(amount, currency, at)
+		if !ok {
+			norm, _ := normalizeCurrencyAndScale(currency)
+			missingFX[norm] = true
+		}
+		return v
+	}
+
+	// --- Net worth: previous close → period close.
+	snaps := append([]db.NetWorthSnapshot(nil), in.snaps...)
+	sort.Slice(snaps, func(i, j int) bool { return snaps[i].Date.Before(snaps[j].Date) })
+	var firstNonZero time.Time
 	for _, s := range snaps {
-		val := 0.0
-		if s.Total.Valid {
-			f, _ := s.Total.Float64Value()
-			val = f.Float64
+		if numericToFloat(s.Total) != 0 {
+			firstNonZero = s.Date
+			break
 		}
-		if !s.Date.Before(start) && !s.Date.After(end) {
-			if nwEnd == 0 {
-				nwEnd = val // first (newest) in range
-			}
-			nwStart = val // last (oldest) in range
+	}
+	var startSnap, endSnap *db.NetWorthSnapshot
+	for i := range snaps {
+		s := &snaps[i]
+		if s.Date.Before(in.start) {
+			startSnap = s
+		} else if !s.Date.After(in.end) {
+			endSnap = s
 		}
+	}
+	if endSnap != nil && !firstNonZero.IsZero() && !endSnap.Date.Before(firstNonZero) {
+		out.HasNetWorth = true
+		nwStart, from := 0.0, time.Time{}
+		if startSnap != nil {
+			nwStart = numericToFloat(startSnap.Total)
+			from = startSnap.Date
+			out.StartDate = startSnap.Date.Format("2006-01-02")
+		}
+		nwEnd := numericToFloat(endSnap.Total)
+		to := endSnap.Date
+		out.EndDate = to.Format("2006-01-02")
+
+		deposits := reportNetDeposits(in, from, to, toEUR)
+		change := nwEnd - nwStart
+		out.NetWorthStart = round2(nwStart)
+		out.NetWorthEnd = round2(nwEnd)
+		out.NetWorthChange = round2(change)
+		if nwStart > 0 {
+			out.NetWorthChangePct = math.Round(change/nwStart*1000) / 10
+		}
+		out.NetDeposits = round2(deposits)
+		out.MarketChange = round2(change - deposits)
 	}
 
-	change := nwEnd - nwStart
-	changePct := 0.0
-	if nwStart > 0 {
-		changePct = (change / nwStart) * 100
-	}
-
-	// Load all transactions for period stats and historical holdings replay as of period end
-	txns, _ := h.queries.ListAllTransactions(ctx)
-	fxRates, _ := h.queries.ListAllExchangeRates(ctx)
-	type fxPt struct {
-		date time.Time
-		rate float64
-	}
-	fxByCur := make(map[string][]fxPt)
-	for _, r := range fxRates {
-		if r.Rate.Valid {
-			f, _ := r.Rate.Float64Value()
-			if f.Float64 > 0 {
-				norm, _ := normalizeCurrencyAndScale(r.Currency)
-				fxByCur[norm] = append(fxByCur[norm], fxPt{date: r.Date, rate: f.Float64})
-			}
-		}
-	}
-	toEURAt := func(amount float64, cur string, dt time.Time) float64 {
-		if amount == 0 {
-			return 0
-		}
-		norm, scale := normalizeCurrencyAndScale(cur)
-		scaled := amount * scale
-		if norm == "EUR" {
-			return scaled
-		}
-		pts := fxByCur[norm]
-		if len(pts) == 0 {
-			return scaled
-		}
-		lo, hi, res := 0, len(pts)-1, -1
-		for lo <= hi {
-			mid := (lo + hi) / 2
-			if !pts[mid].date.After(dt) {
-				res = mid
-				lo = mid + 1
-			} else {
-				hi = mid - 1
-			}
-		}
-		if res >= 0 {
-			return scaled / pts[res].rate
-		}
-		return scaled / pts[0].rate
-	}
-
-	newTxns := 0
-	dividends := 0.0
-	for _, txn := range txns {
-		if txn.Date.Before(start) || txn.Date.After(end) {
+	// --- Period activity and dividends (calendar period).
+	gross, withheld := 0.0, 0.0
+	for _, t := range in.txns {
+		if t.Date.Before(in.start) || t.Date.After(in.end) {
 			continue
 		}
-		newTxns++
-		if txn.Type == "dividend" && txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			dividends += toEURAt(f.Float64, txn.Currency, txn.Date)
+		out.NewTransactions++
+		if t.Type != "dividend" {
+			continue
 		}
+		gross += toEUR(math.Abs(numericToFloat(t.Amount)), t.Currency, t.Date)
+		withheld += toEUR(math.Abs(numericToFloat(t.Fee))+math.Abs(numericToFloat(t.Tax)), t.Currency, t.Date)
 	}
+	out.DividendsGross = round2(gross)
+	out.DividendsWithheld = round2(withheld)
+	out.TotalDividends = round2(gross - withheld)
 
-	// Replay holdings chronologically up to period end (`end`) so historical
-	// reports reflect the portfolio at the end of that period rather than today.
-	type replayHold struct {
-		qty  float64
-		cost float64
-	}
+	// --- Holdings at period end: replay chronologically up to `end` so a
+	// historical report shows the portfolio as it was, at average cost.
+	type replayHold struct{ qty, cost float64 }
 	replayed := make(map[string]*replayHold)
-	for i := len(txns) - 1; i >= 0; i-- {
-		txn := txns[i]
-		if txn.Date.After(end) || !txn.SecurityISIN.Valid || txn.SecurityISIN.String == "" {
+	for i := len(in.txns) - 1; i >= 0; i-- {
+		t := in.txns[i]
+		if t.Date.After(in.end) || !t.SecurityISIN.Valid || t.SecurityISIN.String == "" {
 			continue
 		}
-		isin := txn.SecurityISIN.String
-		qty := numericToFloat(txn.Quantity)
-		amtEUR := toEURAt(numericToFloat(txn.Amount), txn.Currency, txn.Date)
-		feeEUR := toEURAt(numericToFloat(txn.Fee), txn.Currency, txn.Date)
-
-		switch txn.Type {
-		case "buy", "savings_plan":
-			if qty > 0 {
-				rh := replayed[isin]
-				if rh == nil {
-					rh = &replayHold{}
-					replayed[isin] = rh
-				}
-				rh.qty += qty
-				rh.cost += amtEUR + feeEUR
+		isin := t.SecurityISIN.String
+		qty := numericToFloat(t.Quantity)
+		switch t.Type {
+		case "buy", "savings_plan", "transfer":
+			if qty <= 0 {
+				continue
 			}
-		case "transfer":
-			if qty > 0 {
-				rh := replayed[isin]
-				if rh == nil {
-					rh = &replayHold{}
-					replayed[isin] = rh
-				}
-				rh.qty += qty
-				if amtEUR > 0 {
-					rh.cost += amtEUR
-				}
+			rh := replayed[isin]
+			if rh == nil {
+				rh = &replayHold{}
+				replayed[isin] = rh
 			}
+			rh.qty += qty
+			cost := toEUR(math.Abs(numericToFloat(t.Amount)), t.Currency, t.Date)
+			if t.Type != "transfer" {
+				cost += toEUR(math.Abs(numericToFloat(t.Fee)), t.Currency, t.Date)
+			}
+			rh.cost += cost
 		case "sell", "transfer_out":
 			if rh := replayed[isin]; rh != nil && rh.qty > 0 && qty > 0 {
-				sellQty := math.Min(qty, rh.qty)
-				avg := rh.cost / rh.qty
-				rh.qty -= sellQty
-				rh.cost -= avg * sellQty
+				sold := math.Min(qty, rh.qty)
+				rh.cost -= rh.cost / rh.qty * sold
+				rh.qty -= sold
 				if rh.qty <= 1e-9 {
 					delete(replayed, isin)
 				}
@@ -298,83 +450,125 @@ func (h *ReportsHandler) computeReport(ctx context.Context, start, end time.Time
 		}
 	}
 
-	secs, _ := h.queries.ListSecurities(ctx)
-	secNames := make(map[string]string, len(secs))
-	for _, sec := range secs {
-		secNames[sec.ISIN] = sec.Name
-	}
-
-	totalValue := 0.0
 	type holdAgg struct {
 		isin, name  string
 		value, cost float64
 	}
-	agg := make(map[string]*holdAgg)
+	var aggs []holdAgg
+	totalValue := 0.0
 	for isin, rh := range replayed {
 		if rh.qty <= 1e-9 {
 			continue
 		}
 		value := rh.cost
-		if priceRow, err := h.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{
-			SecurityISIN: isin,
-			Date:         end,
-		}); err == nil && priceRow.Close.Valid {
-			f, _ := priceRow.Close.Float64Value()
-			if f.Float64 > 0 {
-				value = toEURAt(rh.qty*f.Float64, priceRow.Currency, end)
+		if in.priceAt != nil {
+			if px, cur, ok := in.priceAt(isin, in.end); ok && px > 0 {
+				if v, ok := in.fx.toEUR(rh.qty*px, cur, in.end); ok {
+					value = v
+				} else {
+					norm, _ := normalizeCurrencyAndScale(cur)
+					missingFX[norm] = true
+				}
 			}
 		}
-		name := secNames[isin]
+		name := in.secNames[isin]
 		if name == "" {
 			name = isin
 		}
-		agg[isin] = &holdAgg{isin: isin, name: name, value: value, cost: rh.cost}
+		aggs = append(aggs, holdAgg{isin: isin, name: name, value: value, cost: rh.cost})
 		totalValue += value
 	}
 
-	reportHoldings := make([]ReportHolding, 0, len(agg))
-	var topGainer, topLoser *ReportHolding
-	for _, a := range agg {
+	for _, a := range aggs {
 		weight := 0.0
 		if totalValue > 0 {
-			weight = (a.value / totalValue) * 100
+			weight = a.value / totalValue * 100
 		}
 		retPct := 0.0
 		if a.cost > 0 {
-			retPct = ((a.value - a.cost) / a.cost) * 100
+			retPct = (a.value - a.cost) / a.cost * 100
 		}
-		rh := ReportHolding{
-			ISIN: a.isin, Name: a.name, Value: math.Round(a.value*100) / 100,
+		out.Holdings = append(out.Holdings, ReportHolding{
+			ISIN: a.isin, Name: a.name, Value: round2(a.value),
 			Weight: math.Round(weight*10) / 10, ReturnPct: math.Round(retPct*10) / 10,
-		}
-		reportHoldings = append(reportHoldings, rh)
-		if topGainer == nil || retPct > topGainer.ReturnPct {
-			g := rh
-			topGainer = &g
-		}
-		if topLoser == nil || retPct < topLoser.ReturnPct {
-			l := rh
-			topLoser = &l
-		}
+		})
 	}
-	sort.Slice(reportHoldings, func(i, j int) bool {
-		if reportHoldings[i].Value != reportHoldings[j].Value {
-			return reportHoldings[i].Value > reportHoldings[j].Value
+	sort.Slice(out.Holdings, func(i, j int) bool {
+		if out.Holdings[i].Value != out.Holdings[j].Value {
+			return out.Holdings[i].Value > out.Holdings[j].Value
 		}
-		return reportHoldings[i].ISIN < reportHoldings[j].ISIN
+		return out.Holdings[i].ISIN < out.Holdings[j].ISIN
 	})
 
-	return ReportData{
-		NetWorthStart:     math.Round(nwStart*100) / 100,
-		NetWorthEnd:       math.Round(nwEnd*100) / 100,
-		NetWorthChange:    math.Round(change*100) / 100,
-		NetWorthChangePct: math.Round(changePct*10) / 10,
-		TotalDividends:    math.Round(dividends*100) / 100,
-		NewTransactions:   newTxns,
-		Holdings:          reportHoldings,
-		TopGainer:         topGainer,
-		TopLoser:          topLoser,
+	// Best and weakest only mean something with two or more holdings.
+	if len(out.Holdings) >= 2 {
+		best, worst := out.Holdings[0], out.Holdings[0]
+		for _, hld := range out.Holdings[1:] {
+			if hld.ReturnPct > best.ReturnPct {
+				best = hld
+			}
+			if hld.ReturnPct < worst.ReturnPct {
+				worst = hld
+			}
+		}
+		if best.ISIN != worst.ISIN {
+			out.TopGainer = &best
+			out.TopLoser = &worst
+		}
 	}
+
+	if len(missingFX) > 0 {
+		curs := make([]string, 0, len(missingFX))
+		for c := range missingFX {
+			curs = append(curs, c)
+		}
+		sort.Strings(curs)
+		out.Warnings = append(out.Warnings, fmt.Sprintf(
+			"No exchange rate for %s, so amounts in %s are left out of the totals.",
+			strings.Join(curs, ", "), strings.Join(curs, ", ")))
+	}
+	return out
+}
+
+// reportNetDeposits sums the external flows in (from, to] in EUR, classified
+// like the attribution waterfall (HandleWealthWaterfall): deposits, RSU vests
+// and other in-kind receipts in, withdrawals out; broker-to-broker in-kind
+// pairs and payments linked to physical assets or loans are swaps. Implicit
+// funding of securities-only accounts and asset/loan adjustments count too.
+func reportNetDeposits(in reportInputs, from, to time.Time, toEUR func(float64, string, time.Time) float64) float64 {
+	var inkind []analytics.InKindTransfer
+	for _, t := range in.txns {
+		if t.SecurityISIN.Valid && (t.Type == "transfer" || t.Type == "transfer_out") {
+			inkind = append(inkind, analytics.InKindTransfer{
+				ID: t.ID, Date: t.Date, Type: t.Type, ISIN: t.SecurityISIN.String,
+				Quantity: numericToFloat(t.Quantity),
+			})
+		}
+	}
+	washed := analytics.MatchInKindTransferPairs(inkind)
+
+	inWindow := func(d time.Time) bool { return d.After(from) && !d.After(to) }
+	total := 0.0
+	for _, t := range in.txns {
+		if !inWindow(t.Date) {
+			continue
+		}
+		if _, w := washed[t.ID]; w || in.physical.linked[t.ID] {
+			continue
+		}
+		switch analytics.ClassifyForAttribution(t.Type, t.SecurityISIN.Valid, analytics.ScopePortfolio) {
+		case analytics.BucketContribution:
+			total += toEUR(math.Abs(numericToFloat(t.Amount)), t.Currency, t.Date)
+		case analytics.BucketWithdrawal:
+			total -= toEUR(math.Abs(numericToFloat(t.Amount)), t.Currency, t.Date)
+		}
+	}
+	for _, ev := range in.implicit {
+		if inWindow(ev.Date) {
+			total += ev.DeltaEUR
+		}
+	}
+	return total + in.physical.window(from, to).contrib
 }
 
 // HandleDownloadPDF generates and streams a PDF for a given report.
@@ -391,11 +585,7 @@ func (h *ReportsHandler) HandleDownloadPDF(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	var data ReportData
-	if err := json.Unmarshal(rpt.Data, &data); err != nil {
-		writeError(w, http.StatusInternalServerError, "decode report data: "+err.Error())
-		return
-	}
+	data := h.currentReportData(r.Context(), rpt)
 
 	pdf := fpdf.New("P", "mm", "A4", "")
 	tr := pdf.UnicodeTranslatorFromDescriptor("")
@@ -409,34 +599,51 @@ func (h *ReportsHandler) HandleDownloadPDF(w http.ResponseWriter, r *http.Reques
 	pdf.CellFormat(0, 8, tr(rpt.PeriodLabel+" ("+rpt.ReportType+")"), "", 1, "C", false, 0, "")
 	pdf.Ln(8)
 
+	row := func(label, value string) {
+		pdf.CellFormat(95, 7, tr(label), "", 0, "", false, 0, "")
+		pdf.CellFormat(95, 7, tr(value), "", 1, "R", false, 0, "")
+	}
+	signedEUR := func(v float64) string {
+		if v > 0 {
+			return "+" + fmtEUR(v) + " EUR"
+		}
+		return fmtEUR(v) + " EUR"
+	}
+
 	// Summary KPIs
 	pdf.SetFont("Helvetica", "B", 14)
 	pdf.CellFormat(0, 8, tr("Summary"), "", 1, "", false, 0, "")
 	pdf.SetFont("Helvetica", "", 11)
-	pdf.CellFormat(95, 7, tr("Net Worth Start:"), "", 0, "", false, 0, "")
-	pdf.CellFormat(95, 7, tr(fmtEUR(data.NetWorthStart)+" EUR"), "", 1, "R", false, 0, "")
-	pdf.CellFormat(95, 7, tr("Net Worth End:"), "", 0, "", false, 0, "")
-	pdf.CellFormat(95, 7, tr(fmtEUR(data.NetWorthEnd)+" EUR"), "", 1, "R", false, 0, "")
-	pdf.CellFormat(95, 7, tr("Change:"), "", 0, "", false, 0, "")
-	changePct := ""
-	if data.NetWorthChangePct != 0 {
-		changePct = fmt.Sprintf(" (%.1f%%)", data.NetWorthChangePct)
+	if data.HasNetWorth {
+		startLabel := "Net worth at previous close:"
+		if data.StartDate != "" {
+			startLabel = fmt.Sprintf("Net worth at previous close (%s):", data.StartDate)
+		}
+		row(startLabel, fmtEUR(data.NetWorthStart)+" EUR")
+		row(fmt.Sprintf("Net worth at close (%s):", data.EndDate), fmtEUR(data.NetWorthEnd)+" EUR")
+		changePct := ""
+		if data.NetWorthChangePct != 0 {
+			changePct = fmt.Sprintf(" (%+.1f%%)", data.NetWorthChangePct)
+		}
+		row("Change:", signedEUR(data.NetWorthChange)+changePct)
+		row("  of which net deposits:", signedEUR(data.NetDeposits))
+		row("  of which market, income and other:", signedEUR(data.MarketChange))
+	} else {
+		row("Net worth:", "no history for this period")
 	}
-	pdf.CellFormat(95, 7, tr(fmtEUR(data.NetWorthChange)+" EUR"+changePct), "", 1, "R", false, 0, "")
-	pdf.CellFormat(95, 7, tr("Dividends Received:"), "", 0, "", false, 0, "")
-	pdf.CellFormat(95, 7, tr(fmtEUR(data.TotalDividends)+" EUR"), "", 1, "R", false, 0, "")
-	pdf.CellFormat(95, 7, tr("Transactions:"), "", 0, "", false, 0, "")
-	pdf.CellFormat(95, 7, fmt.Sprintf("%d", data.NewTransactions), "", 1, "R", false, 0, "")
+	row("Dividends received (net):", fmtEUR(data.TotalDividends)+" EUR")
+	if data.DividendsWithheld != 0 {
+		row("  gross, less withheld tax and fees:", fmtEUR(data.DividendsGross)+" - "+fmtEUR(data.DividendsWithheld)+" EUR")
+	}
+	row("Transactions:", fmt.Sprintf("%d", data.NewTransactions))
 	pdf.Ln(4)
 
 	// Top performers
 	if data.TopGainer != nil {
-		pdf.CellFormat(95, 7, tr("Top Gainer:"), "", 0, "", false, 0, "")
-		pdf.CellFormat(95, 7, tr(fmt.Sprintf("%s (+%.1f%%)", truncateRunes(data.TopGainer.Name, 35), data.TopGainer.ReturnPct)), "", 1, "R", false, 0, "")
+		row("Best holding:", fmt.Sprintf("%s (%+.1f%%)", truncateRunes(data.TopGainer.Name, 35), data.TopGainer.ReturnPct))
 	}
 	if data.TopLoser != nil {
-		pdf.CellFormat(95, 7, tr("Top Loser:"), "", 0, "", false, 0, "")
-		pdf.CellFormat(95, 7, tr(fmt.Sprintf("%s (%.1f%%)", truncateRunes(data.TopLoser.Name, 35), data.TopLoser.ReturnPct)), "", 1, "R", false, 0, "")
+		row("Weakest holding:", fmt.Sprintf("%s (%+.1f%%)", truncateRunes(data.TopLoser.Name, 35), data.TopLoser.ReturnPct))
 	}
 	pdf.Ln(6)
 
@@ -461,10 +668,16 @@ func (h *ReportsHandler) HandleDownloadPDF(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	for _, warn := range data.Warnings {
+		pdf.Ln(2)
+		pdf.SetFont("Helvetica", "I", 9)
+		pdf.MultiCell(0, 5, tr(warn), "", "", false)
+	}
+
 	// Footer
 	pdf.Ln(10)
 	pdf.SetFont("Helvetica", "I", 8)
-	pdf.CellFormat(0, 5, tr(fmt.Sprintf("Generated %s by Wealth Tracker", rpt.GeneratedAt.Format("2006-01-02 15:04"))), "", 0, "C", false, 0, "")
+	pdf.CellFormat(0, 5, tr(fmt.Sprintf("Figures as of %s, Wealth Tracker", time.Now().UTC().Format("2006-01-02 15:04"))), "", 0, "C", false, 0, "")
 
 	if err := pdf.Error(); err != nil {
 		writeError(w, http.StatusInternalServerError, "generate pdf: "+err.Error())

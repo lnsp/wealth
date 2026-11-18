@@ -277,7 +277,10 @@ export interface AssetsOverview {
 
 export interface ImportResult {
   imported: number;
+  /** Rows already stored unchanged (same hash, or an equivalent older row). */
   skipped: number;
+  /** Rows already stored whose type, security, quantity or price the re-import corrected. */
+  updated?: number;
   new_securities: string[];
   institution: string;
   errors?: string[];
@@ -388,6 +391,10 @@ export interface ImportHistoryEntry {
   total_rows: number;
   imported: number;
   skipped: number;
+  /** Re-imported rows the import corrected (0 for imports before migration 032). */
+  updated?: number;
+  /** RSU vesting rows (vested or scheduled) from Morgan Stanley files. */
+  rsu_vests?: number;
   new_securities: string[];
   account_name: string;
 }
@@ -502,12 +509,27 @@ export interface WealthReportDetail {
   period_start: string;
   period_end: string;
   generated_at: string;
+  /** Figures are recomputed from current data on every read. */
+  computed_at?: string;
   data: {
+    /** false when the period has no net worth history; the net worth figures are then 0. */
+    has_net_worth?: boolean;
+    /** Snapshot the opening value comes from: the previous period's close. Absent = no earlier history (start 0). */
+    start_date?: string;
+    end_date?: string;
     net_worth_start: number;
     net_worth_end: number;
     net_worth_change: number;
     net_worth_change_pct: number;
+    /** External flows in the period: deposits and in-kind receipts (RSU vests) minus withdrawals. */
+    net_deposits?: number;
+    /** net_worth_change − net_deposits: price moves, income, fees, taxes, revaluations. */
+    market_change?: number;
+    /** Net: credited after tax and fees withheld at source, at the payment-date FX. */
     total_dividends: number;
+    dividends_gross?: number;
+    dividends_withheld?: number;
+    warnings?: string[];
     new_transactions: number;
     holdings: { isin: string; name: string; value: number; weight: number; return_pct: number }[];
     top_gainer?: { isin: string; name: string; return_pct: number };
@@ -728,7 +750,8 @@ export const api = {
     if (search) params.set('search', search);
     if (from) params.set('from', from);
     if (to) params.set('to', to);
-    return request<{ transactions: TransactionRow[]; total: number }>(`/transactions?${params}`);
+    /** first_date: the oldest transaction's date ("" when there are none), whatever the filters. */
+    return request<{ transactions: TransactionRow[]; total: number; first_date?: string }>(`/transactions?${params}`);
   },
   updateTransactionCategory: (id: string, category: string) =>
     request<{ ok: boolean }>(`/transactions/${id}/category`, { method: 'PATCH', body: JSON.stringify({ category }) }),
@@ -847,7 +870,8 @@ export const api = {
 
   // Settings
   listAllAccounts: () => request<{ accounts: Account[] }>('/settings/accounts'),
-  getImportHistory: () => request<{ history: ImportHistoryEntry[] }>('/import-history'),
+  getImportHistory: (limit = 50, offset = 0) =>
+    request<{ history: ImportHistoryEntry[]; total?: number }>(`/import-history?limit=${limit}&offset=${offset}`),
 
   // Goals
   listGoals: () => request<{ goals: GoalProgress[] }>('/settings/goals'),
@@ -885,8 +909,9 @@ export const api = {
   // Reports
   listReports: () => request<{ reports: WealthReportSummary[] }>('/settings/reports'),
   getReport: (id: string) => request<WealthReportDetail>(`/settings/reports/${id}`),
+  /** Generates the report for a period, or regenerates it when it exists (regenerated: true). */
   generateReport: (data: { report_type: string; year: number; month?: number }) =>
-    request<{ status: string; period: string }>('/settings/reports', { method: 'POST', body: JSON.stringify(data) }),
+    request<{ status: string; period: string; regenerated?: boolean }>('/settings/reports', { method: 'POST', body: JSON.stringify(data) }),
   listSecurities: () => request<{ securities: Security[] }>('/settings/securities'),
   updateSecuritySymbol: (isin: string, symbol: string) =>
     request<{ status: string }>(`/settings/securities/${isin}/symbol`, {

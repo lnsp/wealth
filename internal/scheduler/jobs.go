@@ -22,7 +22,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/robfig/cron/v3"
 
-	"github.com/lnsp/wealth/internal/analytics"
 	"github.com/lnsp/wealth/internal/assets"
 	db "github.com/lnsp/wealth/internal/database/generated"
 	"github.com/lnsp/wealth/internal/market"
@@ -1941,16 +1940,10 @@ func (s *Scheduler) checkTaxLossHarvesting() {
 
 	secs, _ := s.queries.ListSecurities(ctx)
 	secNames := make(map[string]string, len(secs))
-	secTFS := make(map[string]float64, len(secs))
 	for _, sec := range secs {
 		secNames[sec.ISIN] = sec.Name
-		var eqPtr *float64
-		if sec.EquityPct.Valid {
-			v := numericToFloat(sec.EquityPct)
-			eqPtr = &v
-		}
-		secTFS[sec.ISIN] = analytics.ResolveSecurityTFSRate(sec.AssetClass, sec.Name, eqPtr)
 	}
+	harvestSaving := s.newHarvestSaver(ctx)
 
 	// Aggregate holdings across depots per ISIN in EUR
 	type aggHold struct {
@@ -1993,10 +1986,19 @@ func (s *Scheduler) checkTaxLossHarvesting() {
 			if name == "" {
 				name = isin
 			}
-			tfs := secTFS[isin]
-			taxSaving := math.Abs(loss) * (1 - tfs) * analytics.EffectiveTaxRate
+			// The saving runs through the tax engine: FIFO sell-all per depot,
+			// Teilfreistellung, both loss pots, carried losses and the allowance.
+			taxSaving, taxable := harvestSaving(isin)
+			if !taxable {
+				continue // held only in a pension wrapper or as a § 23 asset
+			}
 			isinTag := "(" + isin + ")"
-			msg := fmt.Sprintf("Tax-loss harvesting: %s %s is down %s EUR (%.1f%%). Selling could save ~%s EUR in tax.", name, isinTag, fmtEUR(loss), lossPct, fmtEUR(taxSaving))
+			msg := fmt.Sprintf("Tax-loss harvesting: %s %s is down %s EUR (%.1f%%).", name, isinTag, fmtEUR(loss), lossPct)
+			if taxSaving >= 1 {
+				msg += fmt.Sprintf(" Selling could save ~%s EUR in tax this year.", fmtEUR(taxSaving))
+			} else {
+				msg += " Selling would save no tax this year (no gains in the same loss pot beyond the allowance); the loss would carry forward."
+			}
 
 			alreadyNotified := false
 			for _, n := range existing {
@@ -2039,7 +2041,11 @@ func (s *Scheduler) generateMonthlyReport() {
 		return
 	}
 
-	data := s.computeReportData(ctx, start, end)
+	data, err := s.computeReportData(ctx, start, end)
+	if err != nil {
+		s.setJobStatus("report", "error", err.Error())
+		return
+	}
 	dataJSON, _ := json.Marshal(data)
 	if err := s.queries.InsertWealthReport(ctx, db.InsertWealthReportParams{
 		ReportType: "monthly", PeriodLabel: label, PeriodStart: start, PeriodEnd: end, Data: dataJSON,
@@ -2051,58 +2057,7 @@ func (s *Scheduler) generateMonthlyReport() {
 	log.Printf("generated monthly report: %s", label)
 
 	// Send monthly advisor digest to configured channels
-	var digestData map[string]any
-	json.Unmarshal(dataJSON, &digestData)
-	s.sendMonthlyDigest(ctx, digestData, label)
-}
-
-// sendMonthlyDigest creates and dispatches a digest to configured channels.
-func (s *Scheduler) sendMonthlyDigest(ctx context.Context, data map[string]any, label string) {
-	subject := fmt.Sprintf("Wealth Monthly Digest — %s", label)
-
-	// Extract fields safely
-	nwEnd, _ := data["net_worth_end"].(float64)
-	nwChange, _ := data["net_worth_change"].(float64)
-	nwChangePct, _ := data["net_worth_change_pct"].(float64)
-	divs, _ := data["total_dividends"].(float64)
-
-	var lines []string
-	lines = append(lines, fmt.Sprintf("Net Worth: %s EUR", fmtEUR(nwEnd)))
-	if nwChange != 0 {
-		sign := "+"
-		if nwChange < 0 {
-			sign = ""
-		}
-		lines = append(lines, fmt.Sprintf("Monthly Change: %s%s EUR (%s%.1f%%)", sign, fmtEUR(nwChange), sign, nwChangePct))
-	}
-	if divs > 0 {
-		lines = append(lines, fmt.Sprintf("Dividend Income: %s EUR", fmtEUR(divs)))
-	}
-
-	if topGainer, ok := data["top_gainer"].(map[string]any); ok {
-		name, _ := topGainer["name"].(string)
-		retPct, _ := topGainer["return_pct"].(float64)
-		if name != "" {
-			lines = append(lines, fmt.Sprintf("Top Gainer: %s (+%.1f%%)", name, retPct))
-		}
-	}
-	if topLoser, ok := data["top_loser"].(map[string]any); ok {
-		name, _ := topLoser["name"].(string)
-		retPct, _ := topLoser["return_pct"].(float64)
-		if name != "" {
-			lines = append(lines, fmt.Sprintf("Top Loser: %s (%.1f%%)", name, retPct))
-		}
-	}
-
-	body := strings.Join(lines, "\n")
-	// Dispatch to monthly channels
-	s.dispatchMessage(ctx, "digest", subject, body, "monthly")
-	// Also dispatch to quarterly channels on Jan/Apr/Jul/Oct
-	month := time.Now().UTC().Month()
-	if month == time.January || month == time.April || month == time.July || month == time.October {
-		s.dispatchMessage(ctx, "digest", subject, body, "quarterly")
-	}
-	log.Printf("monthly digest dispatched for %s", label)
+	s.sendMonthlyDigest(ctx, data, label)
 }
 
 func (s *Scheduler) generateAnnualReport() {
@@ -2125,7 +2080,11 @@ func (s *Scheduler) generateAnnualReport() {
 		return
 	}
 
-	data := s.computeReportData(ctx, start, end)
+	data, err := s.computeReportData(ctx, start, end)
+	if err != nil {
+		s.setJobStatus("report", "error", err.Error())
+		return
+	}
 	dataJSON, _ := json.Marshal(data)
 	if err := s.queries.InsertWealthReport(ctx, db.InsertWealthReportParams{
 		ReportType: "annual", PeriodLabel: label, PeriodStart: start, PeriodEnd: end, Data: dataJSON,
@@ -2141,12 +2100,17 @@ func (s *Scheduler) backfillReports() {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Find earliest snapshot date
-	snaps, _ := s.queries.ListNetWorthSnapshots(ctx, 5000)
+	// Start at the first snapshot with a non-zero net worth: earlier ones are
+	// placeholders written before any data existed, and reports for those
+	// periods would only show 0.
+	snaps, _ := s.queries.ListNetWorthSnapshots(ctx, 100000)
 	if len(snaps) < 2 {
 		return
 	}
-	earliest := snaps[len(snaps)-1].Date
+	earliest, ok := firstNonZeroSnapshot(snaps)
+	if !ok {
+		return
+	}
 	now := time.Now().UTC()
 
 	// Backfill monthly reports from earliest snapshot month to last month
@@ -2158,7 +2122,12 @@ func (s *Scheduler) backfillReports() {
 		if exists, _ := s.queries.ReportExistsForPeriod(ctx, db.ReportExistsForPeriodParams{ReportType: "monthly", PeriodLabel: label}); !exists {
 			start := cur
 			end := time.Date(cur.Year(), cur.Month()+1, 0, 0, 0, 0, 0, time.UTC)
-			data := s.computeReportData(ctx, start, end)
+			data, err := s.computeReportData(ctx, start, end)
+			if err != nil {
+				log.Printf("backfill report %s: %v", label, err)
+				cur = time.Date(cur.Year(), cur.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+				continue
+			}
 			dataJSON, _ := json.Marshal(data)
 			if err := s.queries.InsertWealthReport(ctx, db.InsertWealthReportParams{
 				ReportType: "monthly", PeriodLabel: label, PeriodStart: start, PeriodEnd: end, Data: dataJSON,
@@ -2175,7 +2144,11 @@ func (s *Scheduler) backfillReports() {
 		if exists, _ := s.queries.ReportExistsForPeriod(ctx, db.ReportExistsForPeriodParams{ReportType: "annual", PeriodLabel: label}); !exists {
 			start := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
 			end := time.Date(year, 12, 31, 0, 0, 0, 0, time.UTC)
-			data := s.computeReportData(ctx, start, end)
+			data, err := s.computeReportData(ctx, start, end)
+			if err != nil {
+				log.Printf("backfill report %s: %v", label, err)
+				continue
+			}
 			dataJSON, _ := json.Marshal(data)
 			if err := s.queries.InsertWealthReport(ctx, db.InsertWealthReportParams{
 				ReportType: "annual", PeriodLabel: label, PeriodStart: start, PeriodEnd: end, Data: dataJSON,
@@ -2188,228 +2161,6 @@ func (s *Scheduler) backfillReports() {
 	if count > 0 {
 		log.Printf("backfilled %d missing reports", count)
 	}
-}
-
-func (s *Scheduler) computeReportData(ctx context.Context, start, end time.Time) map[string]any {
-	snaps, _ := s.queries.ListNetWorthSnapshots(ctx, 5000)
-	nwStart, nwEnd := 0.0, 0.0
-	for _, snap := range snaps {
-		val := numericToFloat(snap.Total)
-		if !snap.Date.Before(start) && !snap.Date.After(end) {
-			if nwEnd == 0 {
-				nwEnd = val
-			}
-			nwStart = val
-		}
-	}
-	change := nwEnd - nwStart
-	changePct := 0.0
-	if nwStart > 0 {
-		changePct = (change / nwStart) * 100
-	}
-
-	txns, _ := s.queries.ListAllTransactions(ctx)
-	fxRates, _ := s.queries.ListAllExchangeRates(ctx)
-	type fxPt struct {
-		date time.Time
-		rate float64
-	}
-	fxByCur := make(map[string][]fxPt)
-	for _, r := range fxRates {
-		if r.Rate.Valid {
-			f, _ := r.Rate.Float64Value()
-			if f.Float64 > 0 {
-				cur := strings.ToUpper(strings.TrimSpace(r.Currency))
-				fxByCur[cur] = append(fxByCur[cur], fxPt{date: r.Date, rate: f.Float64})
-			}
-		}
-	}
-	toEURAt := func(amount float64, cur string, dt time.Time) float64 {
-		c := strings.TrimSpace(cur)
-		if c == "" || strings.EqualFold(c, "EUR") || amount == 0 {
-			return amount
-		}
-		if c == "GBp" || c == "GBX" {
-			amount /= 100.0
-			c = "GBP"
-		} else {
-			c = strings.ToUpper(c)
-		}
-		pts := fxByCur[c]
-		if len(pts) == 0 {
-			return amount
-		}
-		lo, hi, res := 0, len(pts)-1, -1
-		for lo <= hi {
-			mid := (lo + hi) / 2
-			if !pts[mid].date.After(dt) {
-				res = mid
-				lo = mid + 1
-			} else {
-				hi = mid - 1
-			}
-		}
-		if res >= 0 {
-			return amount / pts[res].rate
-		}
-		return amount / pts[0].rate
-	}
-
-	newTxns, dividends := 0, 0.0
-	for _, txn := range txns {
-		if txn.Date.Before(start) || txn.Date.After(end) {
-			continue
-		}
-		newTxns++
-		if txn.Type == "dividend" && txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			dividends += toEURAt(f.Float64, txn.Currency, txn.Date)
-		}
-	}
-
-	type replayHold struct {
-		qty  float64
-		cost float64
-	}
-	replayed := make(map[string]*replayHold)
-	for i := len(txns) - 1; i >= 0; i-- {
-		txn := txns[i]
-		if txn.Date.After(end) || !txn.SecurityISIN.Valid || txn.SecurityISIN.String == "" {
-			continue
-		}
-		isin := txn.SecurityISIN.String
-		qty := numericToFloat(txn.Quantity)
-		amtEUR := toEURAt(numericToFloat(txn.Amount), txn.Currency, txn.Date)
-		feeEUR := toEURAt(numericToFloat(txn.Fee), txn.Currency, txn.Date)
-
-		switch txn.Type {
-		case "buy", "savings_plan":
-			if qty > 0 {
-				rh := replayed[isin]
-				if rh == nil {
-					rh = &replayHold{}
-					replayed[isin] = rh
-				}
-				rh.qty += qty
-				rh.cost += amtEUR + feeEUR
-			}
-		case "transfer":
-			if qty > 0 {
-				rh := replayed[isin]
-				if rh == nil {
-					rh = &replayHold{}
-					replayed[isin] = rh
-				}
-				rh.qty += qty
-				if amtEUR > 0 {
-					rh.cost += amtEUR
-				}
-			}
-		case "sell", "transfer_out":
-			if rh := replayed[isin]; rh != nil && rh.qty > 0 && qty > 0 {
-				sellQty := math.Min(qty, rh.qty)
-				avg := rh.cost / rh.qty
-				rh.qty -= sellQty
-				rh.cost -= avg * sellQty
-				if rh.qty <= 1e-9 {
-					delete(replayed, isin)
-				}
-			}
-		}
-	}
-
-	secs, _ := s.queries.ListSecurities(ctx)
-	secNames := make(map[string]string, len(secs))
-	for _, sec := range secs {
-		secNames[sec.ISIN] = sec.Name
-	}
-
-	type reportHoldingItem struct {
-		ISIN      string  `json:"isin"`
-		Name      string  `json:"name"`
-		Value     float64 `json:"value"`
-		Weight    float64 `json:"weight"`
-		ReturnPct float64 `json:"return_pct,omitempty"`
-	}
-	type holdAgg struct {
-		isin, name  string
-		value, cost float64
-	}
-	agg := make(map[string]*holdAgg)
-	totalValue := 0.0
-	for isin, rh := range replayed {
-		if rh.qty <= 1e-9 {
-			continue
-		}
-		value := rh.cost
-		if priceRow, err := s.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{
-			SecurityISIN: isin,
-			Date:         end,
-		}); err == nil && priceRow.Close.Valid {
-			f, _ := priceRow.Close.Float64Value()
-			if f.Float64 > 0 {
-				value = toEURAt(rh.qty*f.Float64, priceRow.Currency, end)
-			}
-		}
-		name := secNames[isin]
-		if name == "" {
-			name = isin
-		}
-		agg[isin] = &holdAgg{isin: isin, name: name, value: value, cost: rh.cost}
-		totalValue += value
-	}
-
-	holdingsList := make([]reportHoldingItem, 0, len(agg))
-	var topGainer, topLoser *reportHoldingItem
-	for _, a := range agg {
-		weight := 0.0
-		if totalValue > 0 {
-			weight = (a.value / totalValue) * 100
-		}
-		retPct := 0.0
-		if a.cost > 0 {
-			retPct = ((a.value - a.cost) / a.cost) * 100
-		}
-		item := reportHoldingItem{
-			ISIN:      a.isin,
-			Name:      a.name,
-			Value:     math.Round(a.value*100) / 100,
-			Weight:    math.Round(weight*10) / 10,
-			ReturnPct: math.Round(retPct*10) / 10,
-		}
-		holdingsList = append(holdingsList, item)
-		if topGainer == nil || retPct > topGainer.ReturnPct {
-			g := item
-			topGainer = &g
-		}
-		if topLoser == nil || retPct < topLoser.ReturnPct {
-			l := item
-			topLoser = &l
-		}
-	}
-	sort.Slice(holdingsList, func(i, j int) bool {
-		if holdingsList[i].Value != holdingsList[j].Value {
-			return holdingsList[i].Value > holdingsList[j].Value
-		}
-		return holdingsList[i].ISIN < holdingsList[j].ISIN
-	})
-
-	out := map[string]any{
-		"net_worth_start":      math.Round(nwStart*100) / 100,
-		"net_worth_end":        math.Round(nwEnd*100) / 100,
-		"net_worth_change":     math.Round(change*100) / 100,
-		"net_worth_change_pct": math.Round(changePct*10) / 10,
-		"total_dividends":      math.Round(dividends*100) / 100,
-		"new_transactions":     newTxns,
-		"holdings":             holdingsList,
-	}
-	if topGainer != nil {
-		out["top_gainer"] = topGainer
-	}
-	if topLoser != nil {
-		out["top_loser"] = topLoser
-	}
-	return out
 }
 
 // checkTaxCalendarReminders generates notifications for upcoming tax events.
@@ -2640,165 +2391,6 @@ func loadEnrichedHoldingsForScheduler(ctx context.Context, q *db.Queries) ([]sch
 		}
 	}
 	return result, nil
-}
-
-// computeSchedulerVorabpauschaleTax computes total § 18 InvStG Vorabpauschale tax
-// for `taxYear` using FIFO-reconstructed Jan 1 / mid-year lots, distributions,
-// appreciation cap, and per-security Teilfreistellung rates.
-func (s *Scheduler) computeSchedulerVorabpauschaleTax(ctx context.Context, taxYear int) float64 {
-	if basiszins, ok := analytics.BasiszinsByYear[taxYear]; !ok || basiszins <= 0 {
-		return 0
-	}
-
-	secs, err := s.queries.ListSecurities(ctx)
-	if err != nil || len(secs) == 0 {
-		return 0
-	}
-	secMap := make(map[string]db.Security, len(secs))
-	tfsMap := make(map[string]float64, len(secs))
-	for _, sec := range secs {
-		secMap[sec.ISIN] = sec
-		var eqPtr *float64
-		if sec.EquityPct.Valid {
-			v := numericToFloat(sec.EquityPct)
-			eqPtr = &v
-		}
-		tfsMap[sec.ISIN] = analytics.ResolveSecurityTFSRate(sec.AssetClass, sec.Name, eqPtr)
-	}
-
-	txns, err := s.queries.ListAllTransactions(ctx)
-	if err != nil || len(txns) == 0 {
-		return 0
-	}
-
-	type fxPt struct {
-		date time.Time
-		rate float64
-	}
-	fxByCur := make(map[string][]fxPt)
-	if fxRows, err := s.queries.ListAllExchangeRates(ctx); err == nil {
-		for _, r := range fxRows {
-			if r.Rate.Valid {
-				if f := numericToFloat(r.Rate); f > 0 {
-					cur := strings.ToUpper(strings.TrimSpace(r.Currency))
-					fxByCur[cur] = append(fxByCur[cur], fxPt{date: r.Date, rate: f})
-				}
-			}
-		}
-	}
-	toEURAt := func(amount float64, currency string, dt time.Time) float64 {
-		c := strings.TrimSpace(currency)
-		if c == "" || strings.EqualFold(c, "EUR") || amount == 0 {
-			return amount
-		}
-		if c == "GBp" || c == "GBX" {
-			amount /= 100.0
-			c = "GBP"
-		} else {
-			c = strings.ToUpper(c)
-		}
-		pts := fxByCur[c]
-		if len(pts) == 0 {
-			return convertToEURScheduler(ctx, s.queries, amount, c)
-		}
-		lo, hi, res := 0, len(pts)-1, -1
-		for lo <= hi {
-			mid := (lo + hi) / 2
-			if !pts[mid].date.After(dt) {
-				res = mid
-				lo = mid + 1
-			} else {
-				hi = mid - 1
-			}
-		}
-		if res >= 0 {
-			return amount / pts[res].rate
-		}
-		return amount / pts[0].rate
-	}
-
-	jan1Date := time.Date(taxYear, 1, 1, 0, 0, 0, 0, time.UTC)
-	yearEndDate := time.Date(taxYear, 12, 31, 0, 0, 0, 0, time.UTC)
-
-	vpTxns := make([]analytics.VorabpauschaleTxn, 0, len(txns))
-	for i := len(txns) - 1; i >= 0; i-- {
-		txn := txns[i]
-		if txn.Date.After(yearEndDate) || !txn.SecurityISIN.Valid {
-			continue
-		}
-		isin := txn.SecurityISIN.String
-		sec, ok := secMap[isin]
-		if !ok || (sec.AssetClass != "etf" && sec.AssetClass != "fund") {
-			continue
-		}
-		qty := numericToFloat(txn.Quantity)
-		amtEUR := toEURAt(numericToFloat(txn.Amount), txn.Currency, txn.Date)
-		feeEUR := toEURAt(numericToFloat(txn.Fee), txn.Currency, txn.Date)
-		if txn.Type == "buy" || txn.Type == "savings_plan" || txn.Type == "transfer" {
-			amtEUR += feeEUR
-		}
-		vpTxns = append(vpTxns, analytics.VorabpauschaleTxn{
-			AccountID: txn.AccountID.String(),
-			ISIN:      isin,
-			Year:      txn.Date.Year(),
-			Month:     int(txn.Date.Month()),
-			Type:      txn.Type,
-			Quantity:  qty,
-			AmountEUR: amtEUR,
-		})
-	}
-
-	positions := analytics.ReconstructVorabpauschaleYear(taxYear, vpTxns)
-	if len(positions) == 0 {
-		return 0
-	}
-
-	curUnitPrice := make(map[string]float64)
-	if latestPrices, err := s.queries.ListLatestPrices(ctx); err == nil {
-		for _, p := range latestPrices {
-			if p.Close.Valid {
-				curUnitPrice[p.SecurityISIN] = convertToEURScheduler(ctx, s.queries, numericToFloat(p.Close), p.Currency)
-			}
-		}
-	}
-
-	var vpInputs []analytics.VorabpauschaleInput
-	for isin, pos := range positions {
-		sec := secMap[isin]
-		jan1Val := 0.0
-		if pos.Jan1Qty > 1e-9 {
-			if priceRow, err := s.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{SecurityISIN: isin, Date: jan1Date}); err == nil && priceRow.Close.Valid {
-				p := toEURAt(numericToFloat(priceRow.Close), priceRow.Currency, priceRow.Date)
-				jan1Val = pos.Jan1Qty * p
-			}
-			if jan1Val <= 0 {
-				jan1Val = pos.Jan1CostEUR
-			}
-		}
-		yearEndVal := 0.0
-		if priceRow, err := s.queries.GetPriceAtDate(ctx, db.GetPriceAtDateParams{SecurityISIN: isin, Date: yearEndDate}); err == nil && priceRow.Close.Valid {
-			p := toEURAt(numericToFloat(priceRow.Close), priceRow.Currency, priceRow.Date)
-			yearEndVal = pos.YearEndQty * p
-		} else if curP := curUnitPrice[isin]; curP > 0 {
-			yearEndVal = pos.YearEndQty * curP
-		}
-		vpInputs = append(vpInputs, analytics.VorabpauschaleInput{
-			ISIN:          isin,
-			Name:          sec.Name,
-			Jan1Value:     jan1Val,
-			YearEndValue:  yearEndVal,
-			Distributions: pos.Distributions,
-			MidYearBuys:   pos.MidYearBuys,
-			TFSRate:       tfsMap[isin],
-		})
-	}
-
-	entries := analytics.ComputeVorabpauschaleDetailed(taxYear, vpInputs)
-	totalTax := 0.0
-	for _, e := range entries {
-		totalTax += e.TaxOnVP
-	}
-	return totalTax
 }
 
 // weeklyDataHealthDigest creates a notification summarizing data quality issues.

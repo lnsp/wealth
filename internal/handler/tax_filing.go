@@ -1269,3 +1269,107 @@ func csvField(s string) string {
 	}
 	return s
 }
+
+/* ───────────── DATEV export ───────────── */
+
+// datevRow is one booking line of the DATEV Buchungsstapel.
+type datevRow struct {
+	Amount     float64 // EUR, magnitude
+	SollHaben  string  // "S" or "H"
+	Konto      string
+	Gegenkonto string
+	Belegdatum string // DDMM
+	Text       string
+	Beleg      string
+}
+
+// datevRows books the year's capital income, sales, fees and withheld taxes
+// (SKR03). Amounts are magnitudes (migration 032); the type gives the
+// direction. Kapitalertragsteuer that arrives as its own "tax" row (Scalable)
+// is booked against 1810 Privatsteuern.
+func datevRows(txns []db.ListTransactionsRow, year int, secNames, acctNames map[string]string, histFX []market.HistoricalFXRate, fxRates map[string]float64) []datevRow {
+	var out []datevRow
+	for _, txn := range txns {
+		if txn.Date.Year() != year {
+			continue
+		}
+		gegenkonto := ""
+		sollHaben := "H"
+		switch txn.Type {
+		case "dividend", "interest", "sell":
+			gegenkonto = "2650"
+		case "fee":
+			gegenkonto, sollHaben = "4900", "S"
+		case "tax":
+			gegenkonto, sollHaben = "1810", "S"
+		default:
+			continue
+		}
+		amt := math.Abs(convertAmountToEURAtDate(numericToFloat(txn.Amount), txn.Currency, txn.Date, histFX, fxRates))
+		isin := ""
+		if txn.SecurityISIN.Valid {
+			isin = txn.SecurityISIN.String
+		}
+		name := secNames[isin]
+		if name == "" {
+			name = isin
+		}
+		if name == "" && txn.Counterparty.Valid {
+			name = txn.Counterparty.String
+		}
+		text := []rune(fmt.Sprintf("%s: %s", txn.Type, name))
+		if len(text) > 60 {
+			text = text[:60]
+		}
+		out = append(out, datevRow{
+			Amount:     amt,
+			SollHaben:  sollHaben,
+			Konto:      "1800",
+			Gegenkonto: gegenkonto,
+			Belegdatum: txn.Date.Format("0201"),
+			Text:       string(text),
+			Beleg:      acctNames[txn.AccountID.String()],
+		})
+	}
+	return out
+}
+
+func writeDATEV(w io.Writer, year int, rows []datevRow) {
+	quote := func(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
+	// DATEV header
+	fmt.Fprintf(w, "\"EXTF\";510;21;\"Buchungsstapel\";7;%d0101;4;\"%d\";\"%d\";;;;\"\";\"\";1;\n", year, year, year)
+	// Column headers
+	fmt.Fprintf(w, "Umsatz;Soll/Haben;WKZ;Konto;Gegenkonto;Belegdatum;Buchungstext;Belegfeld1\n")
+	for _, r := range rows {
+		fmt.Fprintf(w, "%.2f;%s;EUR;%s;%s;%s;%s;%s\n", r.Amount, r.SollHaben, r.Konto, r.Gegenkonto, r.Belegdatum, quote(r.Text), quote(r.Beleg))
+	}
+}
+
+/* ───────────── Shared with background jobs ───────────── */
+
+// TaxLedger is the tax engine input the Tax pages work from, for background
+// jobs (scheduler reminders and alerts) that must show the same figures.
+type TaxLedger struct {
+	// Txns is chronological, with the Vorabpauschale events of completed
+	// years merged in and pension-wrapper accounts removed.
+	Txns   []analytics.TaxTransaction
+	Names  map[string]string
+	Equity map[string]bool
+	// Prices is today's EUR price per unit of every held security.
+	Prices map[string]float64
+}
+
+// LoadTaxLedger loads the tax ledger exactly as the filing views build it.
+func LoadTaxLedger(ctx context.Context, q *db.Queries) (*TaxLedger, error) {
+	h := NewAnalysisHandler(q)
+	d, err := h.loadTaxFilingData(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &TaxLedger{
+		Txns:   capitalIncomeInput{Ledger: d.ledger, Accounts: d.accounts}.filingLedger(),
+		Names:  d.names,
+		Equity: d.equity,
+		Prices: h.currentUnitPricesEUR(ctx),
+	}, nil
+}

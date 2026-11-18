@@ -219,6 +219,13 @@ func (h *ReportsHandler) HandleGenerateReport(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusCreated, map[string]any{"status": "ok", "period": periodLabel, "regenerated": false})
 }
 
+// ComputeReportData computes a report for the calendar period [start, end]
+// exactly as the report pages do. The scheduler's report generation, backfill
+// and digests use it so stored copies and digests match the pages.
+func (h *ReportsHandler) ComputeReportData(ctx context.Context, start, end time.Time) (ReportData, error) {
+	return h.loadReportData(ctx, start, end)
+}
+
 // loadReportData loads everything a report needs and computes it for the
 // calendar period [start, end].
 func (h *ReportsHandler) loadReportData(ctx context.Context, start, end time.Time) (ReportData, error) {

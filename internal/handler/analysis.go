@@ -2485,56 +2485,7 @@ func (h *AnalysisHandler) HandleExportDATEV(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 	w.Write([]byte{0xEF, 0xBB, 0xBF}) // UTF-8 BOM for Excel
-
-	// DATEV header
-	fmt.Fprintf(w, "\"EXTF\";510;21;\"Buchungsstapel\";7;%d0101;4;\"%d\";\"%d\";;;;\"\";\"\";1;\n", year, year, year)
-	// Column headers
-	fmt.Fprintf(w, "Umsatz;Soll/Haben;WKZ;Konto;Gegenkonto;Belegdatum;Buchungstext;Belegfeld1\n")
-
-	for _, txn := range txns {
-		if txn.Date.Year() != year {
-			continue
-		}
-		if txn.Type != "dividend" && txn.Type != "interest" && txn.Type != "sell" && txn.Type != "fee" {
-			continue
-		}
-		amt := 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-		}
-		isin := ""
-		if txn.SecurityISIN.Valid {
-			isin = txn.SecurityISIN.String
-		}
-		name := secNames[isin]
-		if name == "" {
-			name = isin
-		}
-		acctName := acctNames[txn.AccountID.String()]
-
-		sollHaben := "S"
-		if amt > 0 && txn.Type != "fee" {
-			sollHaben = "H"
-		}
-
-		konto := "1800"
-		gegenkonto := "2650"
-		if txn.Type == "fee" {
-			gegenkonto = "4900"
-		}
-
-		buchungstext := fmt.Sprintf("%s: %s", txn.Type, name)
-		if len(buchungstext) > 60 {
-			buchungstext = buchungstext[:60]
-		}
-
-		belegdatum := txn.Date.Format("0201")
-		belegfeld := acctName
-
-		fmt.Fprintf(w, "%.2f;%s;EUR;%s;%s;%s;\"%s\";\"%s\"\n",
-			math.Abs(amt), sollHaben, konto, gegenkonto, belegdatum, buchungstext, belegfeld)
-	}
+	writeDATEV(w, year, datevRows(txns, year, secNames, acctNames, histFX, fxRates))
 }
 
 // HandleAnlageKAP prepares Anlage KAP and Anlage KAP-INV for a tax year with

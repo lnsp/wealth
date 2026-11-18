@@ -110,7 +110,7 @@ func txnTFSRate(txn TaxTransaction) float64 {
 
 // Basiszins published by Deutsche Bundesbank (used for Vorabpauschale)
 var BasiszinsByYear = map[int]float64{
-	2022: -0.05, 2023: 2.55, 2024: 2.29, 2025: 2.53, 2026: 2.53,
+	2022: -0.05, 2023: 2.55, 2024: 2.29, 2025: 2.53, 2026: 3.20, // 2026: BMF 13.01.2026
 }
 
 // VorabpauschaleEntry holds per-ETF Vorabpauschale data.
@@ -529,22 +529,14 @@ type SellSimResult struct {
 }
 
 // SellTaxRate returns the effective rate on a taxable capital gain given an
-// optional church-tax rate (KiSt). Formula:
+// optional church-tax rate (KiSt). Kirchensteuer is deductible from the
+// Abgeltungsteuer base (§32d Abs. 1 EStG), see CapitalIncomeTaxRate:
 //
-//	rate = Abgeltungssteuer × (1 + Soli + KiSt)
+//	no church: 26.375 %, 8 % (BY/BW): 27.8186 %, 9 %: 27.9951 %
 //
-// Defaults (no church): 0.25 × 1.055 = 0.26375 (= EffectiveTaxRate).
-// 8% church (BY/BW): 0.25 × 1.135 = 0.28375.
-// 9% church (other Bundesländer): 0.25 × 1.145 = 0.28625.
-// churchTaxRate is silently clamped to [0, 0.09] to keep the planner sane.
+// churchTaxRate is silently clamped to [0, 0.09].
 func SellTaxRate(churchTaxRate float64) float64 {
-	if churchTaxRate < 0 {
-		churchTaxRate = 0
-	}
-	if churchTaxRate > 0.09 {
-		churchTaxRate = 0.09
-	}
-	return Abgeltungssteuer * (1 + Solidaritaetszuschlag + churchTaxRate)
+	return CapitalIncomeTaxRate(churchTaxRate)
 }
 
 // SimulateSell computes the tax impact of selling specified EUR amounts using
@@ -843,6 +835,7 @@ type TaxTransaction struct {
 	Quantity       float64
 	Amount         float64
 	IsEquityFund   bool
+	AssetClass     string  // securities.asset_class; drives loss pot (IsShareAssetClass) and §23 exclusion (IsPrivateSaleAssetClass)
 	TFS            float64 // optional explicit Teilfreistellung rate (0.30, 0.15, 0.00)
 	HasExplicitTFS bool    // true when TFS was explicitly resolved from EquityPct
 }

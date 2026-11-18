@@ -23,18 +23,18 @@ func TestSellTaxRate_NoChurch(t *testing.T) {
 }
 
 func TestSellTaxRate_8PercentChurch(t *testing.T) {
-	// 25% × (1 + 0.055 + 0.08) = 25% × 1.135 = 0.28375
+	// §32d Abs. 1 EStG: KiSt reduces the base → (1 + 0.055 + 0.08) / 4.08
 	got := SellTaxRate(0.08)
-	want := 0.28375
+	want := 1.135 / 4.08 // 0.278186
 	if math.Abs(got-want) > 1e-6 {
 		t.Errorf("SellTaxRate(0.08) = %.6f, want %.6f", got, want)
 	}
 }
 
 func TestSellTaxRate_9PercentChurch(t *testing.T) {
-	// 25% × (1 + 0.055 + 0.09) = 25% × 1.145 = 0.28625
+	// §32d Abs. 1 EStG: KiSt reduces the base → (1 + 0.055 + 0.09) / 4.09
 	got := SellTaxRate(0.09)
-	want := 0.28625
+	want := 1.145 / 4.09 // 0.279951
 	if math.Abs(got-want) > 1e-6 {
 		t.Errorf("SellTaxRate(0.09) = %.6f, want %.6f", got, want)
 	}
@@ -48,8 +48,8 @@ func TestSellTaxRate_NegativeClamped(t *testing.T) {
 
 func TestSellTaxRate_AboveMaxClamped(t *testing.T) {
 	// Anything above 0.09 clamps to 0.09 (max German Kirchensteuer rate).
-	if got := SellTaxRate(0.5); math.Abs(got-0.28625) > 1e-6 {
-		t.Errorf("SellTaxRate(0.5) should clamp to 0.09 → 0.28625, got %.6f", got)
+	if got := SellTaxRate(0.5); math.Abs(got-1.145/4.09) > 1e-6 {
+		t.Errorf("SellTaxRate(0.5) should clamp to 0.09 → 0.279951, got %.6f", got)
 	}
 }
 
@@ -93,14 +93,14 @@ func TestSimulateSell_EquityNoChurch(t *testing.T) {
 
 func TestSimulateSell_EquityWith9PercentChurch(t *testing.T) {
 	// Same fixture as above, but with 9% church tax.
-	// tax = 3500 × 0.28625 = 1001.875
+	// tax = 3500 × 1.145/4.09 = 979.83 (KiSt deductible, §32d Abs. 1 EStG)
 	lots := []TaxLot{
 		{ISIN: "EQ1", Name: "Equity ETF", Quantity: 100, CostBasis: 10000, CurrentValue: 15000, IsEquityFund: true},
 	}
 	requests := []SellRequest{{ISIN: "EQ1", AmountEUR: 15000}}
 	results, _, _ := SimulateSell(lots, requests, 0.09)
-	if math.Abs(results[0].EstimatedTax-1001.875) > 0.5 {
-		t.Errorf("estimated_tax with 9%% church = %.2f, want 1001.875", results[0].EstimatedTax)
+	if math.Abs(results[0].EstimatedTax-979.83) > 0.5 {
+		t.Errorf("estimated_tax with 9%% church = %.2f, want 979.83", results[0].EstimatedTax)
 	}
 }
 

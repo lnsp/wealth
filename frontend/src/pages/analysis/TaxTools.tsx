@@ -269,8 +269,8 @@ function SellSimulator({ lots }: { lots: LoadState<TaxLot[]> }) {
                     try { localStorage.setItem('church_tax_rate', String(v)); } catch { /* preference only */ }
                   }}>
                   <option value={0}>None, rate applied 26,375 %</option>
-                  <option value={0.08}>8 % (Bavaria, Baden-Württemberg), rate applied 28,375 %</option>
-                  <option value={0.09}>9 % (other states), rate applied 28,625 %</option>
+                  <option value={0.08}>8 % (Bavaria, Baden-Württemberg), rate applied 27,82 %</option>
+                  <option value={0.09}>9 % (other states), rate applied 28,00 %</option>
                 </SelectField>
               </div>
 

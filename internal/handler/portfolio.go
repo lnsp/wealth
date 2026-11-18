@@ -1869,27 +1869,32 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 	now := time.Now()
 	startMonth := addMonthsFirstOfMonth(now, 0).Format("2006-01")
 
-	// Historical investable wealth, one point per month. The current month is
-	// the projection's first point, so history stops before it.
-	allSnaps, _ := h.queries.ListNetWorthSnapshots(ctx, 5000)
+	// Historical investable wealth: the month-end value of every complete
+	// month, then today's value labelled with the current month. That last
+	// point is the projection's first, so the two lines meet and a move in
+	// the running month (an asset bought from savings) shows in the history
+	// instead of as a jump between the lines.
+	allSnaps, _ := h.queries.ListNetWorthSnapshots(ctx, 36600)
 	type histPoint struct {
 		Date  string  `json:"date"`
 		Value float64 `json:"value"`
 	}
 	history := make([]histPoint, 0)
-	lastMonth := ""
-	// Snapshots are newest-first; reverse for chronological
+	// Snapshots are newest-first; walk chronologically and keep each month's last.
 	for i := len(allSnaps) - 1; i >= 0; i-- {
 		s := allSnaps[i]
 		month := s.Date.Format("2006-01")
 		if month >= startMonth {
 			break
 		}
-		if month != lastMonth {
-			history = append(history, histPoint{Date: month, Value: math.Round(investableNetWorth(s))})
-			lastMonth = month
+		v := math.Round(investableNetWorth(s))
+		if n := len(history); n > 0 && history[n-1].Date == month {
+			history[n-1].Value = v
+		} else {
+			history = append(history, histPoint{Date: month, Value: v})
 		}
 	}
+	history = append(history, histPoint{Date: startMonth, Value: math.Round(currentValue)})
 
 	// Default contribution: trailing 12-month net external contribution.
 	fxRates := loadFXRatesMap(ctx, h.queries)

@@ -16,7 +16,7 @@ import { useMarketRefresh } from '../hooks/useMarketRefresh';
 import UnvestedPanel from '../components/UnvestedPanel';
 import AssetsTab, { ASSET_VIEW_PARAMS } from '../components/assets/AssetsTab';
 import UnlinkedAssetPaymentsNote from '../components/planning/UnlinkedAssetPaymentsNote';
-import { escapeHtml, fmtEUR, fmtPct, fmtNum, fmtAxis, fmtDateLong, fmtMonth, fmtMonthShort } from '../utils/format';
+import { escapeHtml, fmtEUR, fmtPct, fmtNum, fmtAxis, fmtDate, fmtDateLong, fmtMonth, fmtMonthShort } from '../utils/format';
 
 type NWTab = 'overview' | 'projection' | 'accounts' | 'assets';
 const NW_TAB_IDS: readonly NWTab[] = ['overview', 'projection', 'accounts', 'assets'];
@@ -1525,6 +1525,22 @@ function ProjectionTab() {
   const shownMilestones = showAllMilestones ? milestones : milestones.slice(0, 2);
   const acc = projData.projection_accuracy;
 
+  // Chart x positions. History points are month ends; the last one is today's
+  // value and is also the projection's first point, so the two lines meet.
+  // Projection points step from today in whole months.
+  const today = new Date();
+  const todayTs = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  const curMonth = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+  const monthEndTs = (ym: string) => { const [y, m] = ym.split('-').map(Number); return new Date(y, m, 0).getTime(); };
+  const projTs = (ym: string, first: boolean) => {
+    if (first || ym === curMonth) return todayTs;
+    const [y, m] = ym.split('-').map(Number);
+    return new Date(y, m - 1, Math.min(today.getDate(), new Date(y, m, 0).getDate())).getTime();
+  };
+  const histXY: [number, number][] = hist.map(h => [h.date === curMonth ? todayTs : monthEndTs(h.date), h.value]);
+  const projXY = proj.map((p, i) => ({ ...p, ts: projTs(p.date, i === 0) }));
+  const projByTs = new Map(projXY.map(p => [p.ts, p]));
+
   const saveScenario = () => {
     if (savedScenarios.length >= 3) return;
     const name = `${fmtEUR(contribNum)} a month at ${fmtPct(returnNum)}`;
@@ -1621,61 +1637,64 @@ function ProjectionTab() {
             tooltip: {
               trigger: 'axis' as const,
               formatter: (params: unknown) => {
-                const ps = params as { seriesName: string; data: number | null; dataIndex: number; marker: string }[];
+                const ps = params as { seriesName: string; data: [number, number | null]; axisValue: number; marker: string }[];
                 if (!Array.isArray(ps) || ps.length === 0) return '';
-                const idx = ps[0].dataIndex;
-                const dateKey = idx < hist.length ? hist[idx].date : proj[idx - hist.length]?.date ?? '';
-                const projPt = idx >= hist.length ? proj[idx - hist.length] : undefined;
-                const rows = ps.filter(p => p.data != null).map(p => {
-                  const val = p.seriesName === '90th percentile' && projPt?.p90 != null ? projPt.p90 : (p.data as number);
+                const ts = ps[0].axisValue;
+                const projPt = projByTs.get(ts);
+                const rows = ps.filter(p => Array.isArray(p.data) && p.data[1] != null).map(p => {
+                  const val = p.seriesName === '90th percentile' && projPt?.p90 != null ? projPt.p90 : (p.data[1] as number);
                   return `${p.marker} ${escapeHtml(p.seriesName)}: ${fmtEUR(val)}`;
                 });
-                return `${escapeHtml(fmtMonth(monthDate(dateKey)))}<br/>${rows.join('<br/>')}`;
+                const label = ts === todayTs ? `Today, ${fmtDate(new Date(ts))}` : fmtMonth(new Date(ts));
+                return `${escapeHtml(label)}<br/>${rows.join('<br/>')}`;
               },
             },
             grid: { left: 4, right: 30, top: 12, bottom: 4, containLabel: true },
+            // A time axis keeps months of history and quarters of projection at true scale.
             xAxis: {
-              type: 'category' as const,
-              boundaryGap: false,
-              data: [...hist.map(h => fmtMonthShort(monthDate(h.date))), ...proj.map(p => fmtMonthShort(monthDate(p.date)))],
+              type: 'time' as const,
+              axisLabel: { formatter: (v: number) => fmtMonthShort(new Date(v)), hideOverlap: true },
             },
             yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
             series: [
               {
                 name: 'Historical', type: 'line' as const, color: tc.forest,
-                data: [...hist.map(h => h.value), ...proj.map(() => null)],
+                data: histXY,
                 showSymbol: false, lineStyle: { width: 2 },
               },
               {
                 name: 'Projected', type: 'line' as const, color: tc.gold,
-                data: [...hist.map(() => null), ...proj.map(p => p.value)],
+                data: projXY.map(p => [p.ts, p.value]),
                 showSymbol: false, lineStyle: { width: 2, type: 'dashed' as const },
+                markLine: {
+                  silent: true, symbol: 'none', animation: false,
+                  lineStyle: { color: tc.inkMuted, type: 'dotted' as const, width: 1 },
+                  label: { formatter: 'Today', color: tc.inkMuted, position: 'insideEndTop' as const },
+                  data: [{ xAxis: todayTs }],
+                },
               },
               ...(projData.has_confidence ? [
                 {
                   name: '10th percentile', type: 'line' as const, color: tc.gold, stack: 'confidence',
-                  data: [...hist.map(() => null), ...proj.map(p => p.p10 ?? null)],
+                  data: projXY.filter(p => p.p10 != null && p.p90 != null).map(p => [p.ts, p.p10 as number]),
                   showSymbol: false, lineStyle: { width: 0 },
                 },
                 {
                   name: '90th percentile', type: 'line' as const, color: tc.gold, stack: 'confidence',
-                  data: [...hist.map(() => null), ...proj.map(p => (p.p10 != null && p.p90 != null ? Math.max(0, p.p90 - p.p10) : null))],
+                  data: projXY.filter(p => p.p10 != null && p.p90 != null).map(p => [p.ts, Math.max(0, (p.p90 as number) - (p.p10 as number))]),
                   showSymbol: false, lineStyle: { width: 0 }, areaStyle: { color: tc.gold, opacity: 0.16 },
                 },
               ] : []),
-              ...(projData.target_amount > 0 ? [{
+              ...(projData.target_amount > 0 && projXY.length > 0 ? [{
                 name: projData.target_goal_name ? `Goal: ${projData.target_goal_name}` : 'Target', type: 'line' as const, color: tc.slate,
-                data: [...hist.map(() => null), ...proj.map(() => projData.target_amount)],
+                data: [[projXY[0].ts, projData.target_amount], [projXY[projXY.length - 1].ts, projData.target_amount]],
                 showSymbol: false, lineStyle: { width: 1.5, type: 'dotted' as const },
               }] : []),
-              ...shownScenarios.map(({ s }, k) => {
-                const byDate = new Map(s.projection.map(p => [p.date, p.value]));
-                return {
-                  name: s.name, type: 'line' as const, color: scenarioColors[k % scenarioColors.length],
-                  data: [...hist.map(() => null), ...proj.map(p => byDate.get(p.date) ?? null)],
-                  showSymbol: false, lineStyle: { width: 1.5, type: 'dashed' as const },
-                };
-              }),
+              ...shownScenarios.map(({ s }, k) => ({
+                name: s.name, type: 'line' as const, color: scenarioColors[k % scenarioColors.length],
+                data: s.projection.map((p, i) => [projTs(p.date, i === 0), p.value]),
+                showSymbol: false, lineStyle: { width: 1.5, type: 'dashed' as const },
+              })),
             ],
           }}
         />

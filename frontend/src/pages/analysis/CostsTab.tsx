@@ -119,8 +119,10 @@ function CostOverview({ costs }: { costs: LoadState<CostData> }) {
                     <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-ink-body">
                       <Chip tone="info">Cost grade {data.benchmark.grade}</Chip>
                       <span>
-                        {data.benchmark.detail}. Your charge of {fmtPct(data.benchmark.your_ter, { digits: 2 })} compares with about {fmtPct(data.benchmark.avg_ter, { digits: 2 })} for a typical German fund investor
-                        {num(data.benchmark.annual_saving) > 0 && <>, a saving of <Money value={data.benchmark.annual_saving} /> a year</>}.
+                        {data.benchmark.detail}. Your funds’ weighted charge of {fmtPct(data.benchmark.your_ter, { digits: 2 })} compares with about {fmtPct(data.benchmark.avg_ter, { digits: 2 })} for a typical German fund investor
+                        {num(data.benchmark.annual_saving) > 0 && <>: <Money value={data.benchmark.annual_saving} /> a year less on <Money value={data.benchmark.funds_value ?? coveredValue} /> in funds</>}
+                        {num(data.benchmark.annual_saving) < 0 && <>: <Money value={-num(data.benchmark.annual_saving)} /> a year more on <Money value={data.benchmark.funds_value ?? coveredValue} /> in funds</>}.
+                        {coverage < 99.5 && ' Single stocks and funds without a charge on record are left out of the grade.'}
                       </span>
                     </div>
                   )}
@@ -136,48 +138,66 @@ function CostOverview({ costs }: { costs: LoadState<CostData> }) {
 
 /* ───────────── Cost drag projection ───────────── */
 
+const PROJECTION_MILESTONES = new Set([1, 5, 10, 20, 30]);
+
 function CostProjection({ costs }: { costs: LoadState<CostData> }) {
   const tc = useThemeColors();
   return (
-    <Section title="Cost Drag Projection" subtitle="Fund costs added up over 1 to 30 years at today’s values, with no growth assumed.">
+    <Section title="Cost Drag Projection" subtitle="What fund charges take out of your portfolio over 1 to 30 years, including the growth the charged money would have earned.">
       <Loaded state={costs} lines={4}>
         {data => {
+          const growth = num(data?.projection_growth_pct) || 5;
           const projection = arr(data?.projection);
           if (projection.length === 0 || num(data?.annual_cost) <= 0) {
             return <Statement>No projection yet. It appears once at least one fund has an ongoing charge on record.</Statement>;
           }
-          const at = (year: number) => projection.find(p => p.year === year)?.cumulative ?? num(data.annual_cost) * year;
+          const at = (year: number) => projection.find(p => p.year === year)?.cumulative;
+          const assumption = `At ${fmtPct(growth, { digits: 0 })} growth a year`;
           return (
             <>
               <MetricGrid>
-                <MetricCard label="After 10 years" value={fmtEUR(at(10))} />
-                <MetricCard label="After 20 years" value={fmtEUR(at(20))} />
-                <MetricCard label="After 30 years" value={fmtEUR(at(30))} />
+                <MetricCard label="After 10 years" value={fmtEUR(at(10))} sublabel={assumption} />
+                <MetricCard label="After 20 years" value={fmtEUR(at(20))} sublabel={assumption} />
+                <MetricCard label="After 30 years" value={fmtEUR(at(30))} sublabel={assumption} />
                 <MetricCard label="Per day" value={fmtEUR(data.daily_cost, { cents: true })} sublabel="At today’s values" />
               </MetricGrid>
               <SubHeading className="mt-6 mb-2">Cumulative Fee Drag</SubHeading>
               <EChartWrapper option={{
-                grid: { top: 28, right: 16, bottom: 28, left: 52 },
-                xAxis: { type: 'category' as const, data: projection.map(p => plural(p.year, 'year', 'years')) },
+                grid: { top: 28, right: 24, bottom: 28, left: 52 },
+                xAxis: {
+                  type: 'value' as const, min: 0, max: 31, interval: 5,
+                  axisLabel: { formatter: (v: number) => (v > 0 && v <= 30 ? `Year ${v}` : '') },
+                  splitLine: { show: false },
+                },
                 yAxis: { type: 'value' as const, min: 0, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
                 series: [{
                   type: 'bar' as const,
-                  name: 'Cumulative fund costs',
-                  data: projection.map(p => p.cumulative),
+                  name: 'Fee drag',
+                  data: projection.map(p => [p.year, p.cumulative]),
                   color: tc.forest,
                   itemStyle: { color: tc.forest, borderRadius: [2, 2, 0, 0] },
-                  barMaxWidth: 48,
-                  label: { show: true, position: 'top' as const, fontSize: 11, color: tc.inkBody, formatter: (p: unknown) => fmtEUR((p as { value: number }).value) },
+                  barMaxWidth: 10,
+                  label: {
+                    show: true, position: 'top' as const, fontSize: 11, color: tc.inkBody,
+                    formatter: (p: unknown) => {
+                      const [year, value] = (p as { value: [number, number] }).value;
+                      return PROJECTION_MILESTONES.has(year) ? fmtEUR(value) : '';
+                    },
+                  },
                 }],
                 tooltip: {
                   trigger: 'axis' as const,
                   formatter: (p: unknown) => {
-                    const a = p as { name: string; value: number }[];
+                    const a = p as { value: [number, number] }[];
                     if (!Array.isArray(a) || a.length === 0) return '';
-                    return `${escapeHtml(a[0].name)}: ${fmtEUR(a[0].value)}`;
+                    const [year, value] = a[0].value;
+                    return `After ${escapeHtml(plural(year, 'year', 'years'))}: ${fmtEUR(value)}`;
                   },
                 },
               }} height="220px" />
+              <p className="mt-2 text-[12px] text-ink-muted">
+                Assumes the funds you hold today and {fmtPct(growth, { digits: 0 })} growth a year before costs. Without growth, today’s charges would add up to <Money value={num(data.annual_cost) * 30} /> over 30 years.
+              </p>
             </>
           );
         }}
@@ -190,22 +210,26 @@ function CostProjection({ costs }: { costs: LoadState<CostData> }) {
 
 function TotalCostOfOwnership({ costs }: { costs: LoadState<CostData> }) {
   return (
-    <Section title="Total Cost of Ownership" subtitle="Fund charges plus what trading costs you in a typical year.">
+    <Section title="Total Cost of Ownership" subtitle="Fund charges plus what trading and custody cost you in a typical year.">
       <Loaded state={costs} lines={3}>
         {data => {
           const t = data?.total_cost_ownership;
-          if (!t) return <Statement>No trading costs on record yet.</Statement>;
+          if (!t) return <Statement>No fund charges or trades on record yet.</Statement>;
+          const years = num(t.years);
           return (
             <>
               <MetricGrid>
                 <MetricCard label="Fund charges" value={fmtEUR(t.ter_cost)} sublabel="Per year" />
-                <MetricCard label="Transaction fees" value={fmtEUR(t.transaction_fees)} sublabel="Per year, averaged" />
+                <MetricCard label="Fees and custody" value={fmtEUR(t.transaction_fees)}
+                  sublabel={years > 0 ? `Per year, averaged over ${fmtNum(years, 1)} years` : 'Per year'} />
                 <MetricCard label="Bid-ask spread" value={fmtEUR(t.spread_estimate)} sublabel="Estimated at 0,05 % of volume" />
                 <MetricCard label="Total per year" value={fmtEUR(t.total_annual)} sublabel={`${fmtPct(t.total_annual_pct, { digits: 2 })} of the portfolio`} />
               </MetricGrid>
-              <p className="mt-3 text-[13px] text-ink-muted">
-                Since your first trade: <Money value={t.lifetime_fees} /> in fees across {fmtNum(t.transaction_count)} {t.transaction_count === 1 ? 'transaction' : 'transactions'}, on a volume of <Money value={t.lifetime_volume} />.
-              </p>
+              {num(t.transaction_count) > 0 && (
+                <p className="mt-3 text-[13px] text-ink-muted">
+                  Since your first trade: <Money value={t.lifetime_fees} /> in fees and custody charges, {fmtNum(t.transaction_count)} {t.transaction_count === 1 ? 'trade' : 'trades'} on a volume of <Money value={t.lifetime_volume} />.
+                </p>
+              )}
             </>
           );
         }}
@@ -216,36 +240,65 @@ function TotalCostOfOwnership({ costs }: { costs: LoadState<CostData> }) {
 
 /* ───────────── Cheaper alternatives ───────────── */
 
+/** What switching would cost in tax, in one sentence. */
+function switchTaxNote(h: Alternatives['alternatives'][number]) {
+  if (h.switch_tax == null) return 'The purchase cost is not on record, so the tax on switching is not estimated.';
+  if (num(h.switch_tax) <= 0) return 'Selling now realises no taxable gain, so switching costs no tax.';
+  return null;
+}
+
 function CheaperAlternatives() {
   const alternatives = useLoad<Alternatives>(() => api.getAlternatives());
   return (
-    <Section title="Cheaper Alternatives" subtitle="Lower-cost ETFs that track a similar index.">
+    <Section title="Cheaper Alternatives" subtitle="Lower-cost ETFs on the same or a similar index, and what switching costs in tax.">
       <Loaded state={alternatives} lines={3}>
         {data => {
           const list = arr(data?.alternatives).filter(h => arr(h.alternatives).length > 0);
           if (list.length === 0) return <Statement>No cheaper alternative on record for the funds you hold.</Statement>;
+          const growth = num(data?.growth_pct) || 5;
           return (
             <div className="flex flex-col gap-5">
-              {list.map(h => (
-                <div key={h.isin}>
-                  <p className="text-[14px] font-medium text-ink">
-                    {h.name} <span className="font-normal text-ink-muted">· ongoing charge {fmtPct(h.current_ter, { digits: 2 })}</span>
-                  </p>
-                  <ul className="mt-1 divide-y divide-divider border-y border-divider">
-                    {arr(h.alternatives).map(a => (
-                      <li key={a.name} className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 py-2 text-[13px]">
-                        <span className="min-w-0">
-                          <span className="text-ink">{a.name}</span>
-                          <span className="text-ink-muted"> · {fmtPct(a.ter, { digits: 2 })}, {fmtNum(num(h.current_ter) - num(a.ter), 2)} points lower</span>
-                        </span>
-                        <span className="text-ink-body">
-                          Saves <Money value={a.annual_saving} className="text-ink" /> a year, <Money value={a.ten_year_saving} /> over 10 years
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ))}
+              {list.map(h => {
+                const note = switchTaxNote(h);
+                return (
+                  <div key={h.isin}>
+                    <p className="text-[14px] font-medium text-ink">
+                      {h.name} <span className="font-normal text-ink-muted">· ongoing charge {fmtPct(h.current_ter, { digits: 2 })}{h.index ? ` · ${h.index}` : ''}</span>
+                    </p>
+                    <p className="mt-1 text-[13px] text-ink-body">
+                      {note ?? <>Selling <Money value={h.value} /> now realises a gain of <Money value={h.unrealized_gain} /> and about <Money value={h.switch_tax} className="text-ink" /> in tax (Teilfreistellung applied, saver’s allowance not counted). Keeping the fund defers that tax until you sell.</>}
+                    </p>
+                    <ul className="mt-2 divide-y divide-divider border-y border-divider">
+                      {arr(h.alternatives).map(a => (
+                        <li key={a.isin} className="flex flex-col gap-1 py-2 text-[13px]">
+                          <span className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                            <span className="min-w-0">
+                              <span className="text-ink">{a.name}</span>
+                              <span className="text-ink-muted"> · {fmtPct(a.ter, { digits: 2 })}, {fmtNum(num(h.current_ter) - num(a.ter), 2)} points lower</span>
+                            </span>
+                            <span className="text-ink-body">
+                              Saves <Money value={a.annual_saving} className="text-ink" /> a year, <Money value={a.ten_year_saving} /> over 10 years before tax
+                            </span>
+                          </span>
+                          <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-ink-muted">
+                            {a.same_index
+                              ? <Chip tone="success">Same index</Chip>
+                              : <Chip tone="warning" title="Returns will differ from your fund's">Different index{a.index ? `: ${a.index}` : ''}</Chip>}
+                            {a.ten_year_net_after_tax != null && (
+                              <span>
+                                After the switch tax: {a.breakeven_years != null
+                                  ? <>ahead after {plural(a.breakeven_years, 'year', 'years')}</>
+                                  : <>not ahead within 50 years</>}
+                                {' '}(after 10 years <Money value={a.ten_year_net_after_tax} sign />, at {fmtPct(growth, { digits: 0 })} growth).
+                              </span>
+                            )}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+              })}
             </div>
           );
         }}

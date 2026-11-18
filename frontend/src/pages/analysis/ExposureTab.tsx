@@ -9,13 +9,20 @@ import { Loaded, Money, ShareBars, Statement, SubHeadingRow, TableRegion, arr, m
 import type { LoadState, ShareBarItem } from './shared';
 
 type Summary = Awaited<ReturnType<typeof api.getAllocationSummary>>;
-type Matrix = { labels: string[]; matrix: number[][] };
+type Matrix = { labels: string[]; matrix: (number | null)[][] };
 
-const FUND_DATA_HINT = 'Sector, country and constituent data is fetched in the background for each ETF you hold.';
+const FUND_DATA_HINT = 'Sector, country and constituent data is fetched in the background for each ETF and fund you hold.';
+const STOCK_SECTOR_HINT = 'Sector data comes from fund profiles, so it covers ETFs and funds only. Single shares have no sector source yet and are counted as unknown.';
+/** Bucket the backend uses for value without sector, country or currency data. */
+const UNKNOWN = 'Unknown';
+/** Asset classes whose constituents and fund data may be on record. */
+const FUND_CLASSES = new Set(['etf', 'fund', 'bond']);
+/** Treemap tile for the part of a fund outside its listed holdings (backend analytics.TreemapRestOfFund). */
+const REST_OF_FUND = 'Rest of fund';
 
 export default function ExposureTab() {
   const summary = useLoad(() => api.getAllocationSummary());
-  const etfs = useLoad(() => api.listHoldings().then(r => arr(r?.holdings).filter(h => h.asset_class === 'etf')));
+  const etfs = useLoad(() => api.listHoldings().then(r => arr(r?.holdings).filter(h => FUND_CLASSES.has(h.asset_class))));
   // Constituents of the ETF opened in the breakdown; the sustainability check reads them too.
   const [constituents, setConstituents] = useState<ETFHoldingEntry[]>([]);
   return (
@@ -44,14 +51,18 @@ function NoFundData({ title, message, onDone }: { title: string; message: string
   );
 }
 
-function shareItems(entries: [string, number][], limit?: number, otherLabel = 'Other'): { items: ShareBarItem[]; total: number } {
-  const sorted = entries.filter(([, v]) => v > 0).sort(([, a], [, b]) => b - a);
-  const total = sorted.reduce((s, [, v]) => s + v, 0);
+/** Share bars largest first; the backend's "Unknown" bucket goes last under `unknownLabel`. */
+function shareItems(entries: [string, number][], limit?: number, otherLabel = 'Other', unknownLabel = UNKNOWN): { items: ShareBarItem[]; total: number } {
+  const positive = entries.filter(([, v]) => v > 0);
+  const unknown = positive.find(([k]) => k === UNKNOWN);
+  const sorted = positive.filter(([k]) => k !== UNKNOWN).sort(([, a], [, b]) => b - a);
+  const total = positive.reduce((s, [, v]) => s + v, 0);
   let shown = sorted;
   if (limit && sorted.length > limit) {
     const rest = sorted.slice(limit);
     shown = [...sorted.slice(0, limit), [`${otherLabel} (${rest.length})`, rest.reduce((s, [, v]) => s + v, 0)]];
   }
+  if (unknown) shown = [...shown, [unknownLabel, unknown[1]]];
   return {
     total,
     items: shown.map(([label, value]) => ({
@@ -69,12 +80,18 @@ function SectorAllocation({ summary }: { summary: LoadState<Summary> }) {
     <Section first title="Sector Allocation" subtitle="Look-through exposure by sector, across all funds and single stocks.">
       <Loaded state={summary} lines={6}>
         {data => {
-          const { items } = shareItems(Object.entries(rec(data?.sectors)));
-          if (items.length === 0) return <NoFundData title="No sector data yet" message={FUND_DATA_HINT} onDone={summary.reload} />;
+          const entries = Object.entries(rec(data?.sectors));
+          const known = entries.filter(([k, v]) => k !== UNKNOWN && v > 0);
+          // Only unknown value (e.g. single shares only): nothing to break down.
+          if (known.length === 0) return <NoFundData title="No sector data yet" message={`${FUND_DATA_HINT} ${STOCK_SECTOR_HINT}`} onDone={summary.reload} />;
+          const { items } = shareItems(entries, undefined, 'Other', 'No sector data');
           if (items.length === 1) return <Statement>All of your exposure is in 1 sector: {items[0].label} (<Money value={items[0].value} />).</Statement>;
           return (
             <>
-              <p className="mb-4 text-[13px] text-ink-muted">{plural(items.length, 'sector', 'sectors')}</p>
+              <p className="mb-4 text-[13px] text-ink-muted">
+                {plural(known.length, 'sector', 'sectors')}
+                {entries.some(([k, v]) => k === UNKNOWN && v > 0) && '. Single shares and funds without data are shown as “No sector data”.'}
+              </p>
               <ShareBars items={items} />
             </>
           );
@@ -86,16 +103,17 @@ function SectorAllocation({ summary }: { summary: LoadState<Summary> }) {
 
 function CountryAllocation({ summary }: { summary: LoadState<Summary> }) {
   return (
-    <Section title="Country Allocation" subtitle="Where the companies you own are based.">
+    <Section title="Country Allocation" subtitle="Where the companies you own are based: fund data for ETFs, the issuer’s country (from the ISIN) for single shares.">
       <Loaded state={summary} lines={6}>
         {data => {
           const all = Object.entries(rec(data?.countries)).filter(([, v]) => v > 0);
-          const { items } = shareItems(all, 15, 'Other countries');
-          if (items.length === 0) return <NoFundData title="No country data yet" message={FUND_DATA_HINT} onDone={summary.reload} />;
+          const known = all.filter(([k]) => k !== UNKNOWN);
+          if (known.length === 0) return <NoFundData title="No country data yet" message={FUND_DATA_HINT} onDone={summary.reload} />;
+          const { items } = shareItems(all, 15, 'Other countries', 'No country data');
           if (items.length === 1) return <Statement>All of your exposure is in 1 country: {items[0].label} (<Money value={items[0].value} />).</Statement>;
           return (
             <>
-              <p className="mb-4 text-[13px] text-ink-muted">{plural(all.length, 'country', 'countries')}</p>
+              <p className="mb-4 text-[13px] text-ink-muted">{plural(known.length, 'country', 'countries')}</p>
               <ShareBars items={items} />
             </>
           );
@@ -107,16 +125,22 @@ function CountryAllocation({ summary }: { summary: LoadState<Summary> }) {
 
 function CurrencyExposure({ summary }: { summary: LoadState<Summary> }) {
   return (
-    <Section title="Currency Exposure" subtitle="Underlying currency exposure, based on where each holding’s assets are.">
+    <Section title="Currency Exposure" subtitle="Underlying currency exposure, based on where each holding’s assets are. Funds without country data count as unknown, not as their trading currency.">
       <Loaded state={summary} lines={4}>
         {data => {
-          const list = arr(data?.currencies).filter(c => num(c.value) > 0).sort((a, b) => b.value - a.value);
-          if (list.length === 0) return <NoFundData title="No currency data yet" message={FUND_DATA_HINT} onDone={summary.reload} />;
+          const all = arr(data?.currencies).filter(c => num(c.value) > 0);
+          // Largest first, the unknown bucket last.
+          const list = [...all.filter(c => c.currency !== UNKNOWN).sort((a, b) => b.value - a.value), ...all.filter(c => c.currency === UNKNOWN)];
+          const known = list.filter(c => c.currency !== UNKNOWN);
+          if (known.length === 0) return <NoFundData title="No currency data yet" message={FUND_DATA_HINT} onDone={summary.reload} />;
           if (list.length === 1) return <Statement>All of your exposure is in 1 currency: {list[0].currency} (<Money value={list[0].value} />).</Statement>;
           return (
             <>
-              <p className="mb-4 text-[13px] text-ink-muted">{plural(list.length, 'currency', 'currencies')}</p>
-              <ShareBars scale={100} items={list.map(c => ({ label: c.currency, value: num(c.pct), money: true, display: fmtEUR(c.value), share: fmtPct(c.pct) }))} />
+              <p className="mb-4 text-[13px] text-ink-muted">{plural(known.length, 'currency', 'currencies')}</p>
+              <ShareBars scale={100} items={list.map(c => ({
+                label: c.currency === UNKNOWN ? 'Unknown (fund without country data)' : c.currency,
+                value: num(c.pct), money: true, display: fmtEUR(c.value), share: fmtPct(c.pct),
+              }))} />
             </>
           );
         }}
@@ -128,20 +152,24 @@ function CurrencyExposure({ summary }: { summary: LoadState<Summary> }) {
 /* ───────────── Sector drift ───────────── */
 
 function SectorDrift() {
+  const tc = useThemeColors();
   const [period, setPeriod] = useState<Period>('All');
   const history = useLoad(() => api.getSectorHistory());
   return (
-    <Section title="Sector Drift Over Time" subtitle="How your sector exposure has shifted month by month, as a share of the portfolio."
+    <Section title="Sector Drift Over Time" subtitle="Sector shares of the portfolio’s market value at the end of each month, with today as the last point. Current sector weights are applied to past holdings."
       actions={<PeriodSelector value={period} onChange={setPeriod} />}>
       <Loaded state={history} lines={6}>
         {data => {
           const all = arr(data?.history);
           const points = filterByPeriod(all, period);
           // Only sectors that actually carry weight in the window: row count alone says nothing.
-          const sectors = arr(data?.sectors).filter(s => points.some(p => num(rec(p.sectors)[s]) > 0.05));
-          const hasAny = arr(data?.sectors).some(s => all.some(p => num(rec(p.sectors)[s]) > 0.05));
-          if (!hasAny) return <NoFundData title="No sector history yet" message="Sector history is rebuilt from your transactions once fund data is available." onDone={history.reload} />;
+          // The unknown share is stacked last.
+          const sectors = arr(data?.sectors).filter(s => points.some(p => num(rec(p.sectors)[s]) > 0.05))
+            .sort((a, b) => Number(a === UNKNOWN) - Number(b === UNKNOWN));
+          const hasAny = arr(data?.sectors).some(s => s !== UNKNOWN && all.some(p => num(rec(p.sectors)[s]) > 0.05));
+          if (!hasAny) return <NoFundData title="No sector history yet" message={`Sector history is rebuilt from your transactions once fund data is available. ${STOCK_SECTOR_HINT}`} onDone={history.reload} />;
           if (sectors.length === 0 || points.length < 2) return <Statement>No sector history in this period. Choose a longer period.</Statement>;
+          if (sectors.length === 1 && sectors[0] === UNKNOWN) return <Statement>None of the holdings in this period has sector data. Choose a longer period.</Statement>;
           if (sectors.length === 1) return <Statement>The portfolio sat in 1 sector, {sectors[0]}, throughout this period, so there is no drift to show.</Statement>;
           return (
             <EChartWrapper option={{
@@ -158,13 +186,15 @@ function SectorDrift() {
               xAxis: { type: 'category' as const, data: points.map(s => formatDateForPeriod(s.date, period)), boundaryGap: false },
               yAxis: { type: 'value' as const, min: 0, max: 100, axisLabel: { formatter: (v: number) => fmtPct(v, { digits: 0 }) } },
               series: sectors.map(sector => ({
-                name: sector,
+                name: sector === UNKNOWN ? 'No sector data' : sector,
                 type: 'line' as const,
                 stack: 'total',
                 areaStyle: { opacity: 0.75 },
                 lineStyle: { width: 1 },
                 emphasis: { focus: 'series' as const },
                 symbol: 'none',
+                // The unknown share is neutral grey so it never reads as a sector.
+                ...(sector === UNKNOWN ? { color: mixHex(tc.parchment, tc.slate, 0.35) } : {}),
                 data: points.map(s => Math.round(num(rec(s.sectors)[sector]) * 100) / 100),
               })),
               grid: { left: 52, right: 16, top: 12, bottom: 56 },
@@ -182,10 +212,15 @@ function AllocationTreemap() {
   const tc = useThemeColors();
   const treemap = useLoad(() => api.getTreemap());
   return (
-    <Section title="Portfolio Allocation" subtitle="Each ETF broken down by sector, then by stock. Select a tile to zoom in; use the trail below the chart to go back.">
+    <Section title="Portfolio Allocation" subtitle="Every holding at its market value, each ETF broken down into its largest holdings; the rest of the fund is one grey tile. Select a tile to zoom in; use the trail below the chart to go back.">
       <Loaded state={treemap} lines={6}>
         {data => {
-          const nodes = arr<TreemapNode>(data?.children);
+          // The part of a fund outside its listed holdings is neutral, not a company.
+          type Datum = Omit<TreemapNode, 'children'> & { children?: Datum[]; itemStyle?: { color: string }; label?: { color: string } };
+          const decorate = (n: TreemapNode): Datum => (n.name === REST_OF_FUND
+            ? { ...n, itemStyle: { color: mixHex(tc.parchment, tc.slate, 0.35) }, label: { color: tc.ink } }
+            : { ...n, children: n.children?.map(decorate) });
+          const nodes = arr<TreemapNode>(data?.children).map(decorate);
           if (nodes.length === 0) return <NoFundData title="No allocation data yet" message={FUND_DATA_HINT} onDone={treemap.reload} />;
           return (
             <EChartWrapper option={{
@@ -230,18 +265,26 @@ function AllocationTreemap() {
 function TopSharedHoldings() {
   const top = useLoad(() => api.getTopHoldings());
   return (
-    <Section title="Top Shared Holdings" subtitle="The individual companies with the largest combined weight across all your ETFs.">
+    <Section title="Top Holdings" subtitle="The companies with the largest share of your whole portfolio: shares you hold directly plus the largest holdings inside each ETF.">
       <Loaded state={top} lines={6}>
         {data => {
           const list = arr(data?.holdings).slice(0, 15);
           if (list.length === 0) return <NoFundData title="No constituent data yet" message={FUND_DATA_HINT} onDone={top.reload} />;
+          const coverage = num(data?.coverage_pct);
           return (
-            <ShareBars items={list.map(h => ({
-              label: h.name,
-              value: num(h.exposure_pct),
-              display: fmtPct(h.exposure_pct, { digits: 2 }),
-              note: h.exposure_pct >= 10 ? 'Above 10 %' : h.exposure_pct >= 5 ? 'Above 5 %' : undefined,
-            }))} />
+            <>
+              <ShareBars items={list.map(h => ({
+                label: h.name,
+                value: num(h.exposure_pct),
+                display: fmtPct(h.exposure_pct, { digits: 2 }),
+                note: h.exposure_pct >= 10 ? 'Above 10 %' : h.exposure_pct >= 5 ? 'Above 5 %' : undefined,
+              }))} />
+              {coverage > 0 && coverage < 99.5 && (
+                <p className="mt-3 text-[13px] text-ink-muted">
+                  Shares of the whole portfolio. {fmtPct(coverage)} of it is attributed to named companies; fund data lists only each ETF’s largest holdings (usually the top 10), so smaller positions inside funds are not counted.
+                </p>
+              )}
+            </>
           );
         }}
       </Loaded>
@@ -251,19 +294,20 @@ function TopSharedHoldings() {
 
 /* ───────────── Overlap and correlation heatmaps ───────────── */
 
-function Heatmap({ data, min, max, colours, digits, unit, regionLabel }: { data: Matrix; min: number; max: number; colours: string[]; digits: number; unit: string; regionLabel: string }) {
+/** Heatmap of a symmetric matrix; null cells (no value) stay blank and say why in the tooltip. */
+function Heatmap({ data, min, max, colours, digits, unit, regionLabel, missing = 'no data' }: { data: Matrix; min: number; max: number; colours: string[]; digits: number; unit: string; regionLabel: string; missing?: string }) {
   const tc = useThemeColors();
   const labels = arr(data.labels);
   const short = (s: string) => (s.length > 18 ? `${s.slice(0, 17)}…` : s);
-  const cell = (v: number) => `${fmtNum(v, digits)}${unit}`;
+  const cell = (v: number | string) => (typeof v === 'number' ? `${fmtNum(v, digits)}${unit}` : '');
   return (
     <div role="region" aria-label={regionLabel} tabIndex={0} className="overflow-x-auto">
       <div style={{ minWidth: `${Math.max(340, 150 + labels.length * 64)}px` }}>
         <EChartWrapper option={{
           tooltip: {
             formatter: (params: unknown) => {
-              const [x, y, val] = (params as { data: number[] }).data;
-              return `${escapeHtml(labels[x] ?? '')} and ${escapeHtml(labels[y] ?? '')}: ${cell(val)}`;
+              const [x, y, val] = (params as { data: (number | string)[] }).data;
+              return `${escapeHtml(labels[Number(x)] ?? '')} and ${escapeHtml(labels[Number(y)] ?? '')}: ${typeof val === 'number' ? cell(val) : escapeHtml(missing)}`;
             },
           },
           xAxis: { type: 'category' as const, data: labels, axisLabel: { rotate: 30, color: tc.inkBody, hideOverlap: false, formatter: short } },
@@ -276,8 +320,9 @@ function Heatmap({ data, min, max, colours, digits, unit, regionLabel }: { data:
           },
           series: [{
             type: 'heatmap' as const,
-            data: arr(data.matrix).flatMap((row, i) => arr(row).map((val, j) => [i, j, Math.round(num(val) * 100) / 100])),
-            label: { show: true, fontSize: 11, color: tc.ink, formatter: (p: unknown) => cell((p as { data: number[] }).data[2]) },
+            // '-' is ECharts' empty value: the cell is drawn blank, not as 0.
+            data: arr(data.matrix).flatMap((row, i) => arr(row).map((val, j) => [i, j, val == null ? '-' : Math.round(val * 100) / 100])),
+            label: { show: true, fontSize: 11, color: tc.ink, formatter: (p: unknown) => cell((p as { data: (number | string)[] }).data[2]) },
             itemStyle: { borderColor: tc.parchment, borderWidth: 2 },
           }],
           grid: { left: 136, right: 16, top: 8, bottom: 120 },
@@ -291,12 +336,35 @@ function OverlapMatrix() {
   const tc = useThemeColors();
   const overlap = useLoad(() => api.getOverlap());
   return (
-    <Section title="ETF Overlap Matrix" subtitle="The share of each pair of ETFs that is invested in the same companies.">
+    <Section title="ETF Overlap of Top Holdings" subtitle="How much of each pair of ETFs sits in the same companies, counting only the holdings listed for each fund (usually its top 10).">
       <Loaded state={overlap} lines={5}>
-        {data => (arr(data?.labels).length < 2
-          ? <Statement>Overlap compares pairs of ETFs, so it needs at least 2 ETFs with constituent data.</Statement>
-          : <Heatmap data={data} min={0} max={100} digits={1} unit=" %" regionLabel="ETF overlap matrix"
-              colours={[tc.parchmentDeep, mixHex(tc.parchment, tc.sage, 0.6)]} />)}
+        {data => {
+          const labels = arr(data?.labels);
+          if (labels.length < 2) return <Statement>Overlap compares pairs of ETFs, so it needs at least 2 ETFs with constituent data.</Statement>;
+          const coverage = arr(data?.coverage);
+          const counts = arr(data?.constituent_counts);
+          const partial = coverage.some(c => num(c) < 99.5);
+          return (
+            <>
+              <Heatmap data={data} min={0} max={100} digits={1} unit=" %" regionLabel="ETF overlap of top holdings"
+                colours={[tc.parchmentDeep, mixHex(tc.parchment, tc.sage, 0.6)]} />
+              {partial && (
+                <p className="mt-3 text-[13px] text-ink-muted">
+                  Each figure is a lower bound: the listed holdings cover only part of each fund, so the real overlap is at least this high and, for two broad index funds, usually much higher.
+                </p>
+              )}
+              {coverage.length === labels.length && (
+                <ul className="mt-2 flex flex-col gap-1 text-[13px] text-ink-body">
+                  {labels.map((label, i) => (
+                    <li key={arr(data?.isins)[i] ?? label}>
+                      <span className="text-ink">{label}</span>: listed holdings cover {fmtPct(coverage[i])} of the fund{counts[i] ? ` (${plural(counts[i], 'holding', 'holdings')})` : ''}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          );
+        }}
       </Loaded>
     </Section>
   );
@@ -306,12 +374,23 @@ function CorrelationMatrix() {
   const tc = useThemeColors();
   const correlation = useLoad(() => api.getCorrelation());
   return (
-    <Section title="Price Correlation" subtitle="How closely daily returns move together, from −1 (opposite) to 1 (identical). Lower values mean better diversification.">
+    <Section title="Price Correlation" subtitle="How closely the holdings’ prices in euros move together, measured over the dates both have a price: from −1 (opposite) to 1 (identical). Lower values mean better diversification.">
       <Loaded state={correlation} lines={5}>
-        {data => (arr(data?.labels).length < 2
-          ? <Statement>Correlation compares pairs of holdings, so it needs at least 2 holdings with enough price history.</Statement>
-          : <Heatmap data={data} min={-1} max={1} digits={2} unit="" regionLabel="Price correlation matrix"
-              colours={[mixHex(tc.parchment, tc.claret, 0.55), tc.parchmentDeep, mixHex(tc.parchment, tc.sage, 0.6)]} />)}
+        {data => {
+          if (arr(data?.labels).length < 2) return <Statement>Correlation compares pairs of holdings, so it needs at least 2 holdings with enough price history.</Statement>;
+          const blank = arr(data?.matrix).some(row => arr(row).some(v => v == null));
+          return (
+            <>
+              <Heatmap data={data} min={-1} max={1} digits={2} unit="" regionLabel="Price correlation matrix" missing="not enough shared price history"
+                colours={[mixHex(tc.parchment, tc.claret, 0.55), tc.parchmentDeep, mixHex(tc.parchment, tc.sage, 0.6)]} />
+              {blank && (
+                <p className="mt-3 text-[13px] text-ink-muted">
+                  Blank cells: the two holdings share fewer than {num(data?.min_observations) || 20} price changes, too few for a meaningful figure.
+                </p>
+              )}
+            </>
+          );
+        }}
       </Loaded>
     </Section>
   );
@@ -319,9 +398,14 @@ function CorrelationMatrix() {
 
 /* ───────────── ETF holdings breakdown ───────────── */
 
+/** False for empty and synthetic constituent IDs ("SYNTH:<hash>", legacy "XX_…"), which are not ISINs. */
+function isRealISIN(id: string | null | undefined): boolean {
+  return !!id && !id.startsWith('SYNTH:') && !id.startsWith('XX_');
+}
+
 function EtfBreakdown({ etfs, onConstituents }: { etfs: LoadState<HoldingRow[]>; onConstituents: (list: ETFHoldingEntry[]) => void }) {
   const [selected, setSelected] = useState<string | null>(null);
-  const [detail, setDetail] = useState<{ status: 'idle' | 'loading' | 'error' | 'done'; name: string; rows: ETFHoldingEntry[]; error?: string }>({ status: 'idle', name: '', rows: [] });
+  const [detail, setDetail] = useState<{ status: 'idle' | 'loading' | 'error' | 'done'; name: string; rows: ETFHoldingEntry[]; coverage?: number; error?: string }>({ status: 'idle', name: '', rows: [] });
 
   const load = (isin: string) => {
     setSelected(isin);
@@ -329,7 +413,7 @@ function EtfBreakdown({ etfs, onConstituents }: { etfs: LoadState<HoldingRow[]>;
     api.getETFHoldings(isin)
       .then(d => {
         const rows = arr(d?.holdings);
-        setDetail({ status: 'done', name: d?.etf_name ?? '', rows });
+        setDetail({ status: 'done', name: d?.etf_name ?? '', rows, coverage: d?.coverage_pct });
         onConstituents(rows);
       })
       .catch((e: unknown) => setDetail({ status: 'error', name: '', rows: [], error: e instanceof Error ? e.message : String(e) }));
@@ -345,7 +429,7 @@ function EtfBreakdown({ etfs, onConstituents }: { etfs: LoadState<HoldingRow[]>;
   };
 
   return (
-    <Section title="ETF Holdings Breakdown" subtitle="Select an ETF to see the companies inside it.">
+    <Section title="ETF Holdings Breakdown" subtitle="Select an ETF to see its largest holdings.">
       <Loaded state={etfs} lines={3}>
         {list => {
           // One button per fund, even when it is held in several accounts.
@@ -374,49 +458,57 @@ function EtfBreakdown({ etfs, onConstituents }: { etfs: LoadState<HoldingRow[]>;
                 {detail.status === 'loading' && <LoadingState message="Loading constituents" />}
                 {detail.status === 'error' && <ErrorState details={detail.error} onRetry={selected ? () => load(selected) : undefined} />}
                 {detail.status === 'done' && detail.rows.length === 0 && <Statement>No constituent data is available for this ETF yet.</Statement>}
-                {detail.status === 'done' && detail.rows.length > 0 && (
-                  <>
-                    <SubHeadingRow>{detail.name}: {plural(detail.rows.length, 'position', 'positions')}</SubHeadingRow>
-                    <ul className="md:hidden divide-y divide-divider border-y border-divider">
-                      {detail.rows.map((entry, i) => (
-                        <li key={`${entry.isin}-${i}`} className="flex items-center gap-3 py-2">
-                          <span className="w-6 shrink-0 text-right text-[12px] text-ink-muted">{i + 1}</span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate text-[13px] font-medium text-ink" title={entry.name}>{entry.name}</span>
-                            <span className="block text-[12px] text-ink-muted">{entry.sector || 'No sector'} · {entry.country || 'No country'}</span>
-                          </span>
-                          <span className="shrink-0 text-[13px] text-ink">{fmtPct(entry.weight, { digits: 2 })}</span>
-                        </li>
-                      ))}
-                    </ul>
-                    <TableRegion label={`Constituents of ${detail.name}`} className="hidden md:block max-h-[560px] overflow-y-auto">
-                      <table className="apple-table">
-                        <thead>
-                          <tr>
-                            <th scope="col" className="num">No.</th>
-                            <th scope="col">Name</th>
-                            <th scope="col">ISIN</th>
-                            <th scope="col" className="num">Weight</th>
-                            <th scope="col">Sector</th>
-                            <th scope="col">Country</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {detail.rows.map((entry, i) => (
-                            <tr key={`${entry.isin}-${i}`}>
-                              <td className="num text-ink-muted">{i + 1}</td>
-                              <td className="font-medium text-ink">{entry.name}</td>
-                              <td className="font-mono text-[12px]">{entry.isin.startsWith('XX_') ? '—' : entry.isin}</td>
-                              <td className="num text-ink">{fmtPct(entry.weight, { digits: 2 })}</td>
-                              <td>{entry.sector || '—'}</td>
-                              <td>{entry.country || '—'}</td>
+                {detail.status === 'done' && detail.rows.length > 0 && (() => {
+                  // The constituent source has no sector or country column: show those only when on record.
+                  const hasSector = detail.rows.some(e => e.sector);
+                  const hasCountry = detail.rows.some(e => e.country);
+                  const covered = num(detail.coverage) || detail.rows.reduce((s, e) => s + num(e.weight), 0);
+                  return (
+                    <>
+                      <SubHeadingRow>{detail.name}: {plural(detail.rows.length, 'largest holding', 'largest holdings')}, {fmtPct(covered)} of the fund</SubHeadingRow>
+                      <ul className="md:hidden divide-y divide-divider border-y border-divider">
+                        {detail.rows.map((entry, i) => (
+                          <li key={`${entry.isin}-${i}`} className="flex items-center gap-3 py-2">
+                            <span className="w-6 shrink-0 text-right text-[12px] text-ink-muted">{i + 1}</span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-[13px] font-medium text-ink" title={entry.name}>{entry.name}</span>
+                              {(entry.sector || entry.country) && (
+                                <span className="block text-[12px] text-ink-muted">{[entry.sector, entry.country].filter(Boolean).join(' · ')}</span>
+                              )}
+                            </span>
+                            <span className="shrink-0 text-[13px] text-ink">{fmtPct(entry.weight, { digits: 2 })}</span>
+                          </li>
+                        ))}
+                      </ul>
+                      <TableRegion label={`Constituents of ${detail.name}`} className="hidden md:block max-h-[560px] overflow-y-auto">
+                        <table className="apple-table">
+                          <thead>
+                            <tr>
+                              <th scope="col" className="num">No.</th>
+                              <th scope="col">Name</th>
+                              <th scope="col">ISIN</th>
+                              <th scope="col" className="num">Weight</th>
+                              {hasSector && <th scope="col">Sector</th>}
+                              {hasCountry && <th scope="col">Country</th>}
                             </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </TableRegion>
-                  </>
-                )}
+                          </thead>
+                          <tbody>
+                            {detail.rows.map((entry, i) => (
+                              <tr key={`${entry.isin}-${i}`}>
+                                <td className="num text-ink-muted">{i + 1}</td>
+                                <td className="font-medium text-ink">{entry.name}</td>
+                                <td className="font-mono text-[12px]">{isRealISIN(entry.isin) ? entry.isin : '—'}</td>
+                                <td className="num text-ink">{fmtPct(entry.weight, { digits: 2 })}</td>
+                                {hasSector && <td>{entry.sector || '—'}</td>}
+                                {hasCountry && <td>{entry.country || '—'}</td>}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </TableRegion>
+                    </>
+                  );
+                })()}
               </div>
             </>
           );

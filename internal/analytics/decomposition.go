@@ -1,5 +1,7 @@
 package analytics
 
+import "sort"
+
 // Holding represents a portfolio position with its market value and metadata.
 type Holding struct {
 	ISIN           string
@@ -84,11 +86,23 @@ type TreemapNode struct {
 type ETFForTreemap struct {
 	Name        string
 	MarketValue float64
-	// Holdings grouped by sector: sector -> [{name, value}]
+	// Holdings grouped by sector: sector -> [{name, value}]. Used only when
+	// every listed constituent has a sector on record.
 	HoldingsBySector map[string][]TreemapNode
+	// Constituents is the flat list of listed constituents (EUR values),
+	// used when no sector breakdown is available.
+	Constituents []TreemapNode
 }
 
-// BuildAllocationTreemap constructs a hierarchical treemap: portfolio → ETF → sector → stock.
+// TreemapRestOfFund labels the part of a fund not covered by its listed
+// constituents (justETF lists only the top 10).
+const TreemapRestOfFund = "Rest of fund"
+
+// BuildAllocationTreemap constructs a hierarchical treemap: portfolio → ETF →
+// (sector →) stock. Every ETF node carries its full market value, and the
+// value not covered by the listed constituents becomes a "Rest of fund"
+// child, so a fund is drawn at its real size rather than at the sum of its
+// top-10 constituents.
 func BuildAllocationTreemap(etfs []ETFForTreemap) []TreemapNode {
 	nodes := make([]TreemapNode, 0)
 
@@ -97,34 +111,56 @@ func BuildAllocationTreemap(etfs []ETFForTreemap) []TreemapNode {
 			continue
 		}
 
-		var sectorNodes []TreemapNode
-		for sector, holdings := range etf.HoldingsBySector {
-			sectorValue := 0.0
-			for _, h := range holdings {
-				sectorValue += h.Value
+		var children []TreemapNode
+		listed := 0.0
+		if len(etf.HoldingsBySector) > 0 {
+			sectors := make([]string, 0, len(etf.HoldingsBySector))
+			for sector := range etf.HoldingsBySector {
+				sectors = append(sectors, sector)
 			}
-			if sectorValue <= 0 {
-				continue
+			sort.Strings(sectors)
+			for _, sector := range sectors {
+				holdings := etf.HoldingsBySector[sector]
+				sectorValue := 0.0
+				for _, h := range holdings {
+					sectorValue += h.Value
+				}
+				if sectorValue <= 0 {
+					continue
+				}
+				listed += sectorValue
+				children = append(children, TreemapNode{
+					Name:     sector,
+					Value:    sectorValue,
+					Children: holdings,
+				})
 			}
-			sectorNodes = append(sectorNodes, TreemapNode{
-				Name:     sector,
-				Value:    sectorValue,
-				Children: holdings,
-			})
+		} else {
+			for _, c := range etf.Constituents {
+				if c.Value <= 0 {
+					continue
+				}
+				listed += c.Value
+				children = append(children, c)
+			}
 		}
 
-		if len(sectorNodes) == 0 {
-			// No sector breakdown — show ETF as leaf node
+		if len(children) == 0 {
+			// No constituent breakdown: show the position as a leaf node.
 			nodes = append(nodes, TreemapNode{
 				Name:  etf.Name,
 				Value: etf.MarketValue,
 			})
-		} else {
-			nodes = append(nodes, TreemapNode{
-				Name:     etf.Name,
-				Children: sectorNodes,
-			})
+			continue
 		}
+		if rest := etf.MarketValue - listed; rest > etf.MarketValue*0.001 {
+			children = append(children, TreemapNode{Name: TreemapRestOfFund, Value: rest})
+		}
+		nodes = append(nodes, TreemapNode{
+			Name:     etf.Name,
+			Value:    etf.MarketValue,
+			Children: children,
+		})
 	}
 
 	return nodes

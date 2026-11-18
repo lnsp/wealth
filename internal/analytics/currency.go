@@ -78,15 +78,28 @@ type CurrencyExposureEntry struct {
 // HoldingForCurrency represents a holding with its value and country weights.
 type HoldingForCurrency struct {
 	ISIN           string
-	Currency       string             // trading currency of the security
+	Currency       string // trading currency of the security
 	MarketValue    float64
 	CountryWeights map[string]float64 // country name -> weight % (0-100)
+	// IsFund marks ETFs and other funds. A fund's trading currency says
+	// nothing about what it holds, so without country data its exposure is
+	// "Unknown" rather than its listing currency.
+	IsFund bool
 }
+
+// CurrencyUnknown is the bucket for value whose currency exposure is not on
+// record: funds without country data and the unlisted part of partial
+// country breakdowns.
+const CurrencyUnknown = "Unknown"
 
 // ComputeCurrencyExposure calculates portfolio-level currency exposure
 // by mapping country weights to currencies.
-// For holdings without country weights (e.g., individual stocks), the
-// security's trading currency is used.
+//   - Holdings with country weights are split by country to currency. Weights
+//     that sum to less than 100 % leave the remainder in "Unknown" instead of
+//     being scaled up; sums slightly above 100 % (rounding) are normalised.
+//   - Funds without country weights go to "Unknown".
+//   - Other holdings without country weights (single stocks) use the
+//     security's trading currency.
 func ComputeCurrencyExposure(holdings []HoldingForCurrency) []CurrencyExposureEntry {
 	totalValue := 0.0
 	for _, h := range holdings {
@@ -98,7 +111,17 @@ func ComputeCurrencyExposure(holdings []HoldingForCurrency) []CurrencyExposureEn
 
 	exposure := make(map[string]float64)
 	for _, h := range holdings {
-		if len(h.CountryWeights) == 0 {
+		weightSum := 0.0
+		for _, pct := range h.CountryWeights {
+			if pct > 0 {
+				weightSum += pct
+			}
+		}
+		if weightSum <= 0 {
+			if h.IsFund {
+				exposure[CurrencyUnknown] += h.MarketValue
+				continue
+			}
 			// No country breakdown: use the security's trading currency
 			cur := h.Currency
 			if cur == "" {
@@ -108,22 +131,23 @@ func ComputeCurrencyExposure(holdings []HoldingForCurrency) []CurrencyExposureEn
 			continue
 		}
 
-		// Distribute value by country weights → currency
-		weightSum := 0.0
-		for _, pct := range h.CountryWeights {
-			weightSum += pct
+		// Distribute value by country weights to currency.
+		scale := 100.0
+		if weightSum > scale {
+			scale = weightSum
 		}
-		if weightSum == 0 {
-			exposure[h.Currency] += h.MarketValue
-			continue
-		}
-
 		for country, pct := range h.CountryWeights {
+			if pct <= 0 {
+				continue
+			}
 			cur := CountryToCurrency[country]
 			if cur == "" {
 				cur = "OTHER"
 			}
-			exposure[cur] += h.MarketValue * pct / weightSum
+			exposure[cur] += h.MarketValue * pct / scale
+		}
+		if weightSum < scale {
+			exposure[CurrencyUnknown] += h.MarketValue * (scale - weightSum) / scale
 		}
 	}
 

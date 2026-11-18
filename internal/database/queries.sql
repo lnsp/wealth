@@ -700,3 +700,9 @@ SELECT date FROM transactions ORDER BY date ASC LIMIT 1;
 UPDATE wealth_reports
 SET data = $3, period_start = $4, period_end = $5, generated_at = now()
 WHERE report_type = $1 AND period_label = $2;
+
+-- name: UpdateSecurityAssetClass :exec
+-- Reclassifies a security when fund data proves its name-based class wrong
+-- (e.g. a broker-abbreviated ETF stored as a stock). Only updates while the
+-- class is still the one the caller saw.
+UPDATE securities SET asset_class = $2 WHERE isin = $1 AND asset_class = $3;

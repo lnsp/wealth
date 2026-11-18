@@ -380,9 +380,68 @@ export interface ConcentrationAlert {
 }
 
 export interface TopHolding {
+  /** Empty for constituents that justETF lists without an ISIN. */
   isin: string;
   name: string;
+  /** Share of the whole portfolio, in percent. */
   exposure_pct: number;
+}
+
+export interface TopHoldingsData {
+  holdings: TopHolding[];
+  total_value?: number;
+  /** Share of the portfolio attributed to named companies (direct stocks + listed fund constituents), in percent. */
+  coverage_pct?: number;
+}
+
+export interface ETFHoldingsData {
+  etf_isin: string;
+  etf_name: string;
+  holdings: ETFHoldingEntry[];
+  /** Sum of the listed constituent weights, in percent of the fund. */
+  coverage_pct?: number;
+}
+
+export interface OverlapData {
+  labels: string[];
+  matrix: number[][];
+  isins?: string[];
+  /** Per fund: sum of the listed constituent weights, in percent. */
+  coverage?: number[];
+  constituent_counts?: number[];
+}
+
+export interface CorrelationData {
+  labels: string[];
+  /** null where two holdings share too little price history. */
+  matrix: (number | null)[][];
+  min_observations?: number;
+}
+
+export interface FundAlternative {
+  isin: string;
+  name: string;
+  index?: string;
+  same_index?: boolean;
+  ter: number;
+  annual_saving: number;
+  ten_year_saving: number;
+  ten_year_net_after_tax?: number | null;
+  breakeven_years?: number | null;
+}
+
+export interface AlternativesData {
+  alternatives: {
+    isin: string;
+    name: string;
+    index?: string;
+    current_ter: number;
+    value: number;
+    unrealized_gain?: number | null;
+    switch_tax?: number | null;
+    alternatives: FundAlternative[];
+  }[];
+  growth_pct?: number;
 }
 
 export interface TreemapNode {
@@ -662,14 +721,20 @@ export interface CostData {
   coverage_pct: number;
   annual_cost: number;
   daily_cost: number;
+  /** Fee drag for years 1–30: future value lost to fund charges, including the growth they would have earned. */
   projection: { year: number; cumulative: number }[];
+  /** Growth before costs assumed by the projection, % a year. */
+  projection_growth_pct?: number;
+  /** Absent when no holding has a charge on record. Computed over funds with a known charge only. */
   benchmark?: {
     avg_ter: number;
     your_ter: number;
+    funds_value?: number;
     grade: string;
     detail: string;
     annual_saving: number;
     ten_year_saving: number;
+    growth_pct?: number;
   };
   total_cost_ownership?: {
     ter_cost: number;
@@ -680,6 +745,8 @@ export interface CostData {
     lifetime_fees: number;
     lifetime_volume: number;
     transaction_count: number;
+    /** Years from the first trade to today (at least 1) that the trading costs are averaged over. */
+    years?: number;
   };
 }
 
@@ -953,18 +1020,18 @@ export const api = {
   getAllocationSummary: () => request<{ sectors: Record<string, number>; countries: Record<string, number>; currencies: CurrencyExposureEntry[] }>('/analysis/summary'),
   getSectors: () => request<{ sectors: Record<string, number> }>('/analysis/sectors'),
   getCountries: () => request<{ countries: Record<string, number> }>('/analysis/countries'),
-  getOverlap: () => request<{ labels: string[]; matrix: number[][] }>('/analysis/overlap'),
+  getOverlap: () => request<OverlapData>('/analysis/overlap'),
   getAlerts: () => request<{ alerts: ConcentrationAlert[] }>('/analysis/alerts'),
-  getTopHoldings: () => request<{ holdings: TopHolding[] }>('/analysis/top-holdings'),
+  getTopHoldings: () => request<TopHoldingsData>('/analysis/top-holdings'),
   getTreemap: () => request<{ children: TreemapNode[] }>('/analysis/treemap'),
   getSectorHistory: () => request<{ history: SectorHistoryPoint[]; sectors: string[] }>('/analysis/sector-history'),
   getETFHoldings: (isin: string) =>
-    request<{ etf_isin: string; etf_name: string; holdings: ETFHoldingEntry[] }>(`/analysis/etf/${isin}/holdings`),
+    request<ETFHoldingsData>(`/analysis/etf/${isin}/holdings`),
   getRisk: () => request<RiskData>('/analysis/risk'),
   getTax: (year?: number, opts?: TaxFilingOptions) => request<TaxData>(`/analysis/tax${taxQuery(opts, year ? { year } : undefined)}`),
   getCurrency: () => request<{ currencies: CurrencyExposureEntry[] }>('/analysis/currency'),
   getCosts: () => request<CostData>('/analysis/costs'),
-  getAlternatives: () => request<{ alternatives: { isin: string; name: string; current_ter: number; value: number; alternatives: { isin: string; name: string; ter: number; annual_saving: number; ten_year_saving: number }[] }[] }>('/analysis/alternatives'),
+  getAlternatives: () => request<AlternativesData>('/analysis/alternatives'),
   getTaxLots: (opts?: TaxFilingOptions) => request<{ lots: TaxLot[]; sell_all?: SellAllSummary }>(`/analysis/tax-lots${taxQuery(opts)}`),
   simulateSell: (requests: { isin: string; amount_eur: number }[], churchTaxRate?: number, joint?: boolean) => {
     const qs = taxQuery({ churchTax: churchTaxRate, joint });
@@ -982,7 +1049,7 @@ export const api = {
       allowance?: number;
     }>(`/analysis/sell-simulator${qs}`, { method: 'POST', body: JSON.stringify(requests) });
   },
-  getCorrelation: () => request<{ labels: string[]; matrix: number[][] }>('/analysis/correlation'),
+  getCorrelation: () => request<CorrelationData>('/analysis/correlation'),
   getAllocationHistory: () => request<{ history: { date: string; weights: Record<string, number> }[]; holdings: string[] }>('/analysis/allocation-history'),
   getFXHistory: () => request<{ rates: Record<string, { date: string; rate: number }[]> }>('/analysis/fx-history'),
   // Users

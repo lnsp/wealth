@@ -2,79 +2,46 @@ package handler
 
 import "testing"
 
-// The Portfolio Health composite weights are locked in HandleHealthScore
-// (analysis.go). They must sum to 100 — otherwise composite = total/100
-// produces values outside [0, 100] for any valid subscore set. The frontend
-// circle and the subscore chips both branch on the same 80 / 60 thresholds,
-// so any drift here silently breaks the matching color bands.
-const (
-	healthWeightDiversification = 25
-	healthWeightCostEfficiency  = 15
-	healthWeightRiskBalance     = 20
-	healthWeightAllocation      = 25
-	healthWeightIncome          = 15
-)
+// These tests drive computeHealthScore, the function HandleHealthScore uses.
+// They used to check local copies of the formulas, one of which pinned the
+// integer-division composite the 2026-11-18 audit flagged.
 
 func TestHealthScore_WeightsSumTo100(t *testing.T) {
-	sum := healthWeightDiversification +
-		healthWeightCostEfficiency +
-		healthWeightRiskBalance +
-		healthWeightAllocation +
-		healthWeightIncome
+	_, subs := computeHealthScore(healthInputs{ValueByISIN: map[string]float64{"A": 1}})
+	if len(subs) != 5 {
+		t.Fatalf("%d subscores, want 5", len(subs))
+	}
+	sum := 0
+	for _, s := range subs {
+		sum += s.Weight
+	}
 	if sum != 100 {
 		t.Fatalf("health-score weights sum to %d, want 100", sum)
 	}
 }
 
-// healthComposite mirrors HandleHealthScore's composite formula. With weights
-// summing to 100 this is a plain weighted average, but the handler uses
-// integer arithmetic — keep the test path identical to catch truncation
-// drift if the weights are ever tweaked unevenly.
-func healthComposite(div, cost, risk, alloc, inc int) int {
-	total := div*healthWeightDiversification +
-		cost*healthWeightCostEfficiency +
-		risk*healthWeightRiskBalance +
-		alloc*healthWeightAllocation +
-		inc*healthWeightIncome
-	return total / 100
-}
-
-func TestHealthScore_CompositeAtKeyValues(t *testing.T) {
-	cases := []struct {
-		name string
-		s    [5]int
-		want int
-	}{
-		{"all 100", [5]int{100, 100, 100, 100, 100}, 100},
-		{"all 0", [5]int{0, 0, 0, 0, 0}, 0},
-		{"all 80 (good band floor)", [5]int{80, 80, 80, 80, 80}, 80},
-		{"all 60 (fair band floor)", [5]int{60, 60, 60, 60, 60}, 60},
-		{"all 50 (poor)", [5]int{50, 50, 50, 50, 50}, 50},
-		// Heavy weight on a low score drags composite down materially.
-		{"diversification 0, rest 100", [5]int{0, 100, 100, 100, 100}, 75},
-		// Light weight on a low score leaves composite high.
-		{"income 0, rest 100", [5]int{100, 100, 100, 100, 0}, 85},
+func TestHealthScore_CompositeIsRoundedWeightedAverage(t *testing.T) {
+	// Five stocks at 20 % each (70 + 15 + 10 = 95), TER 0.15 % (80), no risk
+	// data (50), targets matched exactly (95), 24 months of dividends (95):
+	// (95·25 + 80·15 + 50·20 + 95·25 + 95·15) / 100 = 83.75 → 84 (integer
+	// division used to truncate it to 83).
+	in := healthInputs{
+		ValueByISIN:    map[string]float64{"A": 1, "B": 1, "C": 1, "D": 1, "E": 1},
+		AssetClass:     map[string]string{"A": "stock", "B": "stock", "C": "stock", "D": "stock", "E": "stock"},
+		WeightedTER:    0.15,
+		Targets:        map[string]float64{"A": 20, "B": 20, "C": 20, "D": 20, "E": 20},
+		DividendMonths: 24,
 	}
-	for _, c := range cases {
-		got := healthComposite(c.s[0], c.s[1], c.s[2], c.s[3], c.s[4])
-		if got != c.want {
-			t.Errorf("%s: composite=%d, want %d", c.name, got, c.want)
+	score, subs := computeHealthScore(in)
+	want := []int{95, 80, 50, 95, 95}
+	for i, s := range subs {
+		if s.Score != want[i] {
+			t.Errorf("%s = %d, want %d", s.Name, s.Score, want[i])
 		}
 	}
-}
-
-// statusForScore mirrors the band mapping HandleHealthScore writes into each
-// subscore's Status field, AND the colour the frontend renders for both the
-// composite circle and the chips. Locking it here makes a mismatch impossible
-// to introduce silently in one half of the system.
-func statusForScore(score int) string {
-	if score >= 80 {
-		return "good"
+	if score != 84 {
+		t.Errorf("composite = %d, want 84", score)
 	}
-	if score >= 60 {
-		return "fair"
-	}
-	return "poor"
 }
 
 func TestHealthScore_StatusBandsAtBoundaries(t *testing.T) {
@@ -90,8 +57,21 @@ func TestHealthScore_StatusBandsAtBoundaries(t *testing.T) {
 		{0, "poor"},
 	}
 	for _, c := range cases {
-		if got := statusForScore(c.score); got != c.want {
+		if got := healthStatus(c.score); got != c.want {
 			t.Errorf("score=%d: status=%q, want %q", c.score, got, c.want)
 		}
+	}
+}
+
+func TestHealthScore_AllocationUsesSharedDrift(t *testing.T) {
+	// A 10 % holding without a target counts as 10 % drift, exactly as the
+	// allocation view and the rebalancer see it.
+	in := healthInputs{
+		ValueByISIN: map[string]float64{"A": 6000, "B": 3000, "C": 1000},
+		Targets:     map[string]float64{"A": 60, "B": 40},
+	}
+	_, subs := computeHealthScore(in)
+	if subs[3].Score != 60 || subs[3].Detail != "max drift 10.0%" {
+		t.Errorf("allocation %+v, want 60 with max drift 10.0%%", subs[3])
 	}
 }

@@ -71,8 +71,9 @@ test.describe('Portfolio page', () => {
     expect(body).toHaveProperty('yield_on_cost');
     expect(body).toHaveProperty('dividend_growth');
     expect(typeof body.trailing_12m).toBe('number');
-    expect(typeof body.yield_on_cost).toBe('number');
-    expect(typeof body.dividend_growth).toBe('number');
+    // null when there is no cost basis / nothing paid in the prior 12 months (shown as "—")
+    expect(body.yield_on_cost === null || typeof body.yield_on_cost === 'number').toBeTruthy();
+    expect(body.dividend_growth === null || typeof body.dividend_growth === 'number').toBeTruthy();
     expect(Array.isArray(body.cumulative)).toBeTruthy();
 
     expect(Array.isArray(body.monthly)).toBeTruthy();
@@ -85,7 +86,8 @@ test.describe('Portfolio page', () => {
       expect(typeof entry.year).toBe('string');
       expect(entry.year).toMatch(/^\d{4}$/);
       expect(typeof entry.amount).toBe('number');
-      expect(entry.amount).toBeGreaterThan(0);
+      // Years without payouts are filled in with 0 so the chart's axis is continuous.
+      expect(entry.amount).toBeGreaterThanOrEqual(0);
     }
 
     // Yearly totals should equal monthly totals
@@ -220,13 +222,14 @@ test.describe('Portfolio page', () => {
     });
   });
 
-  test('cumulative dividends are monotonically increasing', async ({ request }) => {
+  test('cumulative dividends are the running sum of monthly payouts', async ({ request }) => {
     const resp = await request.get('/api/portfolio/dividends');
     const body = await resp.json();
-    if (body.cumulative && body.cumulative.length > 1) {
-      for (let i = 1; i < body.cumulative.length; i++) {
-        expect(body.cumulative[i].cumulative).toBeGreaterThanOrEqual(body.cumulative[i - 1].cumulative);
-      }
+    let running = 0;
+    for (const c of body.cumulative || []) {
+      running += c.amount;
+      // A reversal lowers the line; it is the running net sum, not a running maximum.
+      expect(Math.abs(c.cumulative - running)).toBeLessThan(0.05);
     }
   });
 

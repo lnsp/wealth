@@ -13,7 +13,7 @@ import { useThemeColors } from '../hooks/useThemeColors';
 import { useMarketRefresh } from '../hooks/useMarketRefresh';
 import UnvestedPanel from '../components/UnvestedPanel';
 import {
-  escapeHtml, fmtEUR, fmtPct, fmtQty, fmtNum, fmtDate, fmtDateLong, fmtMonth, fmtMonthShort, fmtDayMonth, fmtAxis, labelFor,
+  escapeHtml, fmtEUR, fmtMoney, fmtPct, fmtQty, fmtNum, fmtDate, fmtDateLong, fmtMonth, fmtMonthShort, fmtDayMonth, fmtAxis, labelFor,
 } from '../utils/format';
 
 type PortfolioTab = 'overview' | 'dividends' | 'allocation' | 'holdings' | 'goals';
@@ -44,6 +44,11 @@ interface SwitchResult {
   difference_eur: number; difference_pct: number; correlation: number; low_correlation_warning: boolean;
   unrealized_gain: number; teilfreistellung: number; taxable_gain: number; freibetrag_used: number;
   tax_on_switch: number; net_proceeds: number; break_even_years: number; is_equity: boolean;
+  /** Remaining FIFO lots compared; lots older than the price history are compared from `compare_from`. */
+  compare_from?: string | null; lots_shifted?: number; lots?: number;
+  teilfreistellung_pct?: number; loss_offset?: number; freibetrag_remaining?: number;
+  allowance?: number; tax_rate?: number; is_stock?: boolean; private_sale?: boolean;
+  loss_pot?: 'stock' | 'general'; harvest_loss?: number; harvest_loss_now?: number; harvest_tax_now?: number;
 }
 
 interface TimeMachineData {
@@ -51,11 +56,14 @@ interface TimeMachineData {
   holdings: { isin: string; name: string; quantity: number; value: number; weight_pct: number }[];
   net_worth: number;
   current: { net_worth: number };
-  change: { net_worth_change: number; net_worth_pct: number; contributions: number; market_return: number; dividends: number; assets?: number; purchase_costs?: number; loan_interest?: number };
+  change: {
+    net_worth_change: number; net_worth_pct: number; contributions: number; market_return: number; dividends: number;
+    interest?: number; fees?: number; taxes?: number; assets?: number; purchase_costs?: number; loan_interest?: number;
+  };
 }
 
-/** One independently loaded resource with loading / error / retry. */
-function useLoad<T>(fn: () => Promise<T>) {
+/** One independently loaded resource with loading / error / retry; reloads when `deps` change. */
+function useLoad<T>(fn: () => Promise<T>, deps: unknown[] = []) {
   const [state, setState] = useState<{ data: T | null; error: string | null; loading: boolean }>({ data: null, error: null, loading: true });
   const fnRef = useRef(fn);
   fnRef.current = fn;
@@ -65,8 +73,41 @@ function useLoad<T>(fn: () => Promise<T>) {
       .then(data => setState({ data, error: null, loading: false }))
       .catch((e: unknown) => setState(s => ({ data: s.data, error: e instanceof Error ? e.message : 'Request failed', loading: false })));
   }, []);
-  useEffect(() => { reload(); }, [reload]);
+  useEffect(() => { reload(); }, [reload, ...deps]);
   return { ...state, reload };
+}
+
+/** A saved preference from the tax pages (church-tax rate, joint filing); never required. */
+function readPref(key: string): string | null {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
+/**
+ * Re-base cumulative return series to the first point of the shown period.
+ *
+ * `portfolio` and `benchmark` are cumulative returns in % from a common origin (null where
+ * undefined). The portfolio line starts at 0 % on its first defined point. The benchmark starts
+ * where it is first defined in the period, at the portfolio's re-based level on that date, so
+ * both lines run from the same point and their gap is the period's out- or underperformance.
+ *
+ * Example: portfolio 37.7 → 50.0 % and MSCI World 20.0 → 26.0 % over the period
+ * → portfolio 0 → 8.9 % (1.5 / 1.377 − 1), MSCI World 0 → 5.0 % (1.26 / 1.20 − 1).
+ */
+function rebaseReturns(portfolio: (number | null)[], benchmark: (number | null)[]): { portfolio: (number | null)[]; benchmark: (number | null)[] } {
+  const p0i = portfolio.findIndex(v => v != null);
+  const p0 = p0i >= 0 ? 1 + (portfolio[p0i] as number) / 100 : null;
+  const rp = portfolio.map(v => (v == null || p0 == null ? null : ((1 + v / 100) / p0 - 1) * 100));
+  const b0i = benchmark.findIndex(v => v != null);
+  if (b0i < 0) return { portfolio: rp, benchmark: benchmark.map(() => null) };
+  const b0 = 1 + (benchmark[b0i] as number) / 100;
+  const level = 1 + (rp[b0i] ?? 0) / 100;
+  const rb = benchmark.map(v => (v == null ? null : (level * (1 + v / 100) / b0 - 1) * 100));
+  return { portfolio: rp, benchmark: rb };
+}
+
+/** Days between an ISO date and today. */
+function daysSince(iso: string): number {
+  return Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
 }
 
 function Money({ children, className }: { children: ReactNode; className?: string }) {
@@ -174,7 +215,12 @@ function SecurityDetailPanel({ detail }: { detail: SecurityDetail }) {
     setSwitchResult(null);
     setSwitchError(null);
     try {
-      const res = await fetch(`/api/portfolio/switch-compare?current=${encodeURIComponent(detail.isin)}&alternative=${encodeURIComponent(altISIN)}`);
+      // Same church-tax and joint-filing choices as the Tax pages.
+      const params = new URLSearchParams({ current: detail.isin, alternative: altISIN });
+      const church = Number(readPref('church_tax_rate'));
+      if (Number.isFinite(church) && church > 0) params.set('church_tax', String(church));
+      if (readPref('fsa_joint') === '1') params.set('joint', '1');
+      const res = await fetch(`/api/portfolio/switch-compare?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setSwitchResult(await res.json());
     } catch (e) {
@@ -204,18 +250,22 @@ function SecurityDetailPanel({ detail }: { detail: SecurityDetail }) {
     if (t.type === 'buy' || t.type === 'savings_plan') buyMarkers.push([s, price]);
     else if (t.type === 'sell') sellMarkers.push([s, price]);
   });
+  // EUR average cost at purchase-date rates, comparable with the EUR price line (also converted
+  // at each day's rate).
   const avgCost = detail.total_quantity > 0 ? detail.total_cost / detail.total_quantity : 0;
+  const paidAvg = detail.avg_cost_paid != null && detail.avg_cost_currency && detail.avg_cost_currency.toUpperCase() !== 'EUR'
+    ? ` (${fmtMoney(detail.avg_cost_paid, detail.avg_cost_currency, { cents: true })} as paid)` : '';
 
   return (
     <div className="flex flex-col gap-6">
       <p className="text-[13px] text-ink-muted">
         {[detail.symbol, labelFor(detail.asset_class), detail.ter > 0 ? `Ongoing charge (TER) ${fmtPct(detail.ter, { digits: 2 })} p.a.` : null,
-          detail.first_buy ? `First bought ${fmtDateLong(detail.first_buy)}` : null].filter(Boolean).join(' · ')}
+          detail.first_buy ? `First acquired ${fmtDateLong(detail.first_buy)}` : null].filter(Boolean).join(' · ')}
       </p>
 
       <MetricGrid>
-        <MetricCard label="Market value" value={fmtEUR(detail.total_value)} sublabel={`Cost basis ${fmtEUR(detail.total_cost)}`} />
-        <MetricCard label="Unrealised gain" value={fmtEUR(detail.unrealized_pl, { sign: true })} tone={toneOf(detail.unrealized_pl)} sublabel="Market value minus cost, in EUR" />
+        <MetricCard label="Market value" value={fmtEUR(detail.total_value)} sublabel={`Cost basis ${fmtEUR(detail.total_cost)} · average cost at purchase-date rates`} />
+        <MetricCard label="Unrealised gain" value={fmtEUR(detail.unrealized_pl, { sign: true })} tone={toneOf(detail.unrealized_pl)} sublabel="Market value minus cost, in EUR; includes currency moves since purchase" />
         <MetricCard label="Weight" value={fmtPct(detail.weight_pct)} money={false} sublabel="Share of all holdings" />
         <MetricCard label="Units" value={fmtQty(detail.total_quantity)} money={false} sublabel="Across all accounts" />
       </MetricGrid>
@@ -224,9 +274,10 @@ function SecurityDetailPanel({ detail }: { detail: SecurityDetail }) {
         <div>
           <SubHeading>Price, last {detail.sparkline.length} trading days · EUR</SubHeading>
           <p className="text-[12px] text-ink-muted mt-1 mb-2">
-            {[avgCost > 0 ? `Dashed line: average cost ${fmtEUR(avgCost, { cents: true })}` : null,
+            {[avgCost > 0 ? `Dashed line: average cost ${fmtEUR(avgCost, { cents: true })}${paidAvg}` : null,
               buyMarkers.length > 0 ? '● purchases' : null,
-              sellMarkers.length > 0 ? '◆ sales' : null].filter(Boolean).join(' · ') || 'Converted at the latest ECB reference rate.'}
+              sellMarkers.length > 0 ? '◆ sales' : null,
+              'each price at that day’s ECB rate'].filter(Boolean).join(' · ')}
           </p>
           <EChartWrapper option={{
             grid: { left: 4, right: 16, top: 12, bottom: 4, containLabel: true },
@@ -295,7 +346,7 @@ function SecurityDetailPanel({ detail }: { detail: SecurityDetail }) {
       {/* Product switch comparison */}
       <div>
         <SubHeading>What if I had bought a different product?</SubHeading>
-        <p className="text-[12px] text-ink-muted mt-1 mb-3">Replays your purchases of this holding into another security and estimates the tax cost of switching today.</p>
+        <p className="text-[12px] text-ink-muted mt-1 mb-3">Puts the money of the units you still hold (each purchase or RSU vest, first in first out) into another security on the same dates, and estimates the tax cost of switching today.</p>
         <form className="flex flex-wrap items-end gap-3" onSubmit={e => { e.preventDefault(); compare(); }}>
           <Field
             label="Alternative ISIN"
@@ -315,8 +366,14 @@ function SecurityDetailPanel({ detail }: { detail: SecurityDetail }) {
         {switchResult && (
           <div className="mt-4 flex flex-col gap-4">
             <MetricGrid>
-              <MetricCard label="This holding" value={fmtEUR(switchResult.current_value)} sublabel="Value today" />
-              <MetricCard label="Alternative" value={fmtEUR(switchResult.alternative_value)} sublabel="Same purchases, value today" />
+              <MetricCard label="This holding" value={fmtEUR(switchResult.current_value)} sublabel={`Value today · cost ${fmtEUR(switchResult.total_invested)}`} />
+              <MetricCard
+                label="Alternative"
+                value={fmtEUR(switchResult.alternative_value)}
+                sublabel={switchResult.lots_shifted && switchResult.compare_from
+                  ? `Same money, value today · ${fmtNum(switchResult.lots_shifted)} of ${fmtNum(switchResult.lots ?? 0)} purchases predate the price history and are compared from ${fmtDate(switchResult.compare_from)}`
+                  : 'Same money on the same dates, value today'}
+              />
               <MetricCard
                 label="Difference"
                 value={fmtEUR(switchResult.difference_eur, { sign: true })}
@@ -331,21 +388,28 @@ function SecurityDetailPanel({ detail }: { detail: SecurityDetail }) {
               </p>
             )}
 
-            {switchResult.unrealized_gain !== 0 && (
+            {switchResult.private_sale && (
+              <p className="text-[13px] text-ink-body">Crypto and physical gold are private sales (§ 23 EStG): tax-free after one year, otherwise taxed at your personal income-tax rate, which isn’t estimated here.</p>
+            )}
+            {switchResult.unrealized_gain > 0 && !switchResult.private_sale && (
               <div>
                 <SubHeading className="mb-2">Tax cost of switching</SubHeading>
                 <dl className="grid grid-cols-[1fr_auto] gap-x-6 gap-y-1.5 text-[14px] max-w-md">
-                  <dt className="text-ink-body">Unrealised gain</dt>
+                  <dt className="text-ink-body">Unrealised gain (first in, first out)</dt>
                   <dd className={`text-right ${toneText(switchResult.unrealized_gain)}`}><Money>{fmtEUR(switchResult.unrealized_gain, { sign: true })}</Money></dd>
-                  {switchResult.is_equity && switchResult.teilfreistellung > 0 && (<>
-                    <dt className="text-ink-body">Teilfreistellung (partial exemption, 30 %)</dt>
+                  {switchResult.teilfreistellung > 0 && (<>
+                    <dt className="text-ink-body">Teilfreistellung (partial exemption, {fmtPct(switchResult.teilfreistellung_pct ?? 30, { digits: 0 })})</dt>
                     <dd className="text-right text-ink"><Money>{fmtEUR(-switchResult.teilfreistellung)}</Money></dd>
+                  </>)}
+                  {(switchResult.loss_offset ?? 0) > 0 && (<>
+                    <dt className="text-ink-body">Offset by losses realised this year</dt>
+                    <dd className="text-right text-ink"><Money>{fmtEUR(-(switchResult.loss_offset ?? 0))}</Money></dd>
                   </>)}
                   {switchResult.freibetrag_used > 0 && (<>
                     <dt className="text-ink-body">Freibetrag (tax-free allowance used)</dt>
                     <dd className="text-right text-ink"><Money>{fmtEUR(-switchResult.freibetrag_used)}</Money></dd>
                   </>)}
-                  <dt className="text-ink font-medium">Tax due on switching</dt>
+                  <dt className="text-ink font-medium">Tax due on switching{switchResult.tax_rate ? ` (${fmtPct(switchResult.tax_rate * 100, { digits: 3 })})` : ''}</dt>
                   <dd className="text-right text-ink font-medium"><Money>{fmtEUR(switchResult.tax_on_switch)}</Money></dd>
                   <dt className="text-ink-body">Net proceeds</dt>
                   <dd className="text-right text-ink"><Money>{fmtEUR(switchResult.net_proceeds)}</Money></dd>
@@ -368,16 +432,23 @@ function SecurityDetailPanel({ detail }: { detail: SecurityDetail }) {
                     <span className="font-medium text-ink">Redirect future contributions.</span>{' '}
                     Stop buying the current product and invest new money in the alternative. No tax event; the transition happens gradually.
                   </li>
-                  {switchResult.tax_on_switch > 1000 && (
+                  {switchResult.tax_on_switch > 1000 && switchResult.allowance != null && switchResult.tax_rate != null && (
                     <li>
                       <span className="font-medium text-ink">Split the sale across two tax years.</span>{' '}
-                      Sell about <Money>{fmtEUR(switchResult.current_value / 2)}</Money> per year to use the Sparer-Pauschbetrag (saver’s allowance) twice, saving roughly <Money>{fmtEUR(Math.min(1000, switchResult.taxable_gain) * 0.26375)}</Money>.
+                      Sell about <Money>{fmtEUR(switchResult.current_value / 2)}</Money> per year to use the Sparer-Pauschbetrag (saver’s allowance, <Money>{fmtEUR(switchResult.allowance)}</Money> a year) twice, saving roughly <Money>{fmtEUR(Math.min(switchResult.allowance, switchResult.taxable_gain) * switchResult.tax_rate)}</Money>.
                     </li>
                   )}
-                  {switchResult.unrealized_gain < 0 && (
+                  {switchResult.unrealized_gain < 0 && !switchResult.private_sale && (
                     <li>
                       <span className="font-medium text-ink">Harvest the loss.</span>{' '}
-                      The holding carries <Money>{fmtEUR(Math.abs(switchResult.unrealized_gain))}</Money> of unrealised losses. Selling now realises them, which offsets future gains (about <Money>{fmtEUR(Math.abs(switchResult.unrealized_gain) * 0.26375)}</Money> of tax).
+                      Selling realises <Money>{fmtEUR(switchResult.harvest_loss ?? 0)}</Money> of tax-relevant loss
+                      {switchResult.teilfreistellung > 0 ? ' (after the partial exemption)' : ''}.{' '}
+                      {switchResult.loss_pot === 'stock'
+                        ? 'As a loss on shares it only offsets gains from selling shares.'
+                        : 'It offsets any capital income.'}{' '}
+                      {(switchResult.harvest_tax_now ?? 0) > 0
+                        ? <>Against this year’s income it saves about <Money>{fmtEUR(switchResult.harvest_tax_now ?? 0)}</Money> of tax now; the rest carries forward.</>
+                        : 'Nothing taxed this year to offset, so it carries forward to future gains.'}
                     </li>
                   )}
                   {switchResult.unrealized_gain >= 0 && switchResult.tax_on_switch <= 1000 && switchResult.tax_on_switch > 0 && (
@@ -408,6 +479,7 @@ export default function Portfolio() {
   const [performance, setPerformance] = useState<PerformanceData | null>(null);
   const [dividends, setDividends] = useState<DividendData | null>(null);
   const [priceAsOf, setPriceAsOf] = useState<string | null>(null);
+  const [priceNewest, setPriceNewest] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -423,6 +495,7 @@ export default function Portfolio() {
   const [targetError, setTargetError] = useState<string | null>(null);
   const [rebalanceTrades, setRebalanceTrades] = useState<RebalanceTrade[]>([]);
   const [rebalanceMsg, setRebalanceMsg] = useState('');
+  const [rebalanceNote, setRebalanceNote] = useState<{ unallocated: number; deposit: number; normalised: boolean; targetSum: number } | null>(null);
   const [rebalanceError, setRebalanceError] = useState<string | null>(null);
   const [rebalanceDone, setRebalanceDone] = useState(false);
   const [depositAmount, setDepositAmount] = useState(0);
@@ -459,6 +532,7 @@ export default function Portfolio() {
       .then(([holdRes, perfRes, divRes]) => {
         setHoldings(holdRes.holdings || []);
         setPriceAsOf(holdRes.price_as_of || null);
+        setPriceNewest(holdRes.price_newest || null);
         setPerformance(perfRes);
         setDividends(divRes);
         setError(null);
@@ -473,7 +547,11 @@ export default function Portfolio() {
     api.listAccounts().then(res => setAccounts((res.accounts || []).filter(a => ['brokerage', 'crypto', 'pension', 'precious_metals'].includes(a.type)))).catch(() => {});
   }, []);
 
-  const perfHistory = useLoad<PerformanceHistoryPoint[]>(() => api.getPerformanceHistory().then(r => r.history || []));
+  // Same scope as the Performance figures: the selected account, or all investment accounts.
+  const perfHistory = useLoad<{ history: PerformanceHistoryPoint[]; twr_resets?: string[] }>(
+    () => api.getPerformanceHistory(filterAccount || undefined).then(r => ({ history: r.history || [], twr_resets: r.twr_resets })),
+    [filterAccount],
+  );
   const allocation = useLoad<AllocationData>(() => api.getAllocation());
   const allocHistory = useLoad<AllocationHistory>(() => api.getAllocationHistory());
   const healthScore = useLoad<HealthScore>(() => api.getHealthScore());
@@ -493,20 +571,19 @@ export default function Portfolio() {
 
   const retryCore = () => { setError(null); setLoading(true); loadPortfolio(); };
 
-  // ── Totals. `market_value`, `unrealized_pl` and `value_eur` are EUR (converted server-side);
-  // `avg_cost_basis` is per share in the trading currency and is never summed here. An unpriced
-  // holding counts at `value_eur`, which is its EUR cost. Cost basis = value − gain, so both sides
-  // of every percentage are EUR.
+  // ── Totals. `market_value`, `unrealized_pl`, `value_eur` and `cost_basis_eur` are EUR (converted
+  // server-side; cost at each purchase date's ECB rate). An unpriced holding counts at `value_eur`,
+  // which is its EUR cost, so both sides of every percentage are EUR.
   const hasMarketPrices = holdings.some(h => h.market_value != null);
   const fullyPriced = holdings.length > 0 && holdings.every(h => h.market_value != null);
   const pricedCount = holdings.filter(h => h.market_value != null).length;
   const totalMarketValue = holdings.reduce((sum, h) => sum + (h.market_value ?? h.value_eur ?? 0), 0);
   const totalPL = holdings.reduce((sum, h) => sum + (h.unrealized_pl ?? 0), 0);
-  const totalCostBasis = totalMarketValue - totalPL;
-  const totalPLPct = totalCostBasis > 0 ? (totalPL / totalCostBasis) * 100 : null;
-  // Dividends per holding come in that holding's own currency.
-  const totalDividends = holdings.reduce((sum, h) => sum + h.total_dividends, 0);
-  const dividendsMixed = holdings.some(h => h.total_dividends > 0 && (h.currency || 'EUR').toUpperCase() !== 'EUR');
+  const totalCostBasis = holdings.reduce((sum, h) => sum + (h.cost_basis_eur ?? ((h.market_value ?? h.value_eur ?? 0) - (h.unrealized_pl ?? 0))), 0);
+  const pricedCost = holdings.reduce((sum, h) => sum + (h.unrealized_pl != null ? (h.cost_basis_eur ?? 0) : 0), 0);
+  const totalPLPct = pricedCost > 0 ? (totalPL / pricedCost) * 100 : null;
+  // Gross dividends per holding, converted to EUR at each payment date's rate by the backend.
+  const totalDividends = holdings.reduce((sum, h) => sum + (h.dividends_eur ?? 0), 0);
 
   const accountFilter = accounts.length > 1 ? (
     <SelectField label="Account" value={filterAccount} onChange={e => setFilterAccount(e.target.value)} className="max-w-xs mt-6">
@@ -522,19 +599,19 @@ export default function Portfolio() {
         value={fmtEUR(totalMarketValue)}
         sublabel={`${holdings.length} ${holdings.length === 1 ? 'holding' : 'holdings'}, converted to EUR${!fullyPriced && hasMarketPrices ? ` · ${pricedCount} of ${holdings.length} priced` : ''}`}
       />
-      <MetricCard label="Cost basis" value={fmtEUR(totalCostBasis)} sublabel="Purchase cost of current holdings, in EUR" />
+      <MetricCard label="Cost basis" value={fmtEUR(totalCostBasis)} sublabel="Average purchase cost of current holdings, at each purchase date’s ECB rate. Tax uses first in, first out." />
       {hasMarketPrices && (
         <MetricCard
           label="Unrealised gain"
           value={fmtEUR(totalPL, { sign: true })}
           tone={toneOf(totalPL)}
-          sublabel={totalPLPct != null ? `${fmtPct(totalPLPct, { sign: true })} on cost basis` : 'Value minus cost basis'}
+          sublabel={totalPLPct != null ? `${fmtPct(totalPLPct, { sign: true })} on cost basis, including currency moves since purchase` : 'Value minus cost basis'}
         />
       )}
       <MetricCard
         label="Dividends received"
         value={fmtEUR(totalDividends)}
-        sublabel={dividendsMixed ? 'Current holdings · sums payouts in their own currencies, unconverted' : 'On current holdings, since purchase'}
+        sublabel="On current holdings, gross before withholding tax, in EUR at each payment date’s rate"
       />
     </MetricGrid>
   );
@@ -555,12 +632,22 @@ export default function Portfolio() {
     const netCapital = p.current_value - p.total_return;
     const ok = (n: number) => Number.isFinite(n);
     const capitalOk = ok(netCapital) && ok(p.current_value) && !(netCapital <= 0 && p.current_value > 0);
-    const twrOk = ok(p.twr) && p.twr > -100;
-    const irrOk = ok(p.irr) && p.irr > -100 && p.irr < 1000;
+    const twr = p.twr != null && ok(p.twr) ? p.twr : null;
+    const twrFullYear = !!p.twr_start && daysSince(p.twr_start) >= 362;
+    const twrResets = p.twr_resets || [];
+    const twrLabel = twr != null && !twrFullYear && p.twr_start ? `Time-weighted return · since ${fmtMonthShort(p.twr_start)}` : 'Time-weighted return · 12 months';
+    const twrCaption = [
+      twrFullYear ? 'Trailing 12 months, chained daily; ignores the timing of deposits' : `Since ${p.twr_start ? fmtDate(p.twr_start) : 'the first purchase'}: less than 12 months of history`,
+      twrResets.length > 0 ? `restarted ${fmtDate(twrResets[twrResets.length - 1])}, when the value fell to zero without a recorded withdrawal` : null,
+    ].filter(Boolean).join(' · ');
+    // Annualise only with at least a year of history; otherwise show the return over the period.
+    const irrAnnual = (p.irr_years ?? 0) >= 1;
+    const irrValue = irrAnnual ? p.irr : p.irr_period_return;
+    const irrOk = irrValue != null && ok(irrValue) && irrValue > -100;
     const gainsOk = capitalOk && ok(p.total_return);
     const dash = (caption: string) => ({ value: '—' as ReactNode, tone: 'neutral' as Tone, sublabel: caption, money: false });
     return (
-      <Section title="Performance" subtitle="All figures in EUR. “Since inception” covers every transaction on record for the selected account.">
+      <Section title="Performance" subtitle="All figures in EUR, for the selected account or all investment accounts; checking and savings cash is not counted. “Since inception” covers every transaction on record.">
         <MetricGrid className="md:!grid-cols-3">
           <MetricCard
             label="Net capital invested"
@@ -574,21 +661,28 @@ export default function Portfolio() {
               ? {
                   value: fmtEUR(p.total_return, { sign: true }),
                   tone: toneOf(p.total_return),
-                  sublabel: ok(p.total_return_pct) ? `${fmtPct(p.total_return_pct, { sign: true })} of net capital invested · current value minus net capital` : 'Current value minus net capital invested',
+                  sublabel: p.total_return_pct != null && ok(p.total_return_pct)
+                    ? `Current value minus net capital · ${fmtPct(p.total_return_pct, { sign: true })} on the average capital invested (Modified Dietz)`
+                    : 'Current value minus net capital invested',
                 }
               : dash('Not enough history: needs complete deposit records'))}
           />
           <MetricCard
-            label="Time-weighted return · 12 months"
-            {...(twrOk
-              ? { value: fmtPct(p.twr, { sign: true }), tone: toneOf(p.twr), sublabel: 'TWR over the trailing 12 months, whole portfolio; ignores the timing of deposits', money: false }
-              : dash('Not enough history for a 12-month return'))}
+            label={twrLabel}
+            {...(twr != null
+              ? { value: fmtPct(twr, { sign: true }), tone: toneOf(twr), sublabel: twrCaption, money: false }
+              : dash('Not enough history: no day with money invested yet'))}
           />
           <MetricCard
-            label="Money-weighted return · p.a."
+            label={irrAnnual ? 'Money-weighted return · p.a.' : `Money-weighted return · since ${p.irr_start ? fmtMonthShort(p.irr_start) : 'inception'}`}
             {...(irrOk
-              ? { value: fmtPct(p.irr, { sign: true }), tone: toneOf(p.irr), sublabel: 'IRR per year since inception; reflects when money went in and out', money: false }
-              : dash('Not enough history for an annual rate'))}
+              ? {
+                  value: fmtPct(irrValue as number, { sign: true }), tone: toneOf(irrValue as number), money: false,
+                  sublabel: irrAnnual
+                    ? 'IRR per year since inception; reflects when money went in and out'
+                    : 'Over less than a year, so not annualised; reflects when money went in and out',
+                }
+              : dash('Not enough history: needs money in and a value today'))}
           />
           <MetricCard
             label="Realised gain · since inception"
@@ -610,7 +704,7 @@ export default function Portfolio() {
   const renderGrowth = () => {
     if (perfHistory.loading && !perfHistory.data) return <Section title="Growth Over Time"><LoadingState lines={5} /></Section>;
     if (perfHistory.error && !perfHistory.data) return <Section title="Growth Over Time"><ErrorState message="The growth history couldn’t be loaded." details={perfHistory.error} onRetry={perfHistory.reload} /></Section>;
-    const all = perfHistory.data || [];
+    const all = perfHistory.data?.history || [];
     const filtered = filterByPeriod(all, growthPeriod);
     const selector = <PeriodSelector value={growthPeriod} onChange={setGrowthPeriod} />;
     if (all.length < 2) {
@@ -630,6 +724,9 @@ export default function Portfolio() {
     const dates = filtered.map(p => p.date);
     const hasInKind = filtered.some(p => p.in_kind_invested > 0);
     const hasBenchmark = filtered.some(p => p.benchmark_pct != null);
+    // Both return lines start at 0 % on the first day of the selected period.
+    const rebased = rebaseReturns(filtered.map(p => p.return_pct ?? null), filtered.map(p => p.benchmark_pct ?? null));
+    const resetsInView = (perfHistory.data?.twr_resets || []).filter(d => d >= dates[0]);
     const line = (name: string, color: string, data: (number | null)[], extra: Record<string, unknown> = {}) => ({
       name, type: 'line' as const, data, symbol: 'none', smooth: 0.3,
       color, itemStyle: { color }, lineStyle: { color, width: 2 }, ...extra,
@@ -658,15 +755,20 @@ export default function Portfolio() {
           grid: GRID,
         }} height="300px" />
 
-        <SubHeading className="mt-6">Cumulative return{hasBenchmark ? ' against MSCI World' : ''} · %</SubHeading>
+        <SubHeading className="mt-6">Time-weighted return{hasBenchmark ? ' against MSCI World' : ''} · %</SubHeading>
+        <p className="text-[12px] text-ink-muted mt-1 mb-2">
+          From the start of the selected period, chained daily so deposits, withdrawals and RSU vests don’t count as gains.
+          {hasBenchmark ? ' MSCI World is its price return over the same dates.' : ''}
+          {resetsInView.length > 0 ? ` The chain restarts on ${resetsInView.map(fmtDate).join(', ')}, when the value fell to zero without a recorded withdrawal.` : ''}
+        </p>
         <EChartWrapper option={{
           tooltip: axisTooltip(v => fmtPct(v, { sign: true })),
           legend: lineLegend([['Portfolio return', 'solid'], ...(hasBenchmark ? [['MSCI World', 'dashed'] as [string, 'dashed']] : [])]),
           xAxis: timeAxis(dates, growthPeriod),
           yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtPct(v, { digits: 0 }) } },
           series: [
-            line('Portfolio return', tc.forest, filtered.map(p => Math.round(p.return_pct * 10) / 10)),
-            ...(hasBenchmark ? [line('MSCI World', tc.walnut, filtered.map(p => (p.benchmark_pct != null ? Math.round(p.benchmark_pct * 10) / 10 : null)), {
+            line('Portfolio return', tc.forest, rebased.portfolio.map(v => (v != null ? Math.round(v * 10) / 10 : null))),
+            ...(hasBenchmark ? [line('MSCI World', tc.walnut, rebased.benchmark.map(v => (v != null ? Math.round(v * 10) / 10 : null)), {
               lineStyle: { color: tc.walnut, width: 1.5, type: 'dashed' as const },
             })] : []),
           ],
@@ -742,7 +844,9 @@ export default function Portfolio() {
       );
     }
     const d = dividends;
-    const growthOk = Number.isFinite(d.dividend_growth) && Math.abs(d.dividend_growth) <= 500;
+    const growth = d.dividend_growth;
+    const growthOk = growth != null && Number.isFinite(growth) && Math.abs(growth) <= 500;
+    const yoc = d.yield_on_cost;
     const monthly = d.monthly || [];
     const yearly = d.yearly || [];
     const cumulative = d.cumulative || [];
@@ -781,7 +885,7 @@ export default function Portfolio() {
         <EChartWrapper option={{
           tooltip: axisTooltip(v => fmtEUR(v, { cents: true }), head),
           xAxis: { type: 'category' as const, data: bars.labels, axisLabel: { formatter: (v: string) => monthLabel(v), hideOverlap: true } },
-          yAxis: { type: 'value' as const, min: 0, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
+          yAxis: { type: 'value' as const, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
           series: [{
             name: dividendView === 'yearly' ? 'Dividends in the year' : 'Dividends in the month', type: 'bar' as const, data: bars.values,
             color: tc.forest, itemStyle: { color: tc.forest, borderRadius: [2, 2, 0, 0] }, barMaxWidth: dividendView === 'yearly' ? 48 : 28,
@@ -794,24 +898,29 @@ export default function Portfolio() {
     return (
       <>
         <SectionBoundary>
-          <Section title="Dividend Income" first subtitle="Dividends and distributions received across all accounts, in EUR.">
+          <Section title="Dividend Income" first subtitle="Dividends and distributions received across all accounts, gross before withholding tax, in EUR at each payment date’s ECB rate.">
             <MetricGrid>
-              <MetricCard label="Total received" value={fmtEUR(d.total)} sublabel="Since the first payout" />
-              <MetricCard label="Trailing 12 months" value={fmtEUR(d.trailing_12m)} sublabel="Received in the last 12 months" />
-              <MetricCard label="Yield on cost" value={fmtPct(d.yield_on_cost, { digits: 2 })} money={false} sublabel="Trailing 12 months ÷ cost basis" />
+              <MetricCard label="Total received" value={fmtEUR(d.total)} sublabel={d.total_net != null ? `Since the first payout · ${fmtEUR(d.total_net)} after withheld tax` : 'Since the first payout'} />
+              <MetricCard label="Trailing 12 months" value={fmtEUR(d.trailing_12m)} sublabel={d.trailing_12m_net != null ? `Received in the last 12 months · ${fmtEUR(d.trailing_12m_net)} after withheld tax` : 'Received in the last 12 months'} />
+              <MetricCard
+                label="Yield on cost"
+                value={yoc != null && Number.isFinite(yoc) ? fmtPct(yoc, { digits: 2 }) : '—'}
+                money={false}
+                sublabel={yoc != null ? 'Last 12 months’ payouts on current holdings ÷ their cost basis' : 'No cost basis to divide by'}
+              />
               <MetricCard
                 label="Growth · year on year"
-                value={growthOk ? fmtPct(d.dividend_growth, { sign: true }) : '—'}
-                tone={growthOk ? toneOf(d.dividend_growth) : 'neutral'}
+                value={growthOk ? fmtPct(growth, { sign: true }) : '—'}
+                tone={growthOk ? toneOf(growth) : 'neutral'}
                 money={false}
-                sublabel={growthOk ? 'Trailing 12 months against the 12 before' : 'Not enough history'}
+                sublabel={growthOk ? 'Trailing 12 months against the 12 before' : 'Not enough history: nothing paid in the 12 months before'}
               />
             </MetricGrid>
           </Section>
         </SectionBoundary>
 
         <SectionBoundary>
-          <Section title="Payout History" actions={<ViewToggle value={dividendView} options={views} onChange={setDividendView} label="Dividend view" />} subtitle="In EUR.">
+          <Section title="Payout History" actions={<ViewToggle value={dividendView} options={views} onChange={setDividendView} label="Dividend view" />} subtitle="Gross, in EUR. Months without payouts show as zero; a reversal lowers the cumulative line.">
             {chart}
           </Section>
         </SectionBoundary>
@@ -831,7 +940,7 @@ export default function Portfolio() {
 
         {upcoming.length > 0 && (
           <SectionBoundary>
-            <Section title="Expected Upcoming Dividends" subtitle="Estimates based on past payouts of your current holdings; not announced amounts.">
+            <Section title="Expected Upcoming Dividends" subtitle="Estimates: the same month’s payout per unit over the last three years, times the units you hold today. Not announced amounts.">
               <div className="flex flex-col gap-4">
                 {upcoming.map(([month, entries]) => (
                   <div key={month}>
@@ -873,7 +982,12 @@ export default function Portfolio() {
   const computeRebalance = () => {
     setRebalanceError(null);
     api.getRebalance(depositAmount > 0 ? depositAmount : undefined)
-      .then(r => { setRebalanceTrades(r.trades || []); setRebalanceMsg(r.message || ''); setRebalanceDone(true); })
+      .then(r => {
+        setRebalanceTrades(r.trades || []);
+        setRebalanceMsg(r.message || '');
+        setRebalanceNote({ unallocated: r.unallocated ?? 0, deposit: r.deposit ?? 0, normalised: !!r.targets_normalised, targetSum: r.target_sum ?? 100 });
+        setRebalanceDone(true);
+      })
       .catch((e: Error) => setRebalanceError(e.message || 'Request failed'));
   };
 
@@ -889,6 +1003,7 @@ export default function Portfolio() {
       );
     }
     const drift = Math.abs(a.max_drift);
+    const untargetedCount = a.allocations.filter(x => x.untargeted).length;
     const driftChip = drift > 5 ? { tone: 'danger' as const, text: 'Rebalancing due' } : drift > 2 ? { tone: 'warning' as const, text: 'Drifting' } : { tone: 'success' as const, text: 'On target' };
     const statusTone = (s: string) => (s === 'on_target' ? 'success' as const : s === 'overweight' ? 'danger' as const : 'warning' as const);
     const draftSum = Object.values(targetDrafts).reduce((s, v) => s + (Number.isFinite(v) ? v : 0), 0);
@@ -897,7 +1012,13 @@ export default function Portfolio() {
         title="Target Allocation"
         first
         subtitle={a.has_targets
-          ? <span className="inline-flex flex-wrap items-center gap-2">Largest drift from target: {fmtPct(a.max_drift, { sign: true })} <Chip tone={driftChip.tone}>{driftChip.text}</Chip></span>
+          ? (
+            <span className="inline-flex flex-wrap items-center gap-2">
+              Largest drift from target: {fmtPct(a.max_drift, { sign: true })} <Chip tone={driftChip.tone}>{driftChip.text}</Chip>
+              {a.targets_normalised && a.target_sum != null && <span>Targets add up to {fmtPct(a.target_sum)}; drift and trades use them scaled to 100 %.</span>}
+              {untargetedCount > 0 && <span>Holdings without a target count as a 0 % target.</span>}
+            </span>
+          )
           : 'Actual weight of each holding. Set targets to see drift and rebalancing suggestions.'}
         actions={editingTargets ? (
           <>
@@ -935,8 +1056,9 @@ export default function Portfolio() {
                 <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 mb-1.5">
                   <span className="text-[14px] font-medium text-ink min-w-0 truncate">{x.name}</span>
                   <span className="flex items-center gap-2 text-[13px] text-ink-body shrink-0">
-                    {fmtPct(x.actual_pct)}{x.target_pct > 0 ? ` of ${fmtPct(x.target_pct)} target` : ''}
+                    {fmtPct(x.actual_pct)}{x.target_pct > 0 ? ` of ${fmtPct(x.effective_target_pct ?? x.target_pct)} target` : ''}
                     {x.target_pct > 0 && <Chip tone={statusTone(x.status)}>{labelFor(x.status)} {fmtPct(x.drift_pct, { sign: true })}</Chip>}
+                    {x.untargeted && <Chip tone={x.status === 'on_target' ? 'neutral' : 'warning'}>No target {fmtPct(x.drift_pct, { sign: true })}</Chip>}
                   </span>
                 </div>
                 {/* Bar shows the actual weight; the ink tick marks the target. */}
@@ -971,7 +1093,7 @@ export default function Portfolio() {
       );
     }
     return (
-      <Section title="Rebalancing" subtitle="Suggested trades to bring the portfolio back to its targets, in EUR.">
+      <Section title="Rebalancing" subtitle="Suggested trades to bring the portfolio back to its targets, in EUR. Holdings without a target are sold; trades under 10 € are left out.">
         <form className="flex flex-wrap items-end gap-3" onSubmit={e => { e.preventDefault(); computeRebalance(); }}>
           <NumberField
             label="New deposit to allocate"
@@ -988,6 +1110,15 @@ export default function Portfolio() {
 
         {rebalanceError && <div className="mt-4"><ErrorState message="The trades couldn’t be computed." details={rebalanceError} onRetry={computeRebalance} /></div>}
         {rebalanceMsg && <p className="text-[13px] text-ink-body mt-4">{rebalanceMsg}</p>}
+        {rebalanceNote && rebalanceTrades.length > 0 && (
+          <p className="text-[12px] text-ink-muted mt-1">
+            {rebalanceNote.deposit > 0
+              ? (Math.abs(rebalanceNote.unallocated) >= 0.01 ? <>Not placed: <Money>{fmtEUR(rebalanceNote.unallocated, { cents: true })}</Money> of the deposit (amounts under 10 €).</> : 'The whole deposit is placed.')
+              : (Math.abs(rebalanceNote.unallocated) >= 0.01 ? <>Sales and purchases differ by <Money>{fmtEUR(rebalanceNote.unallocated, { cents: true, sign: true })}</Money> (trades under 10 € left out).</> : 'Sales pay for the purchases.')}
+            {rebalanceNote.normalised ? ` Targets add up to ${fmtPct(rebalanceNote.targetSum)} and were scaled to 100 %.` : ''}
+            {' '}Unit counts assume fractional shares; brokers that only trade whole units need rounding.
+          </p>
+        )}
 
         {rebalanceTrades.length > 0 && (
           <Rows className="mt-4">
@@ -1025,7 +1156,7 @@ export default function Portfolio() {
     if (history.length <= 3 || names.length === 0) {
       return (
         <Section title={title}>
-          <p className="text-[14px] text-ink-body">Not enough history yet. The chart appears after a few days of portfolio snapshots.</p>
+          <p className="text-[14px] text-ink-body">Not enough history yet. The chart appears once holdings have been valued at a few month-ends.</p>
         </Section>
       );
     }
@@ -1051,7 +1182,7 @@ export default function Portfolio() {
       return 0;
     };
     return (
-      <Section title={title} actions={selector} subtitle="Share of each holding in the portfolio over time, in % of market value.">
+      <Section title={title} actions={selector} subtitle="Share of each holding in % of market value at each month-end, at that day’s price and ECB rate.">
         <EChartWrapper option={{
           tooltip: axisTooltip(v => fmtPct(v)),
           legend: { type: 'scroll' as const, bottom: 0, textStyle: { fontSize: 12 } },
@@ -1075,14 +1206,21 @@ export default function Portfolio() {
     if (!sp || sp.plans.length === 0) {
       return (
         <Section title="Savings Plans">
-          <p className="text-[14px] text-ink-body">No savings plans detected. Regular monthly purchases of the same security show up here.</p>
+          <p className="text-[14px] text-ink-body">
+            {(sp?.inactive_count ?? 0) > 0
+              ? `No savings plan has run in the last two months; ${fmtNum(sp?.inactive_count ?? 0)} earlier ${(sp?.inactive_count ?? 0) === 1 ? 'plan has' : 'plans have'} stopped.`
+              : 'No savings plans detected. Regular monthly purchases of the same security show up here.'}
+          </p>
         </Section>
       );
     }
     return (
       <Section
         title="Savings Plans"
-        subtitle={<>{sp.plan_count} detected {sp.plan_count === 1 ? 'plan' : 'plans'} · <Money>{fmtEUR(sp.total_monthly)}</Money> per month in total</>}
+        subtitle={<>
+          {sp.plan_count} running {sp.plan_count === 1 ? 'plan' : 'plans'} · <Money>{fmtEUR(sp.total_monthly)}</Money> per month in total at the current rate
+          {(sp.inactive_count ?? 0) > 0 ? ` · ${fmtNum(sp.inactive_count ?? 0)} stopped ${(sp.inactive_count ?? 0) === 1 ? 'plan' : 'plans'} not counted` : ''}
+        </>}
       >
         <Rows>
           {sp.plans.map(p => (
@@ -1091,17 +1229,21 @@ export default function Portfolio() {
                 <div className="min-w-0 flex-1">
                   <p className="text-[14px] font-medium text-ink truncate">{p.name}</p>
                   <p className="text-[12px] text-ink-muted">
-                    about <Money>{fmtEUR(p.monthly_amount)}</Money> per month · {fmtNum(p.executions)} purchases over {fmtNum(p.months_active)} months
+                    <Money>{fmtEUR(p.monthly_amount)}</Money> per month now
+                    {p.trailing_12m_monthly != null && Math.abs(p.trailing_12m_monthly - p.monthly_amount) >= 1 ? <> (<Money>{fmtEUR(p.trailing_12m_monthly)}</Money> a month over the last 12)</> : null}
+                    {' · '}{fmtNum(p.executions)} purchases over {fmtNum(p.months_active)} {p.months_active === 1 ? 'month' : 'months'}
+                    {(p.lump_sum_count ?? 0) > 0 ? <> · <Money>{fmtEUR(p.lump_sum_amount ?? 0)}</Money> in {fmtNum(p.lump_sum_count ?? 0)} one-off {(p.lump_sum_count ?? 0) === 1 ? 'purchase' : 'purchases'} left out</> : null}
                   </p>
                 </div>
                 <div className="text-right shrink-0">
                   <p className="text-[14px] font-medium text-ink"><Money>{fmtEUR(p.current_value)}</Money></p>
-                  <p className={`text-[12px] ${toneText(p.dca_return_pct)}`}>{fmtPct(p.dca_return_pct, { sign: true })} return</p>
+                  <p className="text-[12px] text-ink-muted">held today</p>
                 </div>
               </div>
               {p.lump_sum_value > 0 && (
                 <p className="mt-1.5 text-[12px] text-ink-muted">
-                  Had the same total been invested at once at the start, it would be worth <Money>{fmtEUR(p.lump_sum_value)}</Money>:{' '}
+                  The plan’s purchases are worth <Money>{fmtEUR(p.plan_value ?? 0)}</Money> today (<span className={toneText(p.dca_return_pct)}>{fmtPct(p.dca_return_pct, { sign: true })}</span>).
+                  {' '}Had the same total been invested at once at the start, it would be worth <Money>{fmtEUR(p.lump_sum_value)}</Money>:{' '}
                   <span className="text-ink-body">
                     investing monthly is {p.dca_advantage_eur >= 0 ? 'ahead' : 'behind'} by <Money>{fmtEUR(Math.abs(p.dca_advantage_eur))}</Money>.
                   </span>
@@ -1162,6 +1304,9 @@ export default function Portfolio() {
       { label: 'Contributions', value: c.contributions, show: true },
       { label: 'Market return', value: c.market_return, show: true },
       { label: 'Dividends', value: c.dividends, show: true },
+      { label: 'Interest', value: c.interest ?? 0, show: Math.abs(c.interest ?? 0) >= 1 },
+      { label: 'Fees', value: -Math.abs(c.fees ?? 0), show: Math.abs(c.fees ?? 0) >= 1 },
+      { label: 'Taxes', value: -Math.abs(c.taxes ?? 0), show: Math.abs(c.taxes ?? 0) >= 1 },
       { label: 'Physical assets', value: c.assets ?? 0, show: Math.abs(c.assets ?? 0) >= 1 },
       { label: 'Purchase costs', value: c.purchase_costs ?? 0, show: Math.abs(c.purchase_costs ?? 0) >= 1 },
       { label: 'Loan interest', value: c.loan_interest ?? 0, show: Math.abs(c.loan_interest ?? 0) >= 1 },
@@ -1191,6 +1336,7 @@ export default function Portfolio() {
 
             <div>
               <SubHeading className="mb-2">Where the change came from</SubHeading>
+              <p className="text-[12px] text-ink-muted mb-2">The rows add up to the change since that date; market return is what is left after the others.</p>
               <dl className="grid grid-cols-[1fr_auto] gap-x-6 gap-y-1.5 text-[14px] max-w-md">
                 {attribution.filter(r => r.show).map(r => (
                   <div key={r.label} className="contents">
@@ -1431,10 +1577,13 @@ export default function Portfolio() {
 
   /* ───────────── Shell ───────────── */
 
-  const staleDays = priceAsOf ? Math.floor((Date.now() - new Date(priceAsOf).getTime()) / 86_400_000) : 0;
+  // `price_as_of` is the oldest latest-price among priced holdings: the page is only as fresh as
+  // its stalest quote.
+  const staleDays = priceAsOf ? daysSince(priceAsOf) : 0;
   const meta = priceAsOf ? (
     <span className="inline-flex flex-wrap items-center gap-2">
       Prices as of {fmtDateLong(priceAsOf)}
+      {priceNewest && priceNewest !== priceAsOf && <span className="text-ink-muted">(oldest; newest {fmtDate(priceNewest)})</span>}
       {staleDays > 3 && <Chip tone="warning">Stale · {staleDays} days old</Chip>}
     </span>
   ) : undefined;

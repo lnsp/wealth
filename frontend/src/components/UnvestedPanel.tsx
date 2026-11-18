@@ -76,7 +76,9 @@ export default function UnvestedPanel({ mode }: Props) {
       {data.accounts.map(acc => {
         const vests = acc.by_vest || [];
         const visibleVests = expanded ? vests : vests.slice(0, DEFAULT_ROWS);
-        const cur = (acc.current_price_currency || acc.currency || 'EUR').toUpperCase();
+        // Keep the currency's case: "GBp" (pence) must reach fmtMoney as-is so it is scaled to
+        // pounds; upper-casing it to "GBP" would show pence-priced RSUs 100× too high.
+        const cur = acc.current_price_currency || acc.currency || 'EUR';
 
         return (
           <div key={acc.account_id} className="mb-6 last:mb-0">
@@ -128,7 +130,7 @@ export default function UnvestedPanel({ mode }: Props) {
                     <th scope="col">Grant</th>
                     <th scope="col" className="num">Gross shares</th>
                     <th scope="col" className="num">Net shares (est.)</th>
-                    <th scope="col" className="num">Value (est.) · {cur}</th>
+                    <th scope="col" className="num">Value (est.) · {cur === 'GBp' || cur === 'GBX' ? 'GBP' : cur.toUpperCase()}</th>
                   </tr>
                 </thead>
                 <tbody>

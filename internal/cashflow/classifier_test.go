@@ -299,3 +299,21 @@ func TestAllCategoriesAreKnown(t *testing.T) {
 		}
 	}
 }
+
+func TestBankNameTransferExceptLoans(t *testing.T) {
+	if got := Classify("withdrawal", "DKB AG", "Umbuchung"); got != CatInternal {
+		t.Errorf("DKB transfer = %q, want internal", got)
+	}
+	if got := Classify("withdrawal", "DKB AG", "Darlehen 12345 Rate 11/2026"); BucketOf(got) == BucketTransfer {
+		t.Errorf("DKB loan instalment = %q, must not be hidden as a transfer", got)
+	}
+}
+
+func TestStateBenefitsAreIncome(t *testing.T) {
+	for _, cp := range []string{"Familienkasse", "Bundesagentur fuer Arbeit Kindergeld", "Elterngeldstelle Elterngeld"} {
+		got := Classify("deposit", cp, "")
+		if got != CatBenefits || BucketOf(got) != BucketIncome {
+			t.Errorf("Classify(deposit, %q) = %q (%s), want benefits in income", cp, got, BucketOf(got))
+		}
+	}
+}

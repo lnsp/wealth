@@ -177,7 +177,7 @@ Pages are assembled from these; do not hand-roll equivalents.
 
 ### Formatting (`frontend/src/utils/format.ts`)
 
-One locale: German numbers, English words. `fmtEUR`, `fmtMoney` (symbol for EUR, ISO code otherwise; cents only on single transactions and prices), `fmtPct` (decimal comma, sign on changes), `fmtQty` (≤4 decimals, with a unit word), `fmtDate` (`16.11.2026`, tables), `fmtDateLong` (`16 Nov 2026`, prose), `fmtMonth` / `fmtMonthShort` (`Nov ’26`, axes), `fmtAxis` (`340k`, `1,2M`), `labelFor` (enum → label). No `toFixed` or ad-hoc `toLocaleString` in components.
+One locale: German numbers, English words. `fmtEUR`, `fmtMoney` (symbol for EUR, ISO code otherwise; cents only on single transactions and prices), `fmtPct` (decimal comma, sign on changes), `fmtQty` (≤4 decimals, 4 significant digits below 1, with a unit word), `fmtDate` (`16.11.2026`, tables), `fmtDateLong` (`16 Nov 2026`, prose), `fmtMonth` / `fmtMonthShort` (`Nov ’26`, axes), `fmtAxis` (`340k`, `1,2M`), `labelFor` (enum → label). No `toFixed` or ad-hoc `toLocaleString` in components.
 
 Note: the `apple-*` prefix is legacy — these are heritage primitives now. Don't rename without sweeping all callers.
 

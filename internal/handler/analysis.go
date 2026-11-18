@@ -325,6 +325,7 @@ func (h *AnalysisHandler) loadEnrichedHoldings(ctx context.Context) ([]enrichedH
 	}
 
 	var result []enrichedHolding
+	var costs map[positionKey]*positionCost
 	for _, hold := range holdings {
 		sec, ok := secMap[hold.SecurityISIN]
 		if !ok {
@@ -338,8 +339,15 @@ func (h *AnalysisHandler) loadEnrichedHoldings(ctx context.Context) ([]enrichedH
 		if qty <= 0 {
 			continue
 		}
+		// EUR cost basis: moving-average cost with each purchase at the ECB
+		// rate of its own date (not today's rate on the trading currency).
 		costValue := 0.0
-		if hold.AvgCostBasis.Valid {
+		if costs == nil {
+			costs = loadPositionCosts(ctx, h.queries, newFXTable(loadHistoricalFXRates(ctx, h.queries), fxRates))
+		}
+		if pc := costs[positionKey{AccountID: hold.AccountID, ISIN: hold.SecurityISIN}]; pc != nil && pc.Qty > 0 {
+			costValue = qty * pc.AvgCostEUR()
+		} else if hold.AvgCostBasis.Valid {
 			f, _ := hold.AvgCostBasis.Float64Value()
 			costValue = qty * convertAmountToEUR(f.Float64, hold.Currency, fxRates)
 		}
@@ -2280,7 +2288,10 @@ func (h *AnalysisHandler) HandleCashFlow(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// HandleAllocationHistory computes monthly holding weight history.
+// HandleAllocationHistory computes monthly holding weight history: each
+// holding's share of the securities' market value at every month-end (and
+// today for the current month), valued at that day's price and ECB rate.
+// Months without transactions are included.
 func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	txns, err := listAllTransactionsRows(ctx, h.queries)
@@ -2292,13 +2303,16 @@ func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http
 		writeJSON(w, http.StatusOK, map[string]any{"history": []any{}, "holdings": []string{}})
 		return
 	}
-
-	fxRates := loadFXRatesMap(ctx, h.queries)
-	histFX := loadHistoricalFXRates(ctx, h.queries)
-
-	// Sort chronologically
-	for i, j := 0, len(txns)-1; i < j; i, j = i+1, j-1 {
-		txns[i], txns[j] = txns[j], txns[i]
+	accounts, err := h.queries.ListAccounts(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list accounts: "+err.Error())
+		return
+	}
+	var active []db.Account
+	for _, a := range accounts {
+		if a.IsActive {
+			active = append(active, a)
+		}
 	}
 
 	// Load security names and build collision-free display labels so sold
@@ -2323,94 +2337,41 @@ func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http
 		return name
 	}
 
-	type holdState struct{ qty, cost float64 }
-	holdings := make(map[string]*holdState)
+	chrono := chronological(txns)
+	isinSet := make(map[string]bool)
+	for _, t := range chrono {
+		if t.SecurityISIN.Valid {
+			isinSet[t.SecurityISIN.String] = true
+		}
+	}
+	isins := make([]string, 0, len(isinSet))
+	for isin := range isinSet {
+		isins = append(isins, isin)
+	}
+	series := buildValuationSeries(valuationRequest{
+		Txns:     chrono,
+		Accounts: active,
+		Prices:   loadPriceBook(ctx, h.queries, isins),
+		FX:       loadFXTable(ctx, h.queries),
+		End:      civilDay(time.Now()),
+		ByISIN:   true,
+		Emit:     isMonthEnd,
+	})
 
 	type snapshot struct {
 		Date    string             `json:"date"`
 		Weights map[string]float64 `json:"weights"`
 	}
 	snapshots := []snapshot{}
-	lastMonth := ""
-
-	emitSnapshot := func(date string) {
-		totalValue := 0.0
-		for _, hs := range holdings {
-			if hs.qty > 1e-9 && hs.cost > 0 {
-				totalValue += hs.cost
+	for _, p := range series {
+		weights := allocationWeights(p.ByISIN, labelForISIN)
+		if weights == nil {
+			if len(snapshots) == 0 {
+				continue // nothing held yet
 			}
+			weights = map[string]float64{} // a month with nothing held
 		}
-		if totalValue <= 0 {
-			return
-		}
-		weights := make(map[string]float64)
-		var sum float64
-		var largestKey string
-		var largestWeight float64
-		for isin, hs := range holdings {
-			if hs.qty > 1e-9 && hs.cost > 0 {
-				label := labelForISIN(isin)
-				w := math.Round((hs.cost/totalValue)*1000) / 10
-				weights[label] += w
-				sum += w
-				if weights[label] > largestWeight {
-					largestWeight = weights[label]
-					largestKey = label
-				}
-			}
-		}
-		if largestKey != "" && sum != 100 {
-			weights[largestKey] += math.Round((100-sum)*10) / 10
-		}
-		snapshots = append(snapshots, snapshot{Date: date, Weights: weights})
-	}
-
-	for _, txn := range txns {
-		isin := ""
-		if txn.SecurityISIN.Valid {
-			isin = txn.SecurityISIN.String
-		}
-		amt, qty := 0.0, 0.0
-		if txn.Amount.Valid {
-			f, _ := txn.Amount.Float64Value()
-			amt = convertAmountToEURAtDate(f.Float64, txn.Currency, txn.Date, histFX, fxRates)
-		}
-		if txn.Quantity.Valid {
-			f, _ := txn.Quantity.Float64Value()
-			qty = f.Float64
-		}
-
-		month := txn.Date.Format("2006-01")
-		if month != lastMonth && lastMonth != "" {
-			emitSnapshot(lastMonth + "-01")
-		}
-		lastMonth = month
-
-		if isin == "" {
-			continue
-		}
-		switch txn.Type {
-		case "buy", "savings_plan", "transfer":
-			hs := holdings[isin]
-			if hs == nil {
-				hs = &holdState{}
-				holdings[isin] = hs
-			}
-			hs.qty += qty
-			hs.cost += amt
-		case "sell", "transfer_out":
-			if hs := holdings[isin]; hs != nil && hs.qty > 0 {
-				costPer := hs.cost / hs.qty
-				hs.qty -= qty
-				hs.cost -= costPer * qty
-				if hs.qty <= 1e-9 {
-					delete(holdings, isin)
-				}
-			}
-		}
-	}
-	if lastMonth != "" {
-		emitSnapshot(lastMonth + "-01")
+		snapshots = append(snapshots, snapshot{Date: p.Date.Format("2006-01-02"), Weights: weights})
 	}
 
 	holdingSet := make(map[string]bool)
@@ -2425,7 +2386,48 @@ func (h *AnalysisHandler) HandleAllocationHistory(w http.ResponseWriter, r *http
 	}
 	sort.Strings(holdingNames)
 
-	writeJSON(w, http.StatusOK, map[string]any{"history": snapshots, "holdings": holdingNames})
+	writeJSON(w, http.StatusOK, map[string]any{"history": snapshots, "holdings": holdingNames, "basis": "market_value"})
+}
+
+// allocationWeights turns EUR values per ISIN into % weights per label,
+// rounded to 0.1 with the rounding remainder on the largest weight so they
+// add up to exactly 100. nil when nothing is held.
+func allocationWeights(valueByISIN map[string]float64, label func(string) string) map[string]float64 {
+	total := 0.0
+	for _, v := range valueByISIN {
+		if v > 0 {
+			total += v
+		}
+	}
+	if total <= 0 {
+		return nil
+	}
+	weights := make(map[string]float64)
+	var sum, largestWeight float64
+	var largestKey string
+	keys := make([]string, 0, len(valueByISIN))
+	for isin := range valueByISIN {
+		keys = append(keys, isin)
+	}
+	sort.Strings(keys)
+	for _, isin := range keys {
+		v := valueByISIN[isin]
+		if v <= 0 {
+			continue
+		}
+		l := label(isin)
+		w := math.Round((v/total)*1000) / 10
+		weights[l] += w
+		sum += w
+		if weights[l] > largestWeight {
+			largestWeight = weights[l]
+			largestKey = l
+		}
+	}
+	if largestKey != "" && math.Abs(sum-100) > 1e-9 {
+		weights[largestKey] = math.Round((weights[largestKey]+100-sum)*10) / 10
+	}
+	return weights
 }
 
 // HandleExportTaxReport generates a CSV tax report for a given year: the tax
@@ -2907,124 +2909,136 @@ func benchmarkInsufficientResponse(isin, name string, have int) map[string]any {
 	}
 }
 
-// HandleHealthScore computes a 0-100 portfolio health score from existing metrics.
-func (h *AnalysisHandler) HandleHealthScore(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	enriched, err := h.loadEnrichedHoldings(ctx)
-	if err != nil || len(enriched) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"score": 0, "subscores": []any{}})
-		return
+// healthSubScore is one component of the Portfolio Health score.
+type healthSubScore struct {
+	Name   string `json:"name"`
+	Score  int    `json:"score"`
+	Weight int    `json:"weight"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+}
+
+// healthInputs are the measured facts the health score is built from.
+type healthInputs struct {
+	ValueByISIN map[string]float64 // EUR market value per ISIN, all accounts
+	AssetClass  map[string]string  // ISIN → asset class
+	WeightedTER float64            // value-weighted TER, %
+	// Risk: Sharpe ratio and volatility of the investable (cash + securities)
+	// series; HasRisk false when the series is too short.
+	HasRisk    bool
+	Sharpe     float64
+	Volatility float64
+	Targets    map[string]float64 // target allocation, % (may be empty)
+	// DividendMonths counts months with a dividend in the trailing 24 months.
+	DividendMonths int
+}
+
+// isDiversifiedFund reports whether one position already spreads over many
+// issuers (an ETF or fund), so it must not count as a single holding.
+func isDiversifiedFund(assetClass string) bool {
+	return assetClass == "etf" || assetClass == "fund"
+}
+
+func healthStatus(score int) string {
+	if score >= 80 {
+		return "good"
+	}
+	if score >= 60 {
+		return "fair"
+	}
+	return "poor"
+}
+
+// computeHealthScore returns the 0–100 composite (the weight-averaged
+// sub-scores, rounded) and the five sub-scores.
+//
+//   - Diversification counts a fund as ten holdings and measures the largest
+//     single-issuer position (shares, crypto, …) rather than the largest
+//     ISIN, so one all-world ETF is diversified and one stock is not.
+//   - Allocation uses allocationMaxDrift, the same definition as the
+//     allocation view (untargeted holdings have target 0).
+//   - Income rises monotonically with the months that paid a dividend in the
+//     trailing 24; a portfolio without payouts (accumulating funds) keeps the
+//     neutral 70 and is never scored below one that pays rarely.
+func computeHealthScore(in healthInputs) (int, []healthSubScore) {
+	total := 0.0
+	for _, v := range in.ValueByISIN {
+		total += v
 	}
 
-	type subScore struct {
-		Name   string `json:"name"`
-		Score  int    `json:"score"`
-		Weight int    `json:"weight"`
-		Status string `json:"status"`
-		Detail string `json:"detail"`
-	}
-
-	// 1. Diversification (25%) — aggregate multi-account positions by ISIN
-	valByISIN := make(map[string]float64)
-	totalValue := 0.0
-	for _, eh := range enriched {
-		totalValue += eh.value
-		valByISIN[eh.security.ISIN] += eh.value
-	}
-	maxWeight := 0.0
-	if totalValue > 0 {
-		for _, v := range valByISIN {
-			w := v / totalValue * 100
-			if w > maxWeight {
-				maxWeight = w
-			}
+	// 1. Diversification (25 %)
+	effective := 0
+	funds, singles := 0, 0
+	largestSingle := 0.0
+	for isin, v := range in.ValueByISIN {
+		if v <= 0 {
+			continue
+		}
+		if isDiversifiedFund(in.AssetClass[isin]) {
+			funds++
+			effective += 10
+			continue
+		}
+		singles++
+		effective++
+		if total > 0 && v/total*100 > largestSingle {
+			largestSingle = v / total * 100
 		}
 	}
-	numHoldings := len(valByISIN)
 	divScore := 50
-	if numHoldings >= 5 {
+	if effective >= 5 {
 		divScore = 70
 	}
-	if numHoldings >= 8 {
+	if effective >= 8 {
 		divScore = 85
 	}
-	if maxWeight < 40 {
+	if largestSingle < 40 {
 		divScore += 15
 	}
-	if maxWeight < 25 {
+	if largestSingle < 25 {
 		divScore += 10
 	}
 	if divScore > 100 {
 		divScore = 100
 	}
-	divDetail := fmt.Sprintf("%d holdings, max weight %.0f%%", numHoldings, maxWeight)
+	divDetail := fmt.Sprintf("%d funds, %d single holdings; largest single holding %.0f%%", funds, singles, largestSingle)
 
-	// 2. Cost Efficiency (15%) — based on weighted avg TER
-	weightedTER := 0.0
-	if totalValue > 0 {
-		for _, eh := range enriched {
-			ter := numericToFloat(eh.security.TER)
-			if ter > 0 {
-				weightedTER += (eh.value / totalValue) * ter
-			}
-		}
-	}
+	// 2. Cost Efficiency (15 %) — value-weighted TER
 	costScore := 90
-	if weightedTER > 0.10 {
+	if in.WeightedTER > 0.10 {
 		costScore = 80
 	}
-	if weightedTER > 0.20 {
+	if in.WeightedTER > 0.20 {
 		costScore = 65
 	}
-	if weightedTER > 0.40 {
+	if in.WeightedTER > 0.40 {
 		costScore = 40
 	}
-	costDetail := fmt.Sprintf("Weighted TER %.2f%%", weightedTER)
+	costDetail := fmt.Sprintf("Weighted TER %.2f%%", in.WeightedTER)
 
-	// 3. Risk Balance (20%) — based on cashflow-adjusted Sharpe ratio
-	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 3000)
-	points := make([]analytics.DailyValuation, 0, len(snaps))
-	for i := len(snaps) - 1; i >= 0; i-- {
-		val := 0.0
-		if snaps[i].Total.Valid {
-			f, _ := snaps[i].Total.Float64Value()
-			val = f.Float64
-		}
-		if val > 0 {
-			points = append(points, analytics.DailyValuation{Date: snaps[i].Date, Value: val})
-		}
-	}
+	// 3. Risk Balance (20 %) — Sharpe ratio
 	riskScore := 50
 	riskDetail := "insufficient data"
-	if len(points) > 60 {
-		adjustedPoints := analytics.BuildCashflowAdjustedSeries(points, h.buildExternalFlowsForRisk(ctx))
-		metrics := analytics.ComputeRiskMetrics(adjustedPoints, 0.03, points[len(points)-1].Value)
-		sharpe := metrics.SharpeRatio
-		if sharpe >= 1.0 {
+	if in.HasRisk {
+		switch {
+		case in.Sharpe >= 1.0:
 			riskScore = 95
-		} else if sharpe >= 0.5 {
+		case in.Sharpe >= 0.5:
 			riskScore = 80
-		} else if sharpe >= 0 {
+		case in.Sharpe >= 0:
 			riskScore = 60
-		} else {
+		default:
 			riskScore = 30
 		}
-		riskDetail = fmt.Sprintf("Sharpe %.2f, Vol %.1f%%", sharpe, metrics.AnnualizedVolatility)
+		riskDetail = fmt.Sprintf("Sharpe %.2f, Vol %.1f%%", in.Sharpe, in.Volatility)
 	}
 
-	// 4. Allocation Discipline (25%) — score based on max drift if targets set
+	// 4. Allocation Discipline (25 %) — max drift if targets set
 	allocScore := 75 // default when no targets
 	allocDetail := "no targets set"
-	targets, _ := h.queries.ListTargetAllocations(ctx)
-	if len(targets) > 0 && totalValue > 0 {
-		maxDrift := 0.0
-		for _, t := range targets {
-			actual := valByISIN[t.SecurityISIN] / totalValue * 100
-			drift := math.Abs(actual - numericToFloat(t.TargetWeightPct))
-			if drift > maxDrift {
-				maxDrift = drift
-			}
-		}
+	if norm, _, _ := normalisedTargets(in.Targets); len(norm) > 0 && total > 0 {
+		// Rounded to 0.1 like the allocation view shows it.
+		maxDrift := math.Round(math.Abs(allocationMaxDrift(in.ValueByISIN, in.Targets))*10) / 10
 		allocScore = 95
 		if maxDrift > 2 {
 			allocScore = 80
@@ -3038,39 +3052,102 @@ func (h *AnalysisHandler) HandleHealthScore(w http.ResponseWriter, r *http.Reque
 		allocDetail = fmt.Sprintf("max drift %.1f%%", maxDrift)
 	}
 
-	// 5. Income Stability (15%) — based on dividend consistency
+	// 5. Income Stability (15 %) — months with dividends, trailing 24
 	incScore := 70
-	incDetail := "no dividend data"
-	txns, _ := listAllTransactionsRows(ctx, h.queries)
-	divMonths := make(map[string]bool)
-	for _, txn := range txns {
-		if txn.Type == "dividend" {
-			divMonths[txn.Date.Format("2006-01")] = true
+	incDetail := "no dividends in the last 24 months"
+	if in.DividendMonths > 0 {
+		switch {
+		case in.DividendMonths >= 24:
+			incScore = 95
+		case in.DividendMonths >= 12:
+			incScore = 90
+		case in.DividendMonths >= 6:
+			incScore = 80
 		}
-	}
-	if len(divMonths) > 0 {
-		incScore = 50
-		if len(divMonths) >= 6 { incScore = 70 }
-		if len(divMonths) >= 12 { incScore = 85 }
-		if len(divMonths) >= 24 { incScore = 95 }
-		incDetail = fmt.Sprintf("%d months with dividends", len(divMonths))
+		incDetail = fmt.Sprintf("%d of the last 24 months with dividends", in.DividendMonths)
 	}
 
-	scores := []subScore{
+	scores := []healthSubScore{
 		{Name: "Diversification", Score: divScore, Weight: 25, Detail: divDetail},
 		{Name: "Cost Efficiency", Score: costScore, Weight: 15, Detail: costDetail},
 		{Name: "Risk Balance", Score: riskScore, Weight: 20, Detail: riskDetail},
 		{Name: "Allocation", Score: allocScore, Weight: 25, Detail: allocDetail},
 		{Name: "Income", Score: incScore, Weight: 15, Detail: incDetail},
 	}
-
-	total := 0
+	weighted, weights := 0.0, 0
 	for i := range scores {
-		total += scores[i].Score * scores[i].Weight
-		if scores[i].Score >= 80 { scores[i].Status = "good" } else if scores[i].Score >= 60 { scores[i].Status = "fair" } else { scores[i].Status = "poor" }
+		scores[i].Status = healthStatus(scores[i].Score)
+		weighted += float64(scores[i].Score * scores[i].Weight)
+		weights += scores[i].Weight
 	}
-	composite := total / 100
+	composite := 0
+	if weights > 0 {
+		composite = int(math.Round(weighted / float64(weights)))
+	}
+	return composite, scores
+}
 
+// HandleHealthScore computes a 0-100 portfolio health score from existing metrics.
+func (h *AnalysisHandler) HandleHealthScore(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	enriched, err := h.loadEnrichedHoldings(ctx)
+	if err != nil || len(enriched) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"score": 0, "subscores": []any{}})
+		return
+	}
+
+	in := healthInputs{
+		ValueByISIN: make(map[string]float64),
+		AssetClass:  make(map[string]string),
+		Targets:     make(map[string]float64),
+	}
+	totalValue := 0.0
+	for _, eh := range enriched {
+		totalValue += eh.value
+		in.ValueByISIN[eh.security.ISIN] += eh.value
+		in.AssetClass[eh.security.ISIN] = eh.security.AssetClass
+	}
+	if totalValue > 0 {
+		for _, eh := range enriched {
+			if ter := numericToFloat(eh.security.TER); ter > 0 {
+				in.WeightedTER += (eh.value / totalValue) * ter
+			}
+		}
+	}
+
+	// Risk on the investable series (cash + securities): the house, the car
+	// and the mortgage are not part of the portfolio's risk.
+	// Same series, flows and risk-free rate as the Risk tab, so the two agree.
+	snaps, _ := h.queries.ListNetWorthSnapshots(ctx, 3000)
+	points := investableRiskSeries(snaps)
+	if len(points) > 60 {
+		adjustedPoints := analytics.BuildCashflowAdjustedSeries(points, h.buildInvestableFlowsForRisk(ctx))
+		riskFreeRate := 0.0
+		if prepared := analytics.PrepareRiskSeries(adjustedPoints); len(prepared) >= 2 {
+			riskFreeRate = analytics.AverageRiskFreeRate(prepared[0].Date, prepared[len(prepared)-1].Date)
+		}
+		metrics := analytics.ComputeRiskMetrics(adjustedPoints, riskFreeRate, points[len(points)-1].Value)
+		in.HasRisk = true
+		in.Sharpe = metrics.SharpeRatio
+		in.Volatility = metrics.AnnualizedVolatility
+	}
+
+	targets, _ := h.queries.ListTargetAllocations(ctx)
+	for _, t := range targets {
+		in.Targets[t.SecurityISIN] = numericToFloat(t.TargetWeightPct)
+	}
+
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
+	cutoff := time.Now().AddDate(-2, 0, 0)
+	divMonths := make(map[string]bool)
+	for _, txn := range txns {
+		if txn.Type == "dividend" && txn.Date.After(cutoff) {
+			divMonths[txn.Date.Format("2006-01")] = true
+		}
+	}
+	in.DividendMonths = len(divMonths)
+
+	composite, scores := computeHealthScore(in)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"score":     composite,
 		"subscores": scores,

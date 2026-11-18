@@ -21,18 +21,27 @@ interface Props {
 
 /**
  * Currency facts the holdings API guarantees:
- *  - `current_price` is in `price_currency`, `avg_cost_basis` per share in `currency` (trading currency);
- *  - `market_value`, `unrealized_pl` and `value_eur` are EUR.
- * The EUR cost basis is therefore market value minus EUR gain for priced rows; for unpriced rows
- * `value_eur` already is the EUR cost. Gain % always divides EUR by EUR.
+ *  - `current_price` is in `price_currency`;
+ *  - `avg_cost_paid` is per unit in `avg_cost_currency`, the currency the units were paid in;
+ *  - `market_value`, `unrealized_pl`, `value_eur`, `cost_basis_eur` and `avg_cost_eur` are EUR, the
+ *    cost at each purchase date's ECB rate (so the gain includes currency moves since purchase).
+ * For unpriced rows `value_eur` is the EUR cost. Gain % always divides EUR by EUR.
  */
 function eurFigures(h: HoldingRow) {
   const priced = h.market_value != null && h.unrealized_pl != null;
   const value = h.market_value ?? h.value_eur;
   const gain = priced ? (h.unrealized_pl as number) : null;
-  const cost = gain != null ? value - gain : h.value_eur;
+  const cost = h.cost_basis_eur ?? (gain != null ? value - gain : h.value_eur);
   const gainPct = gain != null && cost > 0 ? (gain / cost) * 100 : null;
   return { value, gain, cost, gainPct };
+}
+
+/**
+ * Concentration is a property of the security, not of one account's row: two 20 % rows of the
+ * same ISIN are a 40 % position. Falls back to the row weight for older responses.
+ */
+function concentrationPct(h: HoldingRow): number | null {
+  return h.isin_weight_pct ?? h.weight_pct;
 }
 
 function toneClass(n: number | null): string {
@@ -63,8 +72,9 @@ function Chevron({ open }: { open: boolean }) {
 }
 
 /** Percent label, bar on a fixed-width track, and — below the bar — the concentration chip. */
-function WeightCell({ pct }: { pct: number | null }) {
+function WeightCell({ pct, isinPct, multiAccount }: { pct: number | null; isinPct: number | null; multiAccount: boolean }) {
   if (pct == null) return <span className="text-ink-muted">—</span>;
+  const across = multiAccount && isinPct != null && Math.abs(isinPct - pct) >= 0.05;
   return (
     <>
       <div className="flex items-center gap-2">
@@ -73,8 +83,10 @@ function WeightCell({ pct }: { pct: number | null }) {
           <span className="block h-full bg-forest" style={{ width: `${Math.max(0, Math.min(pct, 100))}%` }} />
         </span>
       </div>
-      {pct > CONCENTRATION_LIMIT_PCT && (
-        <Chip tone="warning" className="mt-1.5">Over {CONCENTRATION_LIMIT_PCT} % limit</Chip>
+      {isinPct != null && isinPct > CONCENTRATION_LIMIT_PCT && (
+        <Chip tone="warning" className="mt-1.5">
+          {across ? `${fmtPct(isinPct)} across accounts · over ${CONCENTRATION_LIMIT_PCT} % limit` : `Over ${CONCENTRATION_LIMIT_PCT} % limit`}
+        </Chip>
       )}
     </>
   );
@@ -85,8 +97,8 @@ function RowFacts({ h }: { h: HoldingRow }) {
   const facts: { label: string; value: ReactNode }[] = [
     { label: 'Account', value: h.account_name || '—' },
     { label: 'Asset class', value: `${labelFor(h.asset_class)}${h.symbol ? ` · ${h.symbol}` : ''}` },
-    { label: 'Cost basis', value: <span data-privacy="blur">{fmtEUR(eurFigures(h).cost)}</span> },
-    { label: 'Dividends received', value: <span data-privacy="blur">{fmtMoney(h.total_dividends, h.currency, { cents: true })}</span> },
+    { label: 'Cost basis · average cost', value: <span data-privacy="blur">{fmtEUR(eurFigures(h).cost)}</span> },
+    { label: 'Dividends received · gross', value: <span data-privacy="blur">{fmtEUR(h.dividends_eur ?? 0, { cents: true })}</span> },
   ];
   if (h.fx_impact_pct != null) {
     facts.push({
@@ -156,19 +168,23 @@ export default function HoldingsTable({ holdings, expandedKey, onToggle, detail 
     );
   };
 
+  // Average cost in the currency it was paid in; in EUR when purchases mixed currencies.
   const priceLines = (h: HoldingRow) => {
     const priceCurrency = h.price_currency || h.currency || 'EUR';
+    const avgCost = h.avg_cost_paid != null && h.avg_cost_currency
+      ? fmtMoney(h.avg_cost_paid, h.avg_cost_currency, { cents: true })
+      : fmtEUR(h.avg_cost_eur ?? eurFigures(h).cost / (h.quantity || 1), { cents: true });
     return {
       price: h.current_price != null ? fmtMoney(h.current_price, priceCurrency, { cents: true }) : null,
-      avgCost: fmtMoney(h.avg_cost_basis, h.currency || 'EUR', { cents: true }),
+      avgCost,
     };
   };
 
   const footnote = (
     <p className="mt-3 text-[12px] text-ink-muted">
-      Gain % is the EUR gain divided by the EUR cost basis. Value and cost of holdings in another currency are both
-      converted at the latest ECB reference rate, so gain % reflects the price change in the trading currency and
-      not currency movement since purchase.
+      Average cost is shown in the currency you paid. Cost basis is the average purchase cost in EUR, each purchase
+      converted at the ECB rate of its date; value uses today’s price and rate, so gain and gain % include currency
+      movement since purchase. Tax is worked out first in, first out, which can differ after partial sales.
       {unpriced > 0 && ` ${unpriced} ${unpriced === 1 ? 'holding has' : 'holdings have'} no market price and ${unpriced === 1 ? 'is' : 'are'} shown at cost.`}
     </p>
   );
@@ -204,7 +220,7 @@ export default function HoldingsTable({ holdings, expandedKey, onToggle, detail 
                     )}
                   </div>
                 </div>
-                <div className="mt-2 text-[13px]"><WeightCell pct={h.weight_pct} /></div>
+                <div className="mt-2 text-[13px]"><WeightCell pct={h.weight_pct} isinPct={concentrationPct(h)} multiAccount={multiAccount} /></div>
                 {open && (
                   <div id={detailId} className="mt-3 pt-3 border-t border-divider">
                     <RowFacts h={h} />
@@ -282,7 +298,7 @@ export default function HoldingsTable({ holdings, expandedKey, onToggle, detail 
                       </div>
                     ) : <span className="text-ink-muted">—</span>}
                   </td>
-                  <td className="!p-2 !border-b !border-divider"><WeightCell pct={h.weight_pct} /></td>
+                  <td className="!p-2 !border-b !border-divider"><WeightCell pct={h.weight_pct} isinPct={concentrationPct(h)} multiAccount={multiAccount} /></td>
                 </tr>
                 {open && (
                   <tr id={detailId} className={bg}>

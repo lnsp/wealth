@@ -12,8 +12,12 @@ import (
 	db "github.com/lnsp/wealth/internal/database/generated"
 )
 
-func resolveTxnCategoryBucket(override, txType, cp, ref string) string {
-	return string(cashflow.BucketOf(cashflow.ResolveCategory(override, txType, cp, ref)))
+// resolveTxnCategoryBucket buckets a row the way the Cashflow page does
+// (account-aware classification, then the sign rule for money in/out), so a
+// drill-through from a Cashflow bucket lists exactly the rows behind it.
+func resolveTxnCategoryBucket(env cashflow.Env, override, txType, cp, ref string, cashDelta float64) string {
+	cat := cashflow.ResolveCategoryWith(env, override, txType, cp, ref)
+	return string(cashflow.BucketOf(cashflow.ForCashDelta(cat, cashDelta, override != "")))
 }
 
 type TransactionsHandler struct {
@@ -101,6 +105,23 @@ func (h *TransactionsHandler) HandleList(w http.ResponseWriter, r *http.Request)
 		}
 		allTxns = h.filterTxnsByUser(r.Context(), allTxns)
 
+		var accountTypes map[uuid.UUID]string
+		var ownIBANs []string
+		if categoryGroup != "" {
+			accounts, err := h.queries.ListAllAccounts(r.Context())
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "list accounts: "+err.Error())
+				return
+			}
+			accountTypes = make(map[uuid.UUID]string, len(accounts))
+			for _, a := range accounts {
+				accountTypes[a.ID] = a.Type
+				if a.IBAN.Valid && a.IBAN.String != "" {
+					ownIBANs = append(ownIBANs, a.IBAN.String)
+				}
+			}
+		}
+
 		var filtered []db.ListTransactionsRow
 		for _, t := range allTxns {
 			if hasAccountFilter && t.AccountID != accountUUID {
@@ -123,7 +144,10 @@ func (h *TransactionsHandler) HandleList(w http.ResponseWriter, r *http.Request)
 				if t.Category.Valid {
 					ov = t.Category.String
 				}
-				cat := resolveTxnCategoryBucket(ov, t.Type, cp, ref)
+				env := cashflow.Env{AccountType: accountTypes[t.AccountID], OwnIBANs: ownIBANs}
+				delta := txnSignedCashDelta(t.Type, t.SecurityISIN.Valid && t.SecurityISIN.String != "",
+					numericToFloat(t.Amount), numericToFloat(t.Fee), numericToFloat(t.Tax))
+				cat := resolveTxnCategoryBucket(env, ov, t.Type, cp, ref, delta)
 				if cat != categoryGroup {
 					continue
 				}

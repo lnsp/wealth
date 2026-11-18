@@ -6,163 +6,102 @@ import (
 	"time"
 )
 
-// trailing12m mirrors the windowed sum HandleDividends computes: amounts of
-// transactions with Type == "dividend" whose date is strictly after the
-// 12-month cutoff. prior12m is the matching [24m, 12m] window, used for the
-// YoY growth metric.
-func trailing12m(dividends []dividendTxn, now time.Time) (trailing, prior float64) {
-	cutoff12 := now.AddDate(-1, 0, 0)
-	cutoff24 := now.AddDate(-2, 0, 0)
-	for _, d := range dividends {
-		if d.Date.After(cutoff12) {
-			trailing += d.Amount
-		} else if d.Date.After(cutoff24) {
-			prior += d.Amount
-		}
-	}
-	return
-}
+// These tests drive summarizeDividends, the function HandleDividends uses.
+// They used to exercise local copies of the formulas; the cumulative copy
+// pinned the old behaviour of ignoring reversals, which the 2026-11-18 audit
+// flagged (the line must be the running net sum).
 
-// yieldOnCost mirrors HandleDividends: (trailing 12m dividends / total cost
-// basis of held positions) × 100. Returns 0 when there's no cost basis to
-// divide by.
-func yieldOnCost(trailing, costBasis float64) float64 {
-	if costBasis <= 0 {
-		return 0
+func payout(date string, gross float64) dividendPayment {
+	d, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		panic(err)
 	}
-	return trailing / costBasis * 100
-}
-
-type dividendTxn struct {
-	Date   time.Time
-	Amount float64
+	return dividendPayment{Date: d, ISIN: "DE000XYZ0001", Gross: gross, Net: gross, QtyHeld: 10}
 }
 
 func TestTrailing12m_WindowBoundaries(t *testing.T) {
 	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
-	dividends := []dividendTxn{
-		// Inside trailing 12m window (after 2025-05-18).
-		{Date: time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC), Amount: 120},
-		{Date: time.Date(2025, 11, 30, 0, 0, 0, 0, time.UTC), Amount: 80},
-		// At the exact 12m cutoff — strict After excludes this row.
-		{Date: time.Date(2025, 5, 18, 12, 0, 0, 0, time.UTC), Amount: 99},
+	s := summarizeDividends([]dividendPayment{
+		// Inside trailing 12m window (after 2025-05-18 12:00).
+		payout("2026-04-15", 120),
+		payout("2025-11-30", 80),
+		// Midnight of the cutoff day is before the 12:00 cutoff: prior window.
+		payout("2025-05-18", 99),
 		// Inside [24m, 12m] prior window.
-		{Date: time.Date(2025, 3, 15, 0, 0, 0, 0, time.UTC), Amount: 60},
-		{Date: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC), Amount: 50},
+		payout("2025-03-15", 60),
+		payout("2024-06-01", 50),
 		// Older than 24m — excluded from both windows.
-		{Date: time.Date(2023, 11, 1, 0, 0, 0, 0, time.UTC), Amount: 200},
-	}
+		payout("2023-11-01", 200),
+	}, map[string]float64{"DE000XYZ0001": 10}, nil, now)
 
-	trail, prior := trailing12m(dividends, now)
-
-	if math.Abs(trail-200) > 0.01 {
-		t.Errorf("trailing12m = %.2f, want 200 (120 + 80; the row at cutoff is excluded by strict After)", trail)
+	if math.Abs(s.Trailing12m-200) > 0.01 {
+		t.Errorf("trailing12m = %.2f, want 200 (120 + 80)", s.Trailing12m)
 	}
-	// The row at the exact 12m cutoff falls through to the prior window because
-	// After(cutoff12m) is strict (== returns false) but After(cutoff24m) is true.
-	// This is the handler's actual behaviour — locking it here so any tweak to
-	// the cutoff comparison surfaces in CI.
-	if math.Abs(prior-209) > 0.01 {
-		t.Errorf("prior12m = %.2f, want 209 (60 + 50 + the 99 at cutoff that falls through)", prior)
+	if math.Abs(s.Prior12m-209) > 0.01 {
+		t.Errorf("prior12m = %.2f, want 209 (99 + 60 + 50)", s.Prior12m)
+	}
+	if s.Growth == nil || math.Abs(*s.Growth-(200-209)/209.0*100) > 1e-9 {
+		t.Errorf("growth = %v, want %.4f", s.Growth, (200-209)/209.0*100)
 	}
 }
 
 func TestTrailing12m_EmptyAndAllOld(t *testing.T) {
 	now := time.Date(2026, 5, 18, 0, 0, 0, 0, time.UTC)
-	trail, prior := trailing12m(nil, now)
-	if trail != 0 || prior != 0 {
-		t.Errorf("empty: trail=%.2f prior=%.2f, want 0 0", trail, prior)
+	s := summarizeDividends(nil, nil, nil, now)
+	if s.Trailing12m != 0 || s.Prior12m != 0 || s.Growth != nil {
+		t.Errorf("empty: trail=%.2f prior=%.2f growth=%v, want 0 0 nil", s.Trailing12m, s.Prior12m, s.Growth)
+	}
+	if s.Monthly == nil || s.Yearly == nil || s.Cumulative == nil || s.Calendar == nil {
+		t.Error("empty series must be [] in JSON, not null")
 	}
 
-	old := []dividendTxn{{Date: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), Amount: 500}}
-	trail, prior = trailing12m(old, now)
-	if trail != 0 || prior != 0 {
-		t.Errorf("all-old: trail=%.2f prior=%.2f, want 0 0", trail, prior)
+	s = summarizeDividends([]dividendPayment{payout("2020-01-01", 500)}, nil, nil, now)
+	if s.Trailing12m != 0 || s.Prior12m != 0 {
+		t.Errorf("all-old: trail=%.2f prior=%.2f, want 0 0", s.Trailing12m, s.Prior12m)
+	}
+	if s.Growth != nil {
+		t.Errorf("growth with no prior-year payouts = %v, want nil (shown as —)", *s.Growth)
 	}
 }
 
-func TestYieldOnCost_Formula(t *testing.T) {
-	// 200 € trailing dividends on a 10_000 € cost basis = 2.00%
-	got := yieldOnCost(200, 10000)
-	if math.Abs(got-2.0) > 0.001 {
-		t.Errorf("YoC(200, 10000) = %.4f, want 2.0", got)
-	}
-	// Zero cost basis returns 0 (no dividing by zero).
-	if got := yieldOnCost(200, 0); got != 0 {
-		t.Errorf("YoC(200, 0) = %.4f, want 0", got)
-	}
-	if got := yieldOnCost(200, -50); got != 0 {
-		t.Errorf("YoC(200, -50) = %.4f, want 0 (negative cost basis is nonsensical)", got)
+func TestYieldOnCost_OnlyHeldISINs(t *testing.T) {
+	// Dividends from a position sold since are not part of the yield on the
+	// current holdings' cost.
+	now := time.Date(2026, 5, 18, 0, 0, 0, 0, time.UTC)
+	sold := payout("2026-03-01", 300)
+	sold.ISIN = "SOLD"
+	s := summarizeDividends([]dividendPayment{payout("2026-04-01", 200), sold}, map[string]float64{"DE000XYZ0001": 10}, nil, now)
+	if s.Trailing12m != 500 || s.Trailing12mHeld != 200 {
+		t.Errorf("trailing %.0f held %.0f, want 500 / 200", s.Trailing12m, s.Trailing12mHeld)
 	}
 }
 
-func TestYieldOnCost_RealisticHighYielder(t *testing.T) {
-	// Single-stock REIT-style example: 5% yield on 50_000 cost basis = 2500
-	// trailing dividends. Reversing gives YoC = 5%.
-	got := yieldOnCost(2500, 50000)
-	if math.Abs(got-5.0) > 0.001 {
-		t.Errorf("YoC(2500, 50000) = %.4f, want 5.0", got)
-	}
-}
-
-// monthlyAmount mirrors the chart's monthly series — each month's net
-// dividend total (can be negative on a reversal). cumulativeNonDecreasing
-// mirrors HandleDividends's cumulative builder: only positive monthly
-// amounts roll forward, so the line is guaranteed monotonic.
-type monthlyAmount struct {
-	Month  string
-	Amount float64
-}
-
-func cumulativeNonDecreasing(monthly []monthlyAmount) []float64 {
-	cum := 0.0
-	out := make([]float64, 0, len(monthly))
-	for _, m := range monthly {
-		if m.Amount > 0 {
-			cum += m.Amount
-		}
-		out = append(out, cum)
-	}
-	return out
-}
-
-func TestCumulativeDividends_AlwaysMonotonicNonDecreasing(t *testing.T) {
-	cases := [][]monthlyAmount{
-		// Normal: every month positive.
-		{{"2024-01", 50}, {"2024-02", 75}, {"2024-03", 30}},
-		// Empty.
-		{},
-		// All zero.
-		{{"2024-01", 0}, {"2024-02", 0}},
-		// Reversal mid-stream (rare correction).
-		{{"2024-01", 50}, {"2024-02", -20}, {"2024-03", 30}},
-		// Reversal at the start (broken import).
-		{{"2024-01", -10}, {"2024-02", 40}, {"2024-03", 25}},
-		// Multiple reversals.
-		{{"2024-01", 100}, {"2024-02", -50}, {"2024-03", -10}, {"2024-04", 60}},
-	}
-	for i, c := range cases {
-		got := cumulativeNonDecreasing(c)
-		for j := 1; j < len(got); j++ {
-			if got[j] < got[j-1] {
-				t.Errorf("case %d step %d: cum=%.2f < prev=%.2f (monthly=%+v)", i, j, got[j], got[j-1], c)
-			}
-		}
-	}
-}
-
-func TestCumulativeDividends_ReversalIsHeldFlat(t *testing.T) {
-	// 50 in Jan, -20 in Feb (a reversal). The Feb amount is preserved in
-	// the bar chart, but the cumulative stays at 50 (doesn't drop to 30).
-	monthly := []monthlyAmount{{"2024-01", 50}, {"2024-02", -20}, {"2024-03", 30}}
-	got := cumulativeNonDecreasing(monthly)
-	want := []float64{50, 50, 80}
-	if len(got) != len(want) {
-		t.Fatalf("len(got)=%d, want %d", len(got), len(want))
+func TestCumulativeDividends_IsRunningNetSum(t *testing.T) {
+	now := time.Date(2024, 4, 10, 0, 0, 0, 0, time.UTC)
+	// 50 in Jan, a −20 reversal in Feb, nothing in March, 30 in April.
+	s := summarizeDividends([]dividendPayment{
+		payout("2024-01-15", 50), payout("2024-02-15", -20), payout("2024-04-05", 30),
+	}, nil, nil, now)
+	want := []float64{50, 30, 30, 60}
+	if len(s.Cumulative) != len(want) {
+		t.Fatalf("cumulative has %d months, want %d (zero months filled)", len(s.Cumulative), len(want))
 	}
 	for i := range want {
-		if math.Abs(got[i]-want[i]) > 0.01 {
-			t.Errorf("step %d: cum=%.2f, want %.2f", i, got[i], want[i])
+		if math.Abs(s.Cumulative[i].Cumulative-want[i]) > 0.01 {
+			t.Errorf("month %s: cum=%.2f, want %.2f", s.Cumulative[i].Month, s.Cumulative[i].Cumulative, want[i])
 		}
+	}
+	if s.Monthly[2].Month != "2024-03" || s.Monthly[2].Amount != 0 {
+		t.Errorf("March must be present with 0, got %+v", s.Monthly[2])
+	}
+	monthly, yearly := 0.0, 0.0
+	for _, m := range s.Monthly {
+		monthly += m.Amount
+	}
+	for _, y := range s.Yearly {
+		yearly += y.Amount
+	}
+	if math.Abs(monthly-yearly) > 0.01 || math.Abs(monthly-s.Total) > 0.01 {
+		t.Errorf("monthly %.2f, yearly %.2f, total %.2f must agree", monthly, yearly, s.Total)
 	}
 }

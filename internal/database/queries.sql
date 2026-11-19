@@ -706,3 +706,82 @@ WHERE report_type = $1 AND period_label = $2;
 -- (e.g. a broker-abbreviated ETF stored as a stock). Only updates while the
 -- class is still the one the caller saw.
 UPDATE securities SET asset_class = $2 WHERE isin = $1 AND asset_class = $3;
+
+-- name: GetPlanningProfile :one
+SELECT * FROM planning_profile WHERE id = true;
+
+-- name: UpsertPlanningProfile :one
+INSERT INTO planning_profile (
+    id, birth_year, retirement_age, children, church_rate, health_kind,
+    gkv_zusatzbeitrag, pkv_premium_monthly, pkv_basic_share, savings_mode,
+    running_costs_monthly, savings_rate, rsu_count_full, inflation,
+    wage_growth, share_drift, usd_per_eur, updated_at
+)
+VALUES (true, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
+ON CONFLICT (id) DO UPDATE SET
+    birth_year = EXCLUDED.birth_year,
+    retirement_age = EXCLUDED.retirement_age,
+    children = EXCLUDED.children,
+    church_rate = EXCLUDED.church_rate,
+    health_kind = EXCLUDED.health_kind,
+    gkv_zusatzbeitrag = EXCLUDED.gkv_zusatzbeitrag,
+    pkv_premium_monthly = EXCLUDED.pkv_premium_monthly,
+    pkv_basic_share = EXCLUDED.pkv_basic_share,
+    savings_mode = EXCLUDED.savings_mode,
+    running_costs_monthly = EXCLUDED.running_costs_monthly,
+    savings_rate = EXCLUDED.savings_rate,
+    rsu_count_full = EXCLUDED.rsu_count_full,
+    inflation = EXCLUDED.inflation,
+    wage_growth = EXCLUDED.wage_growth,
+    share_drift = EXCLUDED.share_drift,
+    usd_per_eur = EXCLUDED.usd_per_eur,
+    updated_at = now()
+RETURNING *;
+
+-- name: ListIncomeStreams :many
+SELECT * FROM income_streams ORDER BY created_at, id;
+
+-- name: GetIncomeStream :one
+SELECT * FROM income_streams WHERE id = $1;
+
+-- name: CreateIncomeStream :one
+INSERT INTO income_streams (
+    kind, name, currency, amount, growth, month, payout_factor, vest_months,
+    vest_every, cliff_months, account_id, first_year, start_date, end_date
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+RETURNING *;
+
+-- name: UpdateIncomeStream :one
+UPDATE income_streams SET
+    name = $2, currency = $3, amount = $4, growth = $5, month = $6,
+    payout_factor = $7, vest_months = $8, vest_every = $9, cliff_months = $10,
+    account_id = $11, first_year = $12, start_date = $13, end_date = $14
+WHERE id = $1
+RETURNING *;
+
+-- name: DeleteIncomeStream :exec
+DELETE FROM income_streams WHERE id = $1;
+
+-- name: ListIncomeStreamSteps :many
+SELECT * FROM income_stream_steps ORDER BY stream_id, effective_date;
+
+-- name: DeleteIncomeStreamSteps :exec
+DELETE FROM income_stream_steps WHERE stream_id = $1;
+
+-- name: InsertIncomeStreamStep :exec
+INSERT INTO income_stream_steps (stream_id, effective_date, amount)
+VALUES ($1, $2, $3);
+
+-- name: UpsertRSUGrant :exec
+-- Unvested rows carry the real grant number; the first import that lists a
+-- grant fixes when it was first seen.
+INSERT INTO rsu_grants (account_id, grant_number, first_seen_on, last_seen_on, first_vest_date, last_vest_date)
+VALUES ($1, $2, $3, $3, $4, $5)
+ON CONFLICT (account_id, grant_number) DO UPDATE SET
+    last_seen_on = GREATEST(rsu_grants.last_seen_on, EXCLUDED.last_seen_on),
+    first_vest_date = LEAST(rsu_grants.first_vest_date, EXCLUDED.first_vest_date),
+    last_vest_date = GREATEST(rsu_grants.last_vest_date, EXCLUDED.last_vest_date);
+
+-- name: ListRSUGrants :many
+SELECT * FROM rsu_grants ORDER BY first_vest_date, grant_number;

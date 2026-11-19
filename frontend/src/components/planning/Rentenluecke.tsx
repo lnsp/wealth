@@ -63,7 +63,7 @@ function isPensionResult(body: unknown): body is PensionResult {
 export default function Rentenluecke() {
   const {
     pensionCurrentAge, pensionAge, pensionNeed, setPensionNeed, pensionContrib, setPensionContrib, pensionSources, setPensionSources,
-    projReturn, projData, fireSWR, fireInflation, crChildren, churchRate, joint,
+    projReturn, projData, fireSWR, fireInflation, crChildren, churchRate, joint, contribSource,
   } = usePlanning();
   const tc = useThemeColors();
   const [confirm, confirmDialog] = useConfirm();
@@ -98,7 +98,7 @@ export default function Rentenluecke() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sources: pensionSources, retirement_age: pensionAge, monthly_need: pensionNeed, current_age: pensionCurrentAge,
-          monthly_contrib: toNum(pensionContrib), return_pct: returnPct, swr, inflation_pct: inflation,
+          monthly_contrib: toNum(pensionContrib), source: contribSource, return_pct: returnPct, swr, inflation_pct: inflation,
           children: Math.max(0, Math.round(toNum(crChildren))), church_rate: churchRate, joint,
         }),
       });

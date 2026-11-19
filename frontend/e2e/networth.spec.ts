@@ -238,9 +238,24 @@ test.describe('Net Worth page', () => {
     await expect(page.getByText('German inheritance tax')).toBeVisible();
   });
 
-  test('displays FIRE calculator on Planning page', async ({ page }) => {
-    // Navigate to Planning page — FIRE & Retirement is the default tab
+  test('opens Planning on the Income tab', async ({ page }) => {
     await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('link', { name: 'Planning', exact: true }).click();
+    await expect(page.getByRole('tab', { name: 'Income' })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('heading', { name: 'Expected income' })).toBeVisible();
+  });
+
+  test('income API returns a schedule', async ({ request }) => {
+    const resp = await request.get('/api/planning/income');
+    expect(resp.ok()).toBeTruthy();
+    const data = await resp.json();
+    expect(typeof data.has_income).toBe('boolean');
+    expect(Array.isArray(data.months)).toBeTruthy();
+    expect(data.profile).toHaveProperty('health_kind');
+  });
+
+  test('displays FIRE calculator on Planning page', async ({ page }) => {
+    await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('link', { name: 'Planning', exact: true }).click();
+    await page.getByRole('tab', { name: 'FIRE & Retirement' }).click();
     await expect(page.getByRole('tab', { name: 'FIRE & Retirement' })).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByRole('heading', { name: 'FIRE Calculator' })).toBeVisible();
     await expect(page.getByRole('textbox', { name: 'Annual expenses' })).toBeVisible();

@@ -330,6 +330,71 @@ func (q *Queries) CreateFinancialGoal(ctx context.Context, arg CreateFinancialGo
 	return i, err
 }
 
+const createIncomeStream = `-- name: CreateIncomeStream :one
+INSERT INTO income_streams (
+    kind, name, currency, amount, growth, month, payout_factor, vest_months,
+    vest_every, cliff_months, account_id, first_year, start_date, end_date
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+RETURNING id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at
+`
+
+type CreateIncomeStreamParams struct {
+	Kind         string         `json:"kind"`
+	Name         string         `json:"name"`
+	Currency     string         `json:"currency"`
+	Amount       pgtype.Numeric `json:"amount"`
+	Growth       pgtype.Numeric `json:"growth"`
+	Month        pgtype.Int4    `json:"month"`
+	PayoutFactor pgtype.Numeric `json:"payout_factor"`
+	VestMonths   pgtype.Int4    `json:"vest_months"`
+	VestEvery    pgtype.Int4    `json:"vest_every"`
+	CliffMonths  int32          `json:"cliff_months"`
+	AccountID    *uuid.UUID     `json:"account_id"`
+	FirstYear    pgtype.Int4    `json:"first_year"`
+	StartDate    time.Time      `json:"start_date"`
+	EndDate      pgtype.Date    `json:"end_date"`
+}
+
+func (q *Queries) CreateIncomeStream(ctx context.Context, arg CreateIncomeStreamParams) (IncomeStream, error) {
+	row := q.db.QueryRow(ctx, createIncomeStream,
+		arg.Kind,
+		arg.Name,
+		arg.Currency,
+		arg.Amount,
+		arg.Growth,
+		arg.Month,
+		arg.PayoutFactor,
+		arg.VestMonths,
+		arg.VestEvery,
+		arg.CliffMonths,
+		arg.AccountID,
+		arg.FirstYear,
+		arg.StartDate,
+		arg.EndDate,
+	)
+	var i IncomeStream
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Name,
+		&i.Currency,
+		&i.Amount,
+		&i.Growth,
+		&i.Month,
+		&i.PayoutFactor,
+		&i.VestMonths,
+		&i.VestEvery,
+		&i.CliffMonths,
+		&i.AccountID,
+		&i.FirstYear,
+		&i.StartDate,
+		&i.EndDate,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createJournalEntry = `-- name: CreateJournalEntry :one
 INSERT INTO decision_journal (action_type, security_isin, amount, reason)
 VALUES ($1, $2, $3, $4)
@@ -648,6 +713,24 @@ DELETE FROM financial_goals WHERE id = $1
 
 func (q *Queries) DeleteFinancialGoal(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteFinancialGoal, id)
+	return err
+}
+
+const deleteIncomeStream = `-- name: DeleteIncomeStream :exec
+DELETE FROM income_streams WHERE id = $1
+`
+
+func (q *Queries) DeleteIncomeStream(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteIncomeStream, id)
+	return err
+}
+
+const deleteIncomeStreamSteps = `-- name: DeleteIncomeStreamSteps :exec
+DELETE FROM income_stream_steps WHERE stream_id = $1
+`
+
+func (q *Queries) DeleteIncomeStreamSteps(ctx context.Context, streamID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteIncomeStreamSteps, streamID)
 	return err
 }
 
@@ -977,6 +1060,34 @@ func (q *Queries) GetFirstTransactionDate(ctx context.Context) (time.Time, error
 	return date, err
 }
 
+const getIncomeStream = `-- name: GetIncomeStream :one
+SELECT id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at FROM income_streams WHERE id = $1
+`
+
+func (q *Queries) GetIncomeStream(ctx context.Context, id uuid.UUID) (IncomeStream, error) {
+	row := q.db.QueryRow(ctx, getIncomeStream, id)
+	var i IncomeStream
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Name,
+		&i.Currency,
+		&i.Amount,
+		&i.Growth,
+		&i.Month,
+		&i.PayoutFactor,
+		&i.VestMonths,
+		&i.VestEvery,
+		&i.CliffMonths,
+		&i.AccountID,
+		&i.FirstYear,
+		&i.StartDate,
+		&i.EndDate,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getLatestExchangeRate = `-- name: GetLatestExchangeRate :one
 SELECT rate, date FROM exchange_rates
 WHERE currency = $1
@@ -1036,6 +1147,36 @@ func (q *Queries) GetLoan(ctx context.Context, id uuid.UUID) (Loan, error) {
 		&i.ExtraAllowancePct,
 		&i.PaymentAccountID,
 		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getPlanningProfile = `-- name: GetPlanningProfile :one
+SELECT id, birth_year, retirement_age, children, church_rate, health_kind, gkv_zusatzbeitrag, pkv_premium_monthly, pkv_basic_share, savings_mode, running_costs_monthly, savings_rate, rsu_count_full, inflation, wage_growth, share_drift, usd_per_eur, updated_at FROM planning_profile WHERE id = true
+`
+
+func (q *Queries) GetPlanningProfile(ctx context.Context) (PlanningProfile, error) {
+	row := q.db.QueryRow(ctx, getPlanningProfile)
+	var i PlanningProfile
+	err := row.Scan(
+		&i.ID,
+		&i.BirthYear,
+		&i.RetirementAge,
+		&i.Children,
+		&i.ChurchRate,
+		&i.HealthKind,
+		&i.GkvZusatzbeitrag,
+		&i.PkvPremiumMonthly,
+		&i.PkvBasicShare,
+		&i.SavingsMode,
+		&i.RunningCostsMonthly,
+		&i.SavingsRate,
+		&i.RsuCountFull,
+		&i.Inflation,
+		&i.WageGrowth,
+		&i.ShareDrift,
+		&i.UsdPerEur,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -1274,6 +1415,22 @@ func (q *Queries) InsertImportHistory(ctx context.Context, arg InsertImportHisto
 		arg.Updated,
 		arg.RsuVests,
 	)
+	return err
+}
+
+const insertIncomeStreamStep = `-- name: InsertIncomeStreamStep :exec
+INSERT INTO income_stream_steps (stream_id, effective_date, amount)
+VALUES ($1, $2, $3)
+`
+
+type InsertIncomeStreamStepParams struct {
+	StreamID      uuid.UUID      `json:"stream_id"`
+	EffectiveDate time.Time      `json:"effective_date"`
+	Amount        pgtype.Numeric `json:"amount"`
+}
+
+func (q *Queries) InsertIncomeStreamStep(ctx context.Context, arg InsertIncomeStreamStepParams) error {
+	_, err := q.db.Exec(ctx, insertIncomeStreamStep, arg.StreamID, arg.EffectiveDate, arg.Amount)
 	return err
 }
 
@@ -2243,6 +2400,76 @@ func (q *Queries) ListImportHistory(ctx context.Context, arg ListImportHistoryPa
 	return items, nil
 }
 
+const listIncomeStreamSteps = `-- name: ListIncomeStreamSteps :many
+SELECT id, stream_id, effective_date, amount FROM income_stream_steps ORDER BY stream_id, effective_date
+`
+
+func (q *Queries) ListIncomeStreamSteps(ctx context.Context) ([]IncomeStreamStep, error) {
+	rows, err := q.db.Query(ctx, listIncomeStreamSteps)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []IncomeStreamStep{}
+	for rows.Next() {
+		var i IncomeStreamStep
+		if err := rows.Scan(
+			&i.ID,
+			&i.StreamID,
+			&i.EffectiveDate,
+			&i.Amount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listIncomeStreams = `-- name: ListIncomeStreams :many
+SELECT id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at FROM income_streams ORDER BY created_at, id
+`
+
+func (q *Queries) ListIncomeStreams(ctx context.Context) ([]IncomeStream, error) {
+	rows, err := q.db.Query(ctx, listIncomeStreams)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []IncomeStream{}
+	for rows.Next() {
+		var i IncomeStream
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Name,
+			&i.Currency,
+			&i.Amount,
+			&i.Growth,
+			&i.Month,
+			&i.PayoutFactor,
+			&i.VestMonths,
+			&i.VestEvery,
+			&i.CliffMonths,
+			&i.AccountID,
+			&i.FirstYear,
+			&i.StartDate,
+			&i.EndDate,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listJournalEntries = `-- name: ListJournalEntries :many
 SELECT id, date, action_type, security_isin, amount, reason, outcome, outcome_date, created_at FROM decision_journal ORDER BY date DESC LIMIT $1
 `
@@ -2678,6 +2905,37 @@ func (q *Queries) ListPriceIndexPoints(ctx context.Context) ([]PriceIndexPoint, 
 	for rows.Next() {
 		var i PriceIndexPoint
 		if err := rows.Scan(&i.Series, &i.Period, &i.Value); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRSUGrants = `-- name: ListRSUGrants :many
+SELECT account_id, grant_number, first_seen_on, last_seen_on, first_vest_date, last_vest_date FROM rsu_grants ORDER BY first_vest_date, grant_number
+`
+
+func (q *Queries) ListRSUGrants(ctx context.Context) ([]RsuGrant, error) {
+	rows, err := q.db.Query(ctx, listRSUGrants)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RsuGrant{}
+	for rows.Next() {
+		var i RsuGrant
+		if err := rows.Scan(
+			&i.AccountID,
+			&i.GrantNumber,
+			&i.FirstSeenOn,
+			&i.LastSeenOn,
+			&i.FirstVestDate,
+			&i.LastVestDate,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -3469,6 +3727,71 @@ func (q *Queries) UpdateFinancialGoal(ctx context.Context, arg UpdateFinancialGo
 	return err
 }
 
+const updateIncomeStream = `-- name: UpdateIncomeStream :one
+UPDATE income_streams SET
+    name = $2, currency = $3, amount = $4, growth = $5, month = $6,
+    payout_factor = $7, vest_months = $8, vest_every = $9, cliff_months = $10,
+    account_id = $11, first_year = $12, start_date = $13, end_date = $14
+WHERE id = $1
+RETURNING id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at
+`
+
+type UpdateIncomeStreamParams struct {
+	ID           uuid.UUID      `json:"id"`
+	Name         string         `json:"name"`
+	Currency     string         `json:"currency"`
+	Amount       pgtype.Numeric `json:"amount"`
+	Growth       pgtype.Numeric `json:"growth"`
+	Month        pgtype.Int4    `json:"month"`
+	PayoutFactor pgtype.Numeric `json:"payout_factor"`
+	VestMonths   pgtype.Int4    `json:"vest_months"`
+	VestEvery    pgtype.Int4    `json:"vest_every"`
+	CliffMonths  int32          `json:"cliff_months"`
+	AccountID    *uuid.UUID     `json:"account_id"`
+	FirstYear    pgtype.Int4    `json:"first_year"`
+	StartDate    time.Time      `json:"start_date"`
+	EndDate      pgtype.Date    `json:"end_date"`
+}
+
+func (q *Queries) UpdateIncomeStream(ctx context.Context, arg UpdateIncomeStreamParams) (IncomeStream, error) {
+	row := q.db.QueryRow(ctx, updateIncomeStream,
+		arg.ID,
+		arg.Name,
+		arg.Currency,
+		arg.Amount,
+		arg.Growth,
+		arg.Month,
+		arg.PayoutFactor,
+		arg.VestMonths,
+		arg.VestEvery,
+		arg.CliffMonths,
+		arg.AccountID,
+		arg.FirstYear,
+		arg.StartDate,
+		arg.EndDate,
+	)
+	var i IncomeStream
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Name,
+		&i.Currency,
+		&i.Amount,
+		&i.Growth,
+		&i.Month,
+		&i.PayoutFactor,
+		&i.VestMonths,
+		&i.VestEvery,
+		&i.CliffMonths,
+		&i.AccountID,
+		&i.FirstYear,
+		&i.StartDate,
+		&i.EndDate,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const updateJournalOutcome = `-- name: UpdateJournalOutcome :exec
 UPDATE decision_journal SET outcome = $2, outcome_date = NOW() WHERE id = $1
 `
@@ -3838,6 +4161,97 @@ func (q *Queries) UpsertNetWorthSnapshot(ctx context.Context, arg UpsertNetWorth
 	return err
 }
 
+const upsertPlanningProfile = `-- name: UpsertPlanningProfile :one
+INSERT INTO planning_profile (
+    id, birth_year, retirement_age, children, church_rate, health_kind,
+    gkv_zusatzbeitrag, pkv_premium_monthly, pkv_basic_share, savings_mode,
+    running_costs_monthly, savings_rate, rsu_count_full, inflation,
+    wage_growth, share_drift, usd_per_eur, updated_at
+)
+VALUES (true, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
+ON CONFLICT (id) DO UPDATE SET
+    birth_year = EXCLUDED.birth_year,
+    retirement_age = EXCLUDED.retirement_age,
+    children = EXCLUDED.children,
+    church_rate = EXCLUDED.church_rate,
+    health_kind = EXCLUDED.health_kind,
+    gkv_zusatzbeitrag = EXCLUDED.gkv_zusatzbeitrag,
+    pkv_premium_monthly = EXCLUDED.pkv_premium_monthly,
+    pkv_basic_share = EXCLUDED.pkv_basic_share,
+    savings_mode = EXCLUDED.savings_mode,
+    running_costs_monthly = EXCLUDED.running_costs_monthly,
+    savings_rate = EXCLUDED.savings_rate,
+    rsu_count_full = EXCLUDED.rsu_count_full,
+    inflation = EXCLUDED.inflation,
+    wage_growth = EXCLUDED.wage_growth,
+    share_drift = EXCLUDED.share_drift,
+    usd_per_eur = EXCLUDED.usd_per_eur,
+    updated_at = now()
+RETURNING id, birth_year, retirement_age, children, church_rate, health_kind, gkv_zusatzbeitrag, pkv_premium_monthly, pkv_basic_share, savings_mode, running_costs_monthly, savings_rate, rsu_count_full, inflation, wage_growth, share_drift, usd_per_eur, updated_at
+`
+
+type UpsertPlanningProfileParams struct {
+	BirthYear           pgtype.Int4    `json:"birth_year"`
+	RetirementAge       int32          `json:"retirement_age"`
+	Children            int32          `json:"children"`
+	ChurchRate          pgtype.Numeric `json:"church_rate"`
+	HealthKind          string         `json:"health_kind"`
+	GkvZusatzbeitrag    pgtype.Numeric `json:"gkv_zusatzbeitrag"`
+	PkvPremiumMonthly   pgtype.Numeric `json:"pkv_premium_monthly"`
+	PkvBasicShare       pgtype.Numeric `json:"pkv_basic_share"`
+	SavingsMode         string         `json:"savings_mode"`
+	RunningCostsMonthly pgtype.Numeric `json:"running_costs_monthly"`
+	SavingsRate         pgtype.Numeric `json:"savings_rate"`
+	RsuCountFull        bool           `json:"rsu_count_full"`
+	Inflation           pgtype.Numeric `json:"inflation"`
+	WageGrowth          pgtype.Numeric `json:"wage_growth"`
+	ShareDrift          pgtype.Numeric `json:"share_drift"`
+	UsdPerEur           pgtype.Numeric `json:"usd_per_eur"`
+}
+
+func (q *Queries) UpsertPlanningProfile(ctx context.Context, arg UpsertPlanningProfileParams) (PlanningProfile, error) {
+	row := q.db.QueryRow(ctx, upsertPlanningProfile,
+		arg.BirthYear,
+		arg.RetirementAge,
+		arg.Children,
+		arg.ChurchRate,
+		arg.HealthKind,
+		arg.GkvZusatzbeitrag,
+		arg.PkvPremiumMonthly,
+		arg.PkvBasicShare,
+		arg.SavingsMode,
+		arg.RunningCostsMonthly,
+		arg.SavingsRate,
+		arg.RsuCountFull,
+		arg.Inflation,
+		arg.WageGrowth,
+		arg.ShareDrift,
+		arg.UsdPerEur,
+	)
+	var i PlanningProfile
+	err := row.Scan(
+		&i.ID,
+		&i.BirthYear,
+		&i.RetirementAge,
+		&i.Children,
+		&i.ChurchRate,
+		&i.HealthKind,
+		&i.GkvZusatzbeitrag,
+		&i.PkvPremiumMonthly,
+		&i.PkvBasicShare,
+		&i.SavingsMode,
+		&i.RunningCostsMonthly,
+		&i.SavingsRate,
+		&i.RsuCountFull,
+		&i.Inflation,
+		&i.WageGrowth,
+		&i.ShareDrift,
+		&i.UsdPerEur,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const upsertPriceIndexPoint = `-- name: UpsertPriceIndexPoint :one
 INSERT INTO price_index_points (series, period, value) VALUES ($1, $2, $3)
 ON CONFLICT (series, period) DO UPDATE SET value = EXCLUDED.value
@@ -3857,6 +4271,36 @@ func (q *Queries) UpsertPriceIndexPoint(ctx context.Context, arg UpsertPriceInde
 	var series string
 	err := row.Scan(&series)
 	return series, err
+}
+
+const upsertRSUGrant = `-- name: UpsertRSUGrant :exec
+INSERT INTO rsu_grants (account_id, grant_number, first_seen_on, last_seen_on, first_vest_date, last_vest_date)
+VALUES ($1, $2, $3, $3, $4, $5)
+ON CONFLICT (account_id, grant_number) DO UPDATE SET
+    last_seen_on = GREATEST(rsu_grants.last_seen_on, EXCLUDED.last_seen_on),
+    first_vest_date = LEAST(rsu_grants.first_vest_date, EXCLUDED.first_vest_date),
+    last_vest_date = GREATEST(rsu_grants.last_vest_date, EXCLUDED.last_vest_date)
+`
+
+type UpsertRSUGrantParams struct {
+	AccountID     uuid.UUID `json:"account_id"`
+	GrantNumber   string    `json:"grant_number"`
+	FirstSeenOn   time.Time `json:"first_seen_on"`
+	FirstVestDate time.Time `json:"first_vest_date"`
+	LastVestDate  time.Time `json:"last_vest_date"`
+}
+
+// Unvested rows carry the real grant number; the first import that lists a
+// grant fixes when it was first seen.
+func (q *Queries) UpsertRSUGrant(ctx context.Context, arg UpsertRSUGrantParams) error {
+	_, err := q.db.Exec(ctx, upsertRSUGrant,
+		arg.AccountID,
+		arg.GrantNumber,
+		arg.FirstSeenOn,
+		arg.FirstVestDate,
+		arg.LastVestDate,
+	)
+	return err
 }
 
 const upsertSecurity = `-- name: UpsertSecurity :exec

@@ -177,10 +177,12 @@ export const BAV_MIN_SUBSIDY_ANNUAL = BAV_MIN_EMPLOYER_SUBSIDY * BAV_SV_FREE_202
 // ── Human capital ───────────────────────────────────────────────────────────
 
 /** Present value of `years` of gross income: year 1 earns `income`, then it grows by `growth`, discounted at `discount`. */
-export function humanCapitalPV(income: number, growth: number, discount: number, years: number, fromYear = 0): number {
+/** `incomes` (gross per year, from the income schedule) replaces income × growth when given. */
+export function humanCapitalPV(income: number, growth: number, discount: number, years: number, fromYear = 0, incomes?: number[]): number {
   let pv = 0;
   for (let r = fromYear + 1; r <= years; r++) {
-    pv += income * Math.pow(1 + growth, r - 1) / Math.pow(1 + discount, r - fromYear);
+    const earned = incomes ? (incomes[r - 1] ?? 0) : income * Math.pow(1 + growth, r - 1);
+    pv += earned / Math.pow(1 + discount, r - fromYear);
   }
   return pv;
 }
@@ -191,12 +193,14 @@ export type CapitalPoint = { yearIndex: number; human: number; financial: number
 export function humanCapitalCrossover(p: {
   income: number; growth: number; discount: number; years: number;
   startWealth: number; monthlyContrib: number; portfolioGrowth: number;
+  /** Gross pay and savings per year from the income schedule; replace income × growth and the flat budget. */
+  incomes?: number[]; savings?: number[];
 }): { series: CapitalPoint[]; crossoverIndex: number | null } {
   const series: CapitalPoint[] = [];
   let fin = p.startWealth;
   for (let y = 0; y <= p.years; y++) {
-    series.push({ yearIndex: y, human: humanCapitalPV(p.income, p.growth, p.discount, p.years, y), financial: fin });
-    fin = (fin + p.monthlyContrib * 12) * (1 + p.portfolioGrowth);
+    series.push({ yearIndex: y, human: humanCapitalPV(p.income, p.growth, p.discount, p.years, y, p.incomes), financial: fin });
+    fin = (fin + (p.savings ? (p.savings[y] ?? 0) : p.monthlyContrib * 12)) * (1 + p.portfolioGrowth);
   }
   const hit = series.find(d => d.financial >= d.human);
   return { series, crossoverIndex: hit ? hit.yearIndex : null };
@@ -377,3 +381,10 @@ export function statutoryAnnual(points: number, claimAge: number): number {
 
 /** Combined flat rate on capital income for display (e.g. 26,375 % → "26,4 %"). */
 export const FLAT_RATE_NO_CHURCH = ABGELTUNGSTEUER * (1 + SOLI_RATE);
+
+/** Gross pay and savings per full year from the income schedule, starting with the first full year. */
+export function scheduleByYear(income: { has_income: boolean; years: { months: number; payroll: { gross: number }; savings: number }[] } | null): { incomes?: number[]; savings?: number[] } {
+  if (!income?.has_income) return {};
+  const full = income.years.filter(y => y.months === 12);
+  return { incomes: full.map(y => y.payroll.gross), savings: full.map(y => y.savings) };
+}

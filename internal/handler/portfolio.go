@@ -1940,6 +1940,8 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 			contribGrowth = v / 100
 		}
 	}
+	plan, source, income := h.projectionPlan(ctx, now, q.Get("source"), q.Get("contribution") != "", monthlyContrib, trailing.Monthly, contribGrowth)
+	monthlyContrib = plan.firstYearAverage()
 
 	monthlyReturn := planMonthlyRate(annualReturn)
 	maxMonths := horizonYears * 12
@@ -2010,7 +2012,7 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 
 	for m := 0; m <= maxMonths; m++ {
 		if m > 0 {
-			projMedian = math.Max(0, projMedian*(1+monthlyReturn)+contribForMonth(monthlyContrib, contribGrowth, m))
+			projMedian = math.Max(0, projMedian*(1+monthlyReturn)+plan.at(m))
 		}
 
 		// Confidence bands: log-normal spread around projMedian so growing
@@ -2036,15 +2038,11 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Sensitivity analysis: vary one parameter at a time, project to end.
-	// planProjectFV uses the same contribution timing as the chart.
-	projectFV := func(cv, mc, ar float64, months int) float64 {
-		return math.Max(0, planProjectFV(cv, mc, ar, contribGrowth, months))
+	// projectPlanFV uses the same contribution timing as the chart.
+	projectFV := func(cv float64, c contributionPlan, ar float64, months int) float64 {
+		return math.Max(0, projectPlanFV(cv, c, ar, months))
 	}
-	baselineFV := projectFV(currentValue, monthlyContrib, annualReturn, maxMonths)
-	lowContrib := monthlyContrib - 500
-	if monthlyContrib >= 0 {
-		lowContrib = math.Max(lowContrib, 0)
-	}
+	baselineFV := projectFV(currentValue, plan, annualReturn, maxMonths)
 
 	type sensitivityBar struct {
 		Label string  `json:"label"`
@@ -2055,20 +2053,20 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 	sensitivity := []sensitivityBar{
 		{
 			Label: "Return rate",
-			Low:   math.Round(projectFV(currentValue, monthlyContrib, math.Max(annualReturn-3, 0), maxMonths)),
-			High:  math.Round(projectFV(currentValue, monthlyContrib, annualReturn+3, maxMonths)),
+			Low:   math.Round(projectFV(currentValue, plan, math.Max(annualReturn-3, 0), maxMonths)),
+			High:  math.Round(projectFV(currentValue, plan, annualReturn+3, maxMonths)),
 			Base:  math.Round(baselineFV),
 		},
 		{
 			Label: "Monthly contribution",
-			Low:   math.Round(projectFV(currentValue, lowContrib, annualReturn, maxMonths)),
-			High:  math.Round(projectFV(currentValue, monthlyContrib+500, annualReturn, maxMonths)),
+			Low:   math.Round(projectFV(currentValue, plan.shifted(-500), annualReturn, maxMonths)),
+			High:  math.Round(projectFV(currentValue, plan.shifted(500), annualReturn, maxMonths)),
 			Base:  math.Round(baselineFV),
 		},
 		{
 			Label: "Starting value",
-			Low:   math.Round(projectFV(currentValue*0.8, monthlyContrib, annualReturn, maxMonths)),
-			High:  math.Round(projectFV(currentValue*1.2, monthlyContrib, annualReturn, maxMonths)),
+			Low:   math.Round(projectFV(currentValue*0.8, plan, annualReturn, maxMonths)),
+			High:  math.Round(projectFV(currentValue*1.2, plan, annualReturn, maxMonths)),
 			Base:  math.Round(baselineFV),
 		},
 	}
@@ -2093,15 +2091,8 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 		if months > maxMonths {
 			break
 		}
-		fv := projectFV(currentValue, monthlyContrib, annualReturn, months)
-		// Sum of contribForMonth over y years: monthlyContrib*12 per year,
-		// growing by g each year → monthlyContrib*12*((1+g)^y − 1)/g.
-		var totalDeposits float64
-		if contribGrowth > 0 {
-			totalDeposits = monthlyContrib * 12 * (math.Pow(1+contribGrowth, float64(y)) - 1) / contribGrowth
-		} else {
-			totalDeposits = monthlyContrib * float64(months)
-		}
+		fv := projectFV(currentValue, plan, annualReturn, months)
+		totalDeposits := plan.total(months)
 		growth := fv - currentValue - totalDeposits
 		realValue := fv / math.Pow(1+analytics.PlanningDefaultInflationPct/100, float64(y))
 		milestones = append(milestones, milestone{
@@ -2118,6 +2109,7 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 	// FIRE: accumulate until the portfolio covers the tax-grossed-up spending
 	// gap at the withdrawal rate, then draw an inflation-indexed withdrawal.
 	var drawdown map[string]any
+	postFireHealth := 0.0
 	annualExpenses := 0.0
 	if e := q.Get("expenses"); e != "" {
 		if v, err := parseFiniteFloat(e); err == nil && v > 0 && v <= 1e9 {
@@ -2127,8 +2119,9 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 	if annualExpenses > 0 {
 		fp := fireParams{
 			CurrentValue:   currentValue,
-			MonthlyContrib: monthlyContrib,
-			ContribGrowth:  contribGrowth,
+			MonthlyContrib: plan.Monthly,
+			ContribGrowth:  plan.Growth,
+			Schedule:       plan.Schedule,
 			AnnualReturn:   annualReturn / 100,
 			Inflation:      analytics.PlanningDefaultInflationPct / 100,
 			Expenses:       annualExpenses,
@@ -2170,6 +2163,10 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 		fp.TaxRate = analytics.CapitalIncomeTaxRate(churchRate)
 		fp.TFS = h.portfolioTFS(ctx, fxRates)
 		fp.Allowance = analytics.SparerPauschbetragForYear(now.Year(), joint)
+		if q.Get("post_fire_health") == "1" && income != nil {
+			postFireHealth = income.postFireHealth(fp, now)
+			fp.Health = postFireHealth
+		}
 		drawdown = fireDrawdownJSON(fp, simulateFIRE(fp, now), now)
 	}
 
@@ -2227,6 +2224,9 @@ func (h *PortfolioHandler) HandleProjection(w http.ResponseWriter, r *http.Reque
 		"target_date":          targetDate,
 		"target_goal_name":     targetGoalName,
 		"contribution":         monthlyContrib,
+		"contribution_source":  source,
+		"has_income":           income != nil && income.hasIncome(),
+		"post_fire_health":     math.Round(postFireHealth),
 		"default_contribution": math.Round(trailing.Monthly*100) / 100,
 		"contribution_basis": map[string]any{
 			"kind":           "trailing_12m_net",
@@ -3378,11 +3378,13 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 		DurationMonths int     `json:"duration_months"` // how long recurring costs last (0 = permanent)
 		TaxImpact      float64 `json:"tax_impact"`      // one-time tax (positive = tax due, negative = benefit)
 		Label          string  `json:"label"`           // display name
+		StopsContrib   bool    `json:"stops_contributions"`
 	}
 
 	var req struct {
 		Events       []lifeEvent `json:"events"`
 		Contribution *float64    `json:"contribution"`
+		Source       string      `json:"source"`
 		ReturnPct    *float64    `json:"return_pct"`
 		Expenses     float64     `json:"expenses"`
 		SWR          float64     `json:"swr"`
@@ -3423,12 +3425,13 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 	txns, _ := listAllTransactionsRows(ctx, h.queries)
 	now := time.Now()
 
-	monthlyContrib := 0.0
+	custom := 0.0
 	if req.Contribution != nil {
-		monthlyContrib = *req.Contribution
-	} else {
-		monthlyContrib = trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates, h.physicalHoldings(ctx)).Monthly
+		custom = *req.Contribution
 	}
+	trailingMonthly := trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates, h.physicalHoldings(ctx)).Monthly
+	plan, source, _ := h.projectionPlan(ctx, now, req.Source, req.Contribution != nil, custom, trailingMonthly, 0)
+	monthlyContrib := plan.firstYearAverage()
 	annualReturn := analytics.PlanningDefaultReturnPct
 	if req.ReturnPct != nil {
 		annualReturn = math.Max(-99.99, math.Min(50, *req.ReturnPct))
@@ -3452,11 +3455,12 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 			ContribChange:  e.ContribChange,
 			RecurringCost:  e.RecurringCost,
 			DurationMonths: e.DurationMonths,
+			StopsContrib:   e.StopsContrib,
 		})
 	}
 
-	baseVals, baseBasis := simulateLifeEvents(currentValue, monthlyContrib, monthlyReturn, nil, fireMonths)
-	evVals, evBasis := simulateLifeEvents(currentValue, monthlyContrib, monthlyReturn, parsed, fireMonths)
+	baseVals, baseBasis := simulateLifeEvents(currentValue, plan, monthlyReturn, nil, fireMonths)
+	evVals, evBasis := simulateLifeEvents(currentValue, plan, monthlyReturn, parsed, fireMonths)
 
 	type projPoint struct {
 		Date  string  `json:"date"`
@@ -3635,6 +3639,7 @@ func (h *PortfolioHandler) HandleLifeEvents(w http.ResponseWriter, r *http.Reque
 		"scope":                  "investable",
 		"templates":              templates,
 		"contribution":           monthlyContrib,
+		"contribution_source":    source,
 		"return_pct":             annualReturn,
 		"execution_plans":        plans,
 	})
@@ -3656,6 +3661,7 @@ func (h *PortfolioHandler) HandlePensionGap(w http.ResponseWriter, r *http.Reque
 		MonthlyNeed    float64              `json:"monthly_need"` // desired monthly net income in retirement
 		CurrentAge     int                  `json:"current_age"`
 		MonthlyContrib float64              `json:"monthly_contrib"` // > 0 overrides the trailing net contribution
+		Source         string               `json:"source"`
 		ReturnPct      *float64             `json:"return_pct"`      // nominal; default 7
 		SWR            float64              `json:"swr"`             // %; default 3.5
 		InflationPct   *float64             `json:"inflation_pct"`   // default 2
@@ -3721,18 +3727,17 @@ func (h *PortfolioHandler) HandlePensionGap(w http.ResponseWriter, r *http.Reque
 		currentValue = investableNetWorth(snaps[0])
 	}
 	fxRates := loadFXRatesMap(ctx, h.queries)
-	monthlyContrib := req.MonthlyContrib // user override
-	if monthlyContrib <= 0 {
-		histFX := loadHistoricalFXRates(ctx, h.queries)
-		txns, _ := listAllTransactionsRows(ctx, h.queries)
-		monthlyContrib = trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates, h.physicalHoldings(ctx)).Monthly
-	}
+	histFX := loadHistoricalFXRates(ctx, h.queries)
+	txns, _ := listAllTransactionsRows(ctx, h.queries)
+	trailingMonthly := trailingNetContribution(txns, h.accountTypesByID(ctx), now, histFX, fxRates, h.physicalHoldings(ctx)).Monthly
+	plan, source, _ := h.projectionPlan(ctx, now, req.Source, req.MonthlyContrib > 0, req.MonthlyContrib, trailingMonthly, 0)
+	monthlyContrib := plan.firstYearAverage()
 	taxRate := analytics.CapitalIncomeTaxRate(churchRate)
 	tfs := h.portfolioTFS(ctx, fxRates)
 	allowance := analytics.SparerPauschbetragForYear(now.Year(), req.Joint)
 	monthsTo := func(age int) int { return int(math.Max(0, float64(age-req.CurrentAge))) * 12 }
 
-	draw := portfolioAtRetirement(currentValue, monthlyContrib, annualReturn, inflation, swr, taxRate, tfs, allowance, monthsTo(req.RetirementAge))
+	draw := portfolioAtRetirement(currentValue, plan, annualReturn, inflation, swr, taxRate, tfs, allowance, monthsTo(req.RetirementAge))
 
 	// Gap calculation
 	gap := req.MonthlyNeed - totalMonthlyNet - draw.NetMonthly
@@ -3757,7 +3762,7 @@ func (h *PortfolioHandler) HandlePensionGap(w http.ResponseWriter, r *http.Reque
 			continue
 		}
 		_, _, pNet := pensionsAt(req.Sources, age, age, true, pc)
-		d := portfolioAtRetirement(currentValue, monthlyContrib, annualReturn, inflation, swr, taxRate, tfs, allowance, monthsTo(age))
+		d := portfolioAtRetirement(currentValue, plan, annualReturn, inflation, swr, taxRate, tfs, allowance, monthsTo(age))
 		total := pNet + d.NetMonthly
 		sensitivity = append(sensitivity, ageSensitivity{
 			Age: age, PensionNet: math.Round(pNet),
@@ -3775,6 +3780,7 @@ func (h *PortfolioHandler) HandlePensionGap(w http.ResponseWriter, r *http.Reque
 		"projected_portfolio":         math.Round(draw.ValueReal),
 		"projected_portfolio_nominal": math.Round(draw.ValueNominal),
 		"monthly_contrib":             math.Round(monthlyContrib),
+		"contribution_source":         source,
 		"monthly_need":                req.MonthlyNeed,
 		"gap":                         math.Round(gap*100) / 100,
 		"gap_annual":                  math.Round(gap * 12),

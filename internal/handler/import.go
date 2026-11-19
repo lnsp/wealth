@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -468,6 +469,49 @@ func numericFromFloat(f float64) pgtype.Numeric {
 	return n
 }
 
+// upsertRSUGrants records every grant listed in an unvested report, so a
+// modelled RSU refresh can step aside once the real grant shows up.
+func upsertRSUGrants(ctx context.Context, q *db.Queries, vests []parser.RSUVest, seen time.Time) error {
+	type key struct {
+		account uuid.UUID
+		grant   string
+	}
+	type span struct{ first, last time.Time }
+	grants := map[key]*span{}
+	var order []key
+	for _, v := range vests {
+		if v.Vested || v.GrantNumber == "" {
+			continue
+		}
+		k := key{v.AccountID, v.GrantNumber}
+		s, ok := grants[k]
+		if !ok {
+			s = &span{first: v.VestDate, last: v.VestDate}
+			grants[k] = s
+			order = append(order, k)
+		}
+		if v.VestDate.Before(s.first) {
+			s.first = v.VestDate
+		}
+		if v.VestDate.After(s.last) {
+			s.last = v.VestDate
+		}
+	}
+	for _, k := range order {
+		s := grants[k]
+		if err := q.UpsertRSUGrant(ctx, db.UpsertRSUGrantParams{
+			AccountID:     k.account,
+			GrantNumber:   k.grant,
+			FirstSeenOn:   seen,
+			FirstVestDate: s.first,
+			LastVestDate:  s.last,
+		}); err != nil {
+			return fmt.Errorf("upsert rsu grant: %w", err)
+		}
+	}
+	return nil
+}
+
 // insertRSUVests persists RSU vest rows, linking vested rows to their sibling
 // transaction via import_hash lookup. For unvested imports it first deletes
 // stale unvested rows for the account so the schedule is always fresh.
@@ -480,6 +524,9 @@ func (h *ImportHandler) insertRSUVests(ctx context.Context, q *db.Queries, vests
 		}
 	}
 	if hasUnvested && len(vests) > 0 {
+		if err := upsertRSUGrants(ctx, q, vests, time.Now()); err != nil {
+			return 0, err
+		}
 		if err := q.DeleteUnvestedRSUVestsForAccount(ctx, vests[0].AccountID); err != nil {
 			return 0, fmt.Errorf("delete stale unvested vests: %w", err)
 		}

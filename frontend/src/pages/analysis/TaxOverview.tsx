@@ -58,9 +58,20 @@ export default function TaxOverview({ onOpenTools }: { onOpenTools: () => void }
   useEffect(() => {
     try { localStorage.setItem(JOINT_KEY, joint ? '1' : '0'); } catch { /* preference only */ }
   }, [joint]);
+  // Once saved, the planning profile on the server holds church tax for payroll and planning too.
+  useEffect(() => {
+    api.getPlanningProfile().then(p => {
+      if (!p.saved) return;
+      setChurchTax(p.church_rate);
+      try { localStorage.setItem(CHURCH_TAX_KEY, String(p.church_rate)); } catch { /* preference only */ }
+    }).catch(() => {});
+  }, []);
   const changeChurchTax = (v: number) => {
     setChurchTax(v);
     try { localStorage.setItem(CHURCH_TAX_KEY, String(v)); } catch { /* preference only */ }
+    api.getPlanningProfile()
+      .then(p => (p.saved ? api.savePlanningProfile({ ...p, church_rate: v }) : undefined))
+      .catch(() => {});
   };
   return (
     <>

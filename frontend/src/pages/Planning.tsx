@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { ReactNode } from 'react';
-import { api, type Account, type NetWorthSnapshot, type ProjectionData } from '../api/client';
+import { api, type Account, type ContributionSource, type IncomeData, type NetWorthSnapshot, type PlanningProfile, type ProjectionData } from '../api/client';
 import {
   PageHeader, Section, TabBar, TabPanel, useTabParam, NumberField,
   LoadingState, ErrorState, SectionBoundary,
@@ -9,10 +9,12 @@ import { PlanningProvider, usePlanning, type PensionSource, type PlanningState }
 import { readStored, writeStored, toNum } from '../components/planning/shared';
 import { investableNetWorth as investableOf, parsePct } from '../components/planning/planningMath';
 import { DEFAULT_INFLATION_PCT } from '../components/planning/constants';
+import { fmtEUR, fmtPct } from '../utils/format';
 import ContributionRouter from '../components/planning/ContributionRouter';
 import EstateCalculator from '../components/planning/EstateCalculator';
 import FinancialIndependencePlaybook from '../components/planning/FinancialIndependencePlaybook';
 import FireCalculator from '../components/planning/FireCalculator';
+import IncomeTab from '../components/planning/IncomeTab';
 import HumanCapital from '../components/planning/HumanCapital';
 import InsuranceInventory from '../components/planning/InsuranceInventory';
 import LiabilityAmortization from '../components/planning/LiabilityAmortization';
@@ -23,9 +25,10 @@ import WithdrawalSequence from '../components/planning/WithdrawalSequence';
 import WithdrawalSimulation from '../components/planning/WithdrawalSimulation';
 import WithdrawalSources from '../components/planning/WithdrawalSources';
 
-type PlanningSubTab = 'fire' | 'growth' | 'protection';
-const TAB_IDS: readonly PlanningSubTab[] = ['fire', 'growth', 'protection'];
+type PlanningSubTab = 'income' | 'fire' | 'growth' | 'protection';
+const TAB_IDS: readonly PlanningSubTab[] = ['income', 'fire', 'growth', 'protection'];
 const PLANNING_TABS: { id: PlanningSubTab; label: string }[] = [
+  { id: 'income', label: 'Income' },
   { id: 'fire', label: 'FIRE & Retirement' },
   { id: 'growth', label: 'Growth' },
   { id: 'protection', label: 'Protection' },
@@ -56,22 +59,39 @@ function useStoredNum(key: string, initial: number): [number, (v: number) => voi
  * The inputs several calculators share, in one place and visible on every tab.
  * Individual calculators no longer repeat these fields.
  */
+function ComputedValue({ label, value, hint }: { label: string; value: string; hint: string }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[13px] text-ink-body">{label}</span>
+      <span className="font-serif text-[20px] leading-[28px] min-h-[44px] flex items-center" data-privacy="blur">{value}</span>
+      <span className="text-[12px] text-ink-muted">{hint}</span>
+    </div>
+  );
+}
+
 function ProfileSection() {
   const {
     pensionCurrentAge, setPensionCurrentAge, pensionAge, setPensionAge,
     crMarginalRate, setCrMarginalRate, crGrossIncome, setCrGrossIncome,
-    crBudget, setCrBudget, crChildren, setCrChildren,
+    crBudget, setCrBudget, crChildren, setCrChildren, income,
   } = usePlanning();
+  const computed = income?.has_income ?? false;
 
   return (
-    <Section id="profile" title="Your Profile" subtitle="Used by every calculator on all three tabs." first>
+    <Section id="profile" title="Your Profile" subtitle="Used by every calculator on all four tabs." first>
       <div className="grid grid-cols-2 md:grid-cols-3 gap-x-3 gap-y-4">
         <NumberField label="Age" unit="years" integer min={0} value={pensionCurrentAge} onValueChange={v => setPensionCurrentAge(Math.max(0, v))} />
         <NumberField label="Retirement age" unit="years" integer min={0} value={pensionAge} onValueChange={v => setPensionAge(Math.max(0, v))} />
-        <NumberField label="Marginal tax rate" unit="%" value={toNum(crMarginalRate)} onValueChange={v => setCrMarginalRate(String(v))} />
-        <NumberField label="Gross income" unit="€ / year" value={toNum(crGrossIncome)} onValueChange={v => setCrGrossIncome(String(v))} />
-        <NumberField label="Monthly budget" unit="€ / month" value={toNum(crBudget)} onValueChange={v => setCrBudget(String(v))} hint="What you can invest each month." />
-        <NumberField label="Children" integer min={0} value={toNum(crChildren)} onValueChange={v => setCrChildren(String(Math.max(0, v)))} hint="Counts towards Riester allowances." />
+        <NumberField label="Children" integer min={0} value={toNum(crChildren)} onValueChange={v => setCrChildren(String(Math.max(0, v)))} hint="Counts towards Riester allowances and the care insurance rate." />
+        {computed ? (<>
+          <ComputedValue label="Gross income, next 12 months" value={fmtEUR(toNum(crGrossIncome))} hint="From the Income tab" />
+          <ComputedValue label="Marginal tax rate" value={fmtPct(toNum(crMarginalRate))} hint="Income tax and surcharges on the next euro" />
+          <ComputedValue label="Cash savings, normal month" value={fmtEUR(toNum(crBudget))} hint="Without bonus and vests" />
+        </>) : (<>
+          <NumberField label="Marginal tax rate" unit="%" value={toNum(crMarginalRate)} onValueChange={v => setCrMarginalRate(String(v))} />
+          <NumberField label="Gross income" unit="€ / year" value={toNum(crGrossIncome)} onValueChange={v => setCrGrossIncome(String(v))} hint="Or describe your pay on the Income tab." />
+          <NumberField label="Monthly budget" unit="€ / month" value={toNum(crBudget)} onValueChange={v => setCrBudget(String(v))} hint="What you can invest each month." />
+        </>)}
       </div>
     </Section>
   );
@@ -99,7 +119,7 @@ export default function Planning() {
   const [projReturn, setProjReturn] = useState<string>('');
 
   // Tab state lives in the URL (?tab=growth).
-  const [tab, setTab] = useTabParam<PlanningSubTab>(TAB_IDS, 'fire');
+  const [tab, setTab] = useTabParam<PlanningSubTab>(TAB_IDS, 'income');
 
   // FIRE inputs
   const [fireExpenses, setFireExpenses] = useStored('fire_expenses', '');
@@ -107,20 +127,74 @@ export default function Planning() {
   const [pensionIncome, setPensionIncome] = useStored('pension_income', '');
   const [otherIncome, setOtherIncome] = useStored('other_income', '');
   const [fireInflation, setFireInflation] = useStored('fire_inflation', String(DEFAULT_INFLATION_PCT));
-  // Church tax and joint filing are set on the Tax page; read them once.
-  const [churchRate] = useState(() => {
+  // Church tax is shared with the Tax page; the planning profile on the server wins once saved.
+  const [churchRate, setChurchRate] = useState(() => {
     const v = parsePct(readStored('church_tax_rate', '0'), 0);
     return v >= 0 && v <= 0.09 ? v : 0;
   });
   const [joint] = useState(() => readStored('fsa_joint', '0') === '1');
 
   // Profile
-  const [crMarginalRate, setCrMarginalRate] = useStored('marginal_tax_rate', '42');
-  const [crChildren, setCrChildren] = useStored('num_children', '0');
-  const [crBudget, setCrBudget] = useStored('monthly_invest_budget', '');
-  const [crGrossIncome, setCrGrossIncome] = useStored('gross_annual_income', '');
-  const [pensionAge, setPensionAge] = useStoredInt('pension_age', 67);
-  const [pensionCurrentAge, setPensionCurrentAge] = useStoredInt('pension_current_age', 35);
+  const [storedMarginalRate, setCrMarginalRate] = useStored('marginal_tax_rate', '42');
+  const [crChildren, setStoredChildren] = useStored('num_children', '0');
+  const [storedBudget, setCrBudget] = useStored('monthly_invest_budget', '');
+  const [storedGrossIncome, setCrGrossIncome] = useStored('gross_annual_income', '');
+  const [pensionAge, setStoredPensionAge] = useStoredInt('pension_age', 67);
+  const [pensionCurrentAge, setStoredCurrentAge] = useStoredInt('pension_current_age', 35);
+
+  // Expected income: the Income tab's schedule, shared by every calculator.
+  const [income, setIncome] = useState<IncomeData | null>(null);
+  const [incomeFailed, setIncomeFailed] = useState(false);
+  const [storedSource, setStoredSource] = useStored('contrib_source', '');
+  const contribSource: ContributionSource = storedSource === 'income' || storedSource === 'trailing' || storedSource === 'custom'
+    ? storedSource
+    : income?.has_income ? 'income' : 'trailing';
+  const setContribSource = useCallback((v: ContributionSource) => setStoredSource(v), [setStoredSource]);
+  const hasIncome = income?.has_income ?? false;
+  const crGrossIncome = hasIncome && income ? String(Math.round(income.summary.gross_next_12)) : storedGrossIncome;
+  const crMarginalRate = hasIncome && income ? String(Math.round(income.summary.marginal_tax * 1000) / 10) : storedMarginalRate;
+  const crBudget = hasIncome && income ? String(Math.round(income.summary.cash_savings_normal_month)) : storedBudget;
+
+  const reloadIncome = useCallback(() => {
+    setIncomeFailed(false);
+    api.getIncome().then(setIncome).catch(() => setIncomeFailed(true));
+  }, []);
+  useEffect(() => { reloadIncome(); }, [reloadIncome]);
+
+  // The saved profile is the source of truth for ages, children and church tax.
+  useEffect(() => {
+    const p = income?.profile;
+    if (!p?.saved) return;
+    setStoredPensionAge(p.retirement_age);
+    if (p.birth_year) setStoredCurrentAge(new Date().getFullYear() - p.birth_year);
+    setStoredChildren(String(p.children));
+    setChurchRate(p.church_rate);
+    writeStored('church_tax_rate', String(p.church_rate));
+  }, [income?.profile, setStoredPensionAge, setStoredCurrentAge, setStoredChildren]);
+
+  // Net Worth's goal shortfall reads the budget from localStorage.
+  useEffect(() => {
+    if (hasIncome) writeStored('monthly_invest_budget', crBudget);
+  }, [hasIncome, crBudget]);
+
+  const projectionReloader = useRef<() => void>(() => {});
+  const saveProfile = useCallback(async (p: PlanningProfile) => {
+    await api.savePlanningProfile(p);
+    reloadIncome();
+    projectionReloader.current();
+  }, [reloadIncome]);
+
+  // Profile edits on this page also reach the server profile once it exists.
+  const profileTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pushProfile = useCallback((patch: Partial<PlanningProfile>) => {
+    const p = income?.profile;
+    if (!p?.saved) return;
+    if (profileTimer.current) clearTimeout(profileTimer.current);
+    profileTimer.current = setTimeout(() => { saveProfile({ ...p, ...patch }).catch(() => {}); }, 600);
+  }, [income?.profile, saveProfile]);
+  const setPensionAge = useCallback((v: number) => { setStoredPensionAge(v); pushProfile({ retirement_age: Math.min(80, Math.max(40, v)) }); }, [setStoredPensionAge, pushProfile]);
+  const setPensionCurrentAge = useCallback((v: number) => { setStoredCurrentAge(v); if (v > 0) pushProfile({ birth_year: new Date().getFullYear() - v }); }, [setStoredCurrentAge, pushProfile]);
+  const setCrChildren = useCallback((v: string) => { setStoredChildren(v); pushProfile({ children: Math.max(0, Math.round(toNum(v))) }); }, [setStoredChildren, pushProfile]);
 
   // Pension gap
   const [pensionSources, setPensionSourcesState] = useState<PensionSource[]>(() => {
@@ -180,6 +254,14 @@ export default function Planning() {
   }, []);
 
   useEffect(() => { reloadProjection(); }, [reloadProjection]);
+  useEffect(() => { projectionReloader.current = reloadProjection; }, [reloadProjection]);
+
+  // FIRE expenses start from the Income tab's running costs, in today's money.
+  useEffect(() => {
+    if (hasIncome && income && !fireExpenses && income.summary.fire_expenses_today > 0) {
+      setFireExpenses(String(Math.round(income.summary.fire_expenses_today)));
+    }
+  }, [hasIncome, income, fireExpenses, setFireExpenses]);
 
   // Re-run projection when FIRE inputs change — FIRE Calculator surfaces the
   // refreshed target, date and drawdown from projData. Other income (rent,
@@ -203,11 +285,13 @@ export default function Planning() {
           inflationPct: parsePct(fireInflation, DEFAULT_INFLATION_PCT),
           churchRate,
           joint,
+          source: contribSource,
+          postFireHealth: hasIncome,
         }).then(setProjData).catch(() => {});
       }
     }, 300);
     return () => clearTimeout(timer);
-  }, [projContrib, projReturn, fireExpenses, fireSWR, pensionIncome, otherIncome, fireInflation, pensionCurrentAge, pensionAge, churchRate, joint]);
+  }, [projContrib, projReturn, fireExpenses, fireSWR, pensionIncome, otherIncome, fireInflation, pensionCurrentAge, pensionAge, churchRate, joint, contribSource, hasIncome]);
 
   const totalNetWorth = allSnapshots.length > 0 ? allSnapshots[0].total : 0;
   const investableNetWorth = investableOf(allSnapshots[0]);
@@ -228,6 +312,7 @@ export default function Planning() {
     pensionNeed, setPensionNeed, pensionContrib, setPensionContrib,
     growthBrokerage, setGrowthBrokerage, growthOther, setGrowthOther,
     hcSalaryGrowth, setHcSalaryGrowth, hcDiscount, setHcDiscount, hcPortfolioGrowth, setHcPortfolioGrowth,
+    income, incomeFailed, reloadIncome, saveProfile, contribSource, setContribSource,
   }), [
     accounts, allSnapshots, totalNetWorth, investableNetWorth,
     projData, projFailed, reloadProjection, projDefaultContrib, projContrib, projReturn,
@@ -241,6 +326,7 @@ export default function Planning() {
     pensionNeed, setPensionNeed, pensionContrib, setPensionContrib,
     growthBrokerage, setGrowthBrokerage, growthOther, setGrowthOther,
     hcSalaryGrowth, setHcSalaryGrowth, hcDiscount, setHcDiscount, hcPortfolioGrowth, setHcPortfolioGrowth,
+    income, incomeFailed, reloadIncome, saveProfile, contribSource, setContribSource,
   ]);
 
   if (loading) {
@@ -272,6 +358,8 @@ export default function Planning() {
 
         <TabPanel id={tab}>
           <Guarded><ProfileSection /></Guarded>
+
+          {tab === 'income' && <Guarded><IncomeTab /></Guarded>}
 
           {tab === 'fire' && (<>
             <Guarded><FireCalculator /></Guarded>

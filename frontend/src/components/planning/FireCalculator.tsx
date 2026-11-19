@@ -24,8 +24,9 @@ export default function FireCalculator() {
     fireExpenses, setFireExpenses, fireSWR, setFireSWR,
     pensionIncome, setPensionIncome, otherIncome, setOtherIncome,
     fireInflation, setFireInflation,
-    pensionCurrentAge, pensionAge,
+    pensionCurrentAge, pensionAge, income, contribSource, setContribSource,
   } = usePlanning();
+  const hasIncome = income?.has_income ?? false;
   const tc = useThemeColors();
   const [editContrib, setEditContrib] = useState(false);
 
@@ -77,7 +78,11 @@ export default function FireCalculator() {
           unit="€ / year"
           value={expenses}
           onValueChange={v => setFireExpenses(String(Math.max(0, v)))}
-          hint="In today’s money, after tax."
+          hint={hasIncome
+            ? <>In today’s money, after tax. Your running costs on the Income tab: <span data-privacy="blur">{fmtEUR(income?.summary.fire_expenses_today ?? 0)}</span>{Math.round(income?.summary.fire_expenses_today ?? 0) !== Math.round(expenses) && (
+              <> · <button type="button" className="underline text-forest min-h-[32px]" onClick={() => setFireExpenses(String(Math.round(income?.summary.fire_expenses_today ?? 0)))}>use them</button></>
+            )}</>
+            : 'In today’s money, after tax.'}
         />
         <NumberField
           label="Withdrawal rate"
@@ -177,9 +182,38 @@ export default function FireCalculator() {
             </p>
           </div>
 
+          {(projData?.post_fire_health ?? 0) > 0 && (
+            <p className="mt-3 text-[13px] text-ink-body">
+              Includes <span data-privacy="blur">{fmtEUR(projData?.post_fire_health ?? 0)}</span> a year for health and care insurance after FIRE, until your pension starts:
+              {income?.profile.health_kind === 'pkv'
+                ? ' your private premium without the employer subsidy.'
+                : ' voluntary statutory insurance on the gains in your withdrawals, never less than the minimum.'}
+            </p>
+          )}
+
+          {hasIncome && (
+            <div className="mt-4 flex flex-col gap-2">
+              <span className="text-[13px] text-ink-body">Contributions</span>
+              <div role="group" aria-label="Contributions" className="inline-flex flex-wrap gap-1.5">
+                {([['income', 'Expected income'], ['trailing', 'Last 12 months'], ['custom', 'Custom']] as const).map(([id, label]) => (
+                  <button key={id} type="button" aria-pressed={contribSource === id}
+                    onClick={() => { setContribSource(id); setEditContrib(id === 'custom'); }}
+                    className={`min-h-[44px] px-3.5 rounded-[4px] border text-[14px] transition-colors ${contribSource === id
+                      ? 'bg-forest border-forest text-parchment font-semibold'
+                      : 'border-field text-ink-body font-medium hover:border-forest hover:text-ink'}`}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="mt-2 flex flex-wrap items-center justify-between gap-x-4">
             <p className="min-w-0 flex-1 basis-56 text-[13px] text-ink-body">
-              {usesAverage
+              {contribSource === 'income' && projData?.contribution_source === 'income'
+                ? <>Contributions follow your monthly schedule from the Income tab, <span data-privacy="blur">{fmtEUR(projData.contribution)}</span> a month on average in the first year, and stop at the independence date.{' '}</>
+                : null}
+              {contribSource === 'income' && projData?.contribution_source === 'income' ? null : usesAverage
                 ? <>Assumes you keep adding <span data-privacy="blur">{fmtEUR(monthlyContrib)}</span> a month, your net contributions over the last 12 months.</>
                 : <>Assumes contributions of <span data-privacy="blur">{fmtEUR(monthlyContrib)}</span> a month{projDefaultContrib != null && <> (your last 12 months: <span data-privacy="blur">{fmtEUR(projDefaultContrib)}</span> a month)</>}.</>}
               {' '}Growth of {fmtPct(annualReturn)} a year before inflation; amounts in today’s money at {fmtPct(inflation)} inflation.
@@ -201,7 +235,7 @@ export default function FireCalculator() {
                 label="Monthly contributions"
                 unit="€ / month"
                 value={monthlyContrib}
-                onValueChange={v => setProjContrib(String(Math.max(0, v)))}
+                onValueChange={v => { setProjContrib(String(Math.max(0, v))); if (hasIncome) setContribSource('custom'); }}
                 hint={projDefaultContrib != null && !usesAverage
                   ? (
                     <button type="button" className="underline text-forest min-h-[32px]" onClick={() => setProjContrib(String(projDefaultContrib))}>
@@ -311,7 +345,9 @@ export default function FireCalculator() {
               {' '}and the <span data-privacy="blur">{fmtEUR(drawdown.allowance ?? 1000)}</span> saver’s allowance. Gains are {fmtPct(drawdown.gain_share_pct ?? 0, { digits: 0 })} of the portfolio at the independence date, counting today’s value and every contribution as paid in.
             </p>
             <p>
-              Contributions stay at the same amount in euros; withdrawals rise with inflation.
+              {projData?.contribution_source === 'income'
+                ? 'Contributions follow the monthly schedule from the Income tab until the independence date; withdrawals rise with inflation.'
+                : 'Contributions stay at the same amount in euros; withdrawals rise with inflation.'}
               {(drawdown.pension_from_age ?? 0) > 0 && <> Until the pension starts at {drawdown.pension_from_age}, the portfolio pays all your spending.</>}
             </p>
           </Assumptions>

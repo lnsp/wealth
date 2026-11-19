@@ -295,6 +295,63 @@ func planProjectFV(cv, mc, annualPct, growth float64, months int) float64 {
 	return v
 }
 
+// contributionPlan is what a projection pays in each month: the income
+// schedule when the household described its income, else a flat amount that
+// grows once a year.
+type contributionPlan struct {
+	Monthly, Growth float64
+	Schedule        []float64
+}
+
+func (c contributionPlan) at(m int) float64 {
+	if c.Schedule != nil {
+		if m >= 1 && m <= len(c.Schedule) {
+			return c.Schedule[m-1]
+		}
+		return 0
+	}
+	return contribForMonth(c.Monthly, c.Growth, m)
+}
+
+// shifted adds d to every month; a cut never takes a saving month below zero.
+func (c contributionPlan) shifted(d float64) contributionPlan {
+	if c.Schedule == nil {
+		c.Monthly += d
+		if d < 0 && c.Monthly-d >= 0 {
+			c.Monthly = math.Max(c.Monthly, 0)
+		}
+		return c
+	}
+	out := make([]float64, len(c.Schedule))
+	for i, v := range c.Schedule {
+		out[i] = v + d
+		if d < 0 && v >= 0 {
+			out[i] = math.Max(out[i], 0)
+		}
+	}
+	c.Schedule = out
+	return c
+}
+
+func (c contributionPlan) total(months int) float64 {
+	var t float64
+	for m := 1; m <= months; m++ {
+		t += c.at(m)
+	}
+	return t
+}
+
+func (c contributionPlan) firstYearAverage() float64 { return c.total(12) / 12 }
+
+func projectPlanFV(cv float64, c contributionPlan, annualPct float64, months int) float64 {
+	mr := planMonthlyRate(annualPct)
+	v := cv
+	for m := 1; m <= months; m++ {
+		v = v*(1+mr) + c.at(m)
+	}
+	return v
+}
+
 // applyMonth grows value for one month and then adds a contribution (which
 // raises the cost basis) or takes a withdrawal (which removes basis pro rata).
 func applyMonth(value, basis, mr, flow float64) (float64, float64) {
@@ -323,14 +380,16 @@ func planGainShare(value, basis float64) float64 {
 // fireParams describe one FIRE plan. Money amounts are in today's euros
 // unless they say otherwise; rates are fractions.
 type fireParams struct {
-	CurrentValue   float64 // investable wealth today; also the starting cost basis
-	MonthlyContrib float64 // nominal, months 1–12
-	ContribGrowth  float64 // p.a., applied each 12 months
-	AnnualReturn   float64 // nominal p.a.
-	Inflation      float64 // p.a.
-	Expenses       float64 // yearly spending the portfolio and the pension must cover
-	Pension        float64 // yearly pension after income tax, paid from PensionAge
-	CurrentAge     int     // 0: unknown, the pension is counted from the independence date
+	CurrentValue   float64   // investable wealth today; also the starting cost basis
+	MonthlyContrib float64   // nominal, months 1–12
+	ContribGrowth  float64   // p.a., applied each 12 months
+	Schedule       []float64 // monthly contributions from the income schedule; replaces the two above
+	AnnualReturn   float64   // nominal p.a.
+	Inflation      float64   // p.a.
+	Expenses       float64   // yearly spending the portfolio and the pension must cover
+	Health         float64   // yearly health and care insurance after FIRE, until the pension starts
+	Pension        float64   // yearly pension after income tax, paid from PensionAge
+	CurrentAge     int       // 0: unknown, the pension is counted from the independence date
 	PensionAge     int
 	SWR            float64 // withdrawal rate
 	TaxRate        float64 // analytics.CapitalIncomeTaxRate
@@ -343,9 +402,21 @@ func (p fireParams) bridgeModelled() bool {
 	return p.CurrentAge > 0 && p.PensionAge > 0 && p.Pension > 0
 }
 
-// longRunGap is the yearly spending the portfolio covers once the pension runs.
+func (p fireParams) contribution(m int) float64 {
+	return contributionPlan{Monthly: p.MonthlyContrib, Growth: p.ContribGrowth, Schedule: p.Schedule}.at(m)
+}
+
+// spendBeforePension is the yearly spending until the pension starts.
+func (p fireParams) spendBeforePension() float64 { return p.Expenses + p.Health }
+
+// longRunGap is the yearly spending the portfolio covers once the pension
+// runs; without a pension the health insurance stays a cost for good.
 func (p fireParams) longRunGap() float64 {
-	return math.Max(0, p.Expenses-p.Pension)
+	gap := math.Max(0, p.Expenses-p.Pension)
+	if p.Pension <= 0 {
+		gap += p.Health
+	}
+	return gap
 }
 
 // bridgeYearsAt returns the years between independence at month m and the
@@ -366,7 +437,7 @@ func (p fireParams) inflator(months float64) float64 {
 func (p fireParams) netSpendNominal(m, y int) float64 {
 	infl := p.inflator(float64(m + 12*y))
 	if p.bridgeModelled() && float64(p.CurrentAge)+float64(m)/12+float64(y) < float64(p.PensionAge) {
-		return p.Expenses * infl
+		return p.spendBeforePension() * infl
 	}
 	return p.longRunGap() * infl
 }
@@ -391,7 +462,7 @@ func (p fireParams) targetAt(m int, value, basis float64) (target, bridge float6
 	for k := 0; float64(k) < years; k++ {
 		weight := math.Min(1, years-float64(k))
 		f := infl * math.Pow(1+p.Inflation, float64(k))
-		extra := gross(p.Expenses*f) - gross(gap*f)
+		extra := gross(p.spendBeforePension()*f) - gross(gap*f)
 		bridge += weight * extra / math.Pow(1+p.AnnualReturn, float64(k))
 	}
 	return longRun + bridge, bridge
@@ -441,7 +512,7 @@ func simulateFIRE(p fireParams, start time.Time) fireResult {
 	v, basis := p.CurrentValue, math.Max(p.CurrentValue, 0)
 	for m := 0; m <= p.MaxMonths; m++ {
 		if m > 0 {
-			v, basis = applyMonth(v, basis, mr, contribForMonth(p.MonthlyContrib, p.ContribGrowth, m))
+			v, basis = applyMonth(v, basis, mr, p.contribution(m))
 		}
 		t, bridge := p.targetAt(m, v, basis)
 		res.TargetNominal = t
@@ -829,12 +900,12 @@ type portfolioDraw struct {
 	NetMonthly   float64 // today's euros
 }
 
-func portfolioAtRetirement(currentValue, monthlyContrib, annualReturn, inflation, swr, taxRate, tfs, allowance float64, months int) portfolioDraw {
+func portfolioAtRetirement(currentValue float64, plan contributionPlan, annualReturn, inflation, swr, taxRate, tfs, allowance float64, months int) portfolioDraw {
 	if months < 0 {
 		months = 0
 	}
-	v := math.Max(0, planProjectFV(currentValue, monthlyContrib, annualReturn*100, 0, months))
-	basis := math.Max(0, currentValue+monthlyContrib*float64(months))
+	v := math.Max(0, projectPlanFV(currentValue, plan, annualReturn*100, months))
+	basis := math.Max(0, currentValue+plan.total(months))
 	defl := math.Pow(1+inflation, float64(months)/12)
 	w := v * swr
 	tax := analytics.CapitalGainsTaxOnWithdrawal(w, planGainShare(v, basis), tfs, taxRate, allowance)
@@ -1016,15 +1087,16 @@ type lifeEventSim struct {
 	ContribChange  float64
 	RecurringCost  float64
 	DurationMonths int // 0 = permanent
+	StopsContrib   bool
 }
 
 // simulateLifeEvents returns investable value and cost basis after each month
 // 0..months. In its month an event's one-off amount (minus tax) is booked,
 // its contribution change starts and its recurring cost starts; a recurring
 // cost with duration n is paid n times.
-func simulateLifeEvents(cv, contrib, mr float64, events []lifeEventSim, months int) (values, bases []float64) {
+func simulateLifeEvents(cv float64, plan contributionPlan, mr float64, events []lifeEventSim, months int) (values, bases []float64) {
 	v, basis := math.Max(cv, 0), math.Max(cv, 0)
-	active := contrib
+	change, stopped := 0.0, false
 	left := map[int]int{}
 	values = make([]float64, 0, months+1)
 	bases = make([]float64, 0, months+1)
@@ -1034,7 +1106,8 @@ func simulateLifeEvents(cv, contrib, mr float64, events []lifeEventSim, months i
 				continue
 			}
 			v, basis = applyMonth(v, basis, 0, e.CashImpact-e.TaxImpact)
-			active += e.ContribChange
+			change += e.ContribChange
+			stopped = stopped || e.StopsContrib
 			if e.RecurringCost != 0 {
 				dur := e.DurationMonths
 				if dur <= 0 {
@@ -1054,7 +1127,11 @@ func simulateLifeEvents(cv, contrib, mr float64, events []lifeEventSim, months i
 			}
 		}
 		rate := mr
-		flow := active - recurring
+		base := plan.at(m)
+		if stopped {
+			base = 0
+		}
+		flow := base + change - recurring
 		if m == 0 {
 			rate, flow = 0, -recurring
 		}

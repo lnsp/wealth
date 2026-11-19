@@ -165,6 +165,7 @@ type IncomeStream struct {
 	StartDate    time.Time      `json:"start_date"`
 	EndDate      pgtype.Date    `json:"end_date"`
 	CreatedAt    time.Time      `json:"created_at"`
+	VestWeights  []float64      `json:"vest_weights"`
 }
 
 type IncomeStreamStep struct {

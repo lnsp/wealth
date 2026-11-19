@@ -6,7 +6,7 @@ import EChartWrapper from '../charts/EChartWrapper';
 import { Section, SubHeading, MetricCard, MetricGrid, NumberField, SelectField, EmptyState, ErrorState, LoadingState, Chip, AddChip, useConfirm } from '../ui';
 import { fmtEUR, fmtMoney, fmtNum, fmtPct, fmtAxis, fmtMonthShort, fmtDate } from '../../utils/format';
 import { ScrollTable } from './shared';
-import IncomeStreamEditor, { KIND_LABEL, newStream } from './IncomeStreamEditor';
+import IncomeStreamEditor, { KIND_LABEL, newStream, shapeLabel } from './IncomeStreamEditor';
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const pct = (fraction: number, digits = 1) => fmtPct(fraction * 100, { digits });
@@ -76,7 +76,8 @@ function streamSummary(s: IncomeStream): string {
       return `${pct(s.amount, 0)} of last year’s base salary, paid in ${MONTH_NAMES[(s.month ?? 3) - 1]} · payout factor ${pct(s.payout_factor ?? 1, 0)}`;
     case 'rsu_refresh': {
       const every = s.vest_every === 3 ? 'quarterly' : s.vest_every === 6 ? 'every half year' : s.vest_every === 12 ? 'yearly' : 'monthly';
-      return `${fmtMoney(s.amount, s.currency, { cents: false })} granted every ${MONTH_NAMES[(s.month ?? 3) - 1]} · vests ${every} over ${(s.vest_months ?? 48) / 12} years`;
+      const shape = s.vest_weights?.length ? `, ${shapeLabel(s.vest_weights)} a year` : '';
+      return `${fmtMoney(s.amount, s.currency, { cents: false })} granted every ${MONTH_NAMES[(s.month ?? 3) - 1]} · vests ${every} over ${(s.vest_months ?? 48) / 12} years${shape}`;
     }
     default:
       return `${fmtEUR(s.amount)} on ${fmtDate(s.start_date)}`;

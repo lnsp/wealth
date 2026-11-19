@@ -891,6 +891,11 @@ export interface ProjectionData {
   /** Name of the goal behind target_amount / target_date (drawn as a reference line only). */
   target_goal_name?: string;
   contribution: number;
+  contribution_source?: ContributionSource;
+  /** Income streams exist, so the monthly schedule is available. */
+  has_income?: boolean;
+  /** Yearly health and care insurance after FIRE, today's money (post_fire_health=1). */
+  post_fire_health?: number;
   /** Trailing 12-month net contribution (deposits − withdrawals + vests) ÷ months covered, regardless of overrides. */
   default_contribution?: number;
   contribution_basis?: {
@@ -963,6 +968,97 @@ export interface FireProjectionParams {
   inflationPct?: number;
   churchRate?: number;
   joint?: boolean;
+  /** income: the monthly schedule from the Income tab; trailing: the last 12 months; custom: `contribution`. */
+  source?: ContributionSource;
+  /** Adds health and care insurance after FIRE, computed from the planning profile. */
+  postFireHealth?: boolean;
+}
+
+export type ContributionSource = 'income' | 'trailing' | 'custom';
+
+export interface PlanningProfile {
+  birth_year: number | null;
+  retirement_age: number;
+  children: number;
+  /** 0, 0.08 or 0.09 */
+  church_rate: number;
+  health_kind: 'gkv' | 'pkv';
+  gkv_zusatzbeitrag: number;
+  pkv_premium_monthly: number;
+  pkv_basic_share: number;
+  savings_mode: 'costs' | 'rate';
+  /** In today's money. */
+  running_costs_monthly: number;
+  savings_rate: number;
+  rsu_count_full: boolean;
+  inflation: number;
+  wage_growth: number;
+  share_drift: number;
+  /** null: the latest ECB rate, held flat. */
+  usd_per_eur: number | null;
+  /** False until the profile was saved once. */
+  saved?: boolean;
+}
+
+export type IncomeKind = 'salary' | 'bonus' | 'rsu_refresh' | 'one_off';
+
+export interface IncomeStream {
+  id?: string;
+  kind: IncomeKind;
+  name: string;
+  currency: 'EUR' | 'USD';
+  /** salary: gross a year; bonus: target share of last year's base (0.15); rsu_refresh: grant value; one_off: the payment. */
+  amount: number;
+  /** salary: yearly raise; rsu_refresh: grant growth (fractions). */
+  growth: number;
+  /** salary: raise month; bonus: payout month; rsu_refresh: grant month. */
+  month: number | null;
+  payout_factor: number | null;
+  vest_months: number | null;
+  vest_every: number | null;
+  cliff_months: number;
+  account_id: string | null;
+  first_year: number | null;
+  start_date: string;
+  end_date: string | null;
+  steps: { date: string; amount: number }[];
+  created_at?: string;
+}
+
+export interface PayrollBreakdown {
+  gross: number; taxable_income: number; income_tax: number; soli: number; church_tax: number;
+  rv: number; av: number; kv: number; pv: number; employer_subsidy: number; max_subsidy: number; net: number;
+}
+
+export interface IncomeYear {
+  year: number;
+  months: number;
+  base_gross: number; bonus_gross: number; one_off_gross: number; held_gross: number; refresh_gross: number;
+  net: number; savings: number; running_costs: number;
+  payroll: PayrollBreakdown;
+  base_keep: number; variable_keep: number; marginal_keep: number; marginal_tax: number;
+  tariff_enacted: boolean; ceilings_enacted: boolean; rv_cap: number; kv_cap: number; tariff_index: number;
+}
+
+export interface IncomeMonth {
+  month: string;
+  base_gross: number; bonus_gross: number; one_off_gross: number; held_gross: number; refresh_gross: number;
+  base_net: number; bonus_net: number; one_off_net: number; held_net: number; refresh_net: number;
+  net: number; running_costs: number; savings: number; cash_savings: number; stopped: boolean;
+}
+
+export interface IncomeData {
+  has_income: boolean;
+  profile: PlanningProfile;
+  streams: IncomeStream[];
+  held: { currency: string; to_vest: number; last_vest?: string; imported_on?: string; latest_grant_first_vest?: string; grants_listed: number };
+  usd_per_eur: number;
+  years: IncomeYear[];
+  months: IncomeMonth[];
+  summary: {
+    gross_next_12: number; savings_next_12: number; bonus_and_vests_next_12: number;
+    cash_savings_normal_month: number; marginal_tax: number; fire_expenses_today: number;
+  };
 }
 
 export interface RebalanceTrade {
@@ -1234,9 +1330,21 @@ export const api = {
     if (p.inflationPct != null && Number.isFinite(p.inflationPct)) params.set('inflation', String(p.inflationPct));
     if (p.churchRate != null && p.churchRate > 0) params.set('church_rate', String(p.churchRate));
     if (p.joint) params.set('joint', '1');
+    if (p.source) params.set('source', p.source);
+    if (p.postFireHealth) params.set('post_fire_health', '1');
     const qs = params.toString();
     return request<ProjectionData>(`/portfolio/projection${qs ? `?${qs}` : ''}`);
   },
+  getIncome: () => request<IncomeData>('/planning/income'),
+  getPlanningProfile: () => request<PlanningProfile>('/planning/profile'),
+  savePlanningProfile: (p: PlanningProfile) =>
+    request<PlanningProfile>('/planning/profile', { method: 'PUT', body: JSON.stringify(p) }),
+  createIncomeStream: (s: IncomeStream) =>
+    request<IncomeStream>('/planning/income-streams', { method: 'POST', body: JSON.stringify(s) }),
+  updateIncomeStream: (id: string, s: IncomeStream) =>
+    request<IncomeStream>(`/planning/income-streams/${id}`, { method: 'PUT', body: JSON.stringify(s) }),
+  deleteIncomeStream: (id: string) =>
+    request<{ status: string }>(`/planning/income-streams/${id}`, { method: 'DELETE' }),
   createGoal: (data: { name: string; target_amount: number; target_date: string; monthly_contribution?: number; assumed_return_pct?: number; funding_account_id?: string; priority?: number }) =>
     request<{ id: string; name: string }>('/settings/goals', { method: 'POST', body: JSON.stringify(data) }),
   deleteGoal: (id: string) =>

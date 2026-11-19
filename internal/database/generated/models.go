@@ -148,6 +148,32 @@ type ImportHistory struct {
 	RsuVests      int32     `json:"rsu_vests"`
 }
 
+type IncomeStream struct {
+	ID           uuid.UUID      `json:"id"`
+	Kind         string         `json:"kind"`
+	Name         string         `json:"name"`
+	Currency     string         `json:"currency"`
+	Amount       pgtype.Numeric `json:"amount"`
+	Growth       pgtype.Numeric `json:"growth"`
+	Month        pgtype.Int4    `json:"month"`
+	PayoutFactor pgtype.Numeric `json:"payout_factor"`
+	VestMonths   pgtype.Int4    `json:"vest_months"`
+	VestEvery    pgtype.Int4    `json:"vest_every"`
+	CliffMonths  int32          `json:"cliff_months"`
+	AccountID    *uuid.UUID     `json:"account_id"`
+	FirstYear    pgtype.Int4    `json:"first_year"`
+	StartDate    time.Time      `json:"start_date"`
+	EndDate      pgtype.Date    `json:"end_date"`
+	CreatedAt    time.Time      `json:"created_at"`
+}
+
+type IncomeStreamStep struct {
+	ID            uuid.UUID      `json:"id"`
+	StreamID      uuid.UUID      `json:"stream_id"`
+	EffectiveDate time.Time      `json:"effective_date"`
+	Amount        pgtype.Numeric `json:"amount"`
+}
+
 type Loan struct {
 	ID                uuid.UUID      `json:"id"`
 	AssetID           uuid.UUID      `json:"asset_id"`
@@ -224,6 +250,27 @@ type NotificationChannel struct {
 	DigestFrequency string          `json:"digest_frequency"`
 }
 
+type PlanningProfile struct {
+	ID                  bool           `json:"id"`
+	BirthYear           pgtype.Int4    `json:"birth_year"`
+	RetirementAge       int32          `json:"retirement_age"`
+	Children            int32          `json:"children"`
+	ChurchRate          pgtype.Numeric `json:"church_rate"`
+	HealthKind          string         `json:"health_kind"`
+	GkvZusatzbeitrag    pgtype.Numeric `json:"gkv_zusatzbeitrag"`
+	PkvPremiumMonthly   pgtype.Numeric `json:"pkv_premium_monthly"`
+	PkvBasicShare       pgtype.Numeric `json:"pkv_basic_share"`
+	SavingsMode         string         `json:"savings_mode"`
+	RunningCostsMonthly pgtype.Numeric `json:"running_costs_monthly"`
+	SavingsRate         pgtype.Numeric `json:"savings_rate"`
+	RsuCountFull        bool           `json:"rsu_count_full"`
+	Inflation           pgtype.Numeric `json:"inflation"`
+	WageGrowth          pgtype.Numeric `json:"wage_growth"`
+	ShareDrift          pgtype.Numeric `json:"share_drift"`
+	UsdPerEur           pgtype.Numeric `json:"usd_per_eur"`
+	UpdatedAt           time.Time      `json:"updated_at"`
+}
+
 type PriceAlert struct {
 	ID           uuid.UUID      `json:"id"`
 	AlertType    string         `json:"alert_type"`
@@ -238,6 +285,15 @@ type PriceIndexPoint struct {
 	Series string         `json:"series"`
 	Period time.Time      `json:"period"`
 	Value  pgtype.Numeric `json:"value"`
+}
+
+type RsuGrant struct {
+	AccountID     uuid.UUID `json:"account_id"`
+	GrantNumber   string    `json:"grant_number"`
+	FirstSeenOn   time.Time `json:"first_seen_on"`
+	LastSeenOn    time.Time `json:"last_seen_on"`
+	FirstVestDate time.Time `json:"first_vest_date"`
+	LastVestDate  time.Time `json:"last_vest_date"`
 }
 
 type RsuVest struct {

@@ -69,7 +69,7 @@ function isLifeEventResult(body: unknown): body is LifeEventResult {
 export default function LifeEventSimulator() {
   const {
     projData, projContrib, projReturn, fireExpenses, otherIncome, pensionIncome, fireSWR, fireInflation,
-    pensionCurrentAge, pensionAge, churchRate, joint,
+    pensionCurrentAge, pensionAge, churchRate, joint, contribSource,
   } = usePlanning();
   const tc = useThemeColors();
   const [confirm, confirmDialog] = useConfirm();
@@ -103,22 +103,19 @@ export default function LifeEventSimulator() {
   };
 
   const simulate = async () => {
-    if (!projData && events.some(ev => ev.stops_contributions)) {
+    if (!projData && contribSource !== 'income' && events.some(ev => ev.stops_contributions)) {
       setError('Your current contribution could not be loaded, so stopping it cannot be simulated. Reload the page and try again.');
       return;
     }
     setLoading(true);
     setError(null);
     try {
-      const payload = events.map(({ stops_contributions, ...ev }) => ({
-        ...ev,
-        contrib_change: stops_contributions ? -contrib : ev.contrib_change,
-      }));
       const res = await fetch('/api/portfolio/life-events', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          events: payload,
-          contribution: projData ? contrib : undefined, // unknown: the backend uses the trailing 12 months
+          events, // the backend stops the scheduled or flat contribution itself
+          source: contribSource,
+          contribution: contribSource === 'custom' && projData ? contrib : undefined,
           return_pct: ret,
           expenses: fireSpend,
           swr: parsePct(fireSWR, 3.5),

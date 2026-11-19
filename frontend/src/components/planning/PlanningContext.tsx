@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react';
-import type { Account, NetWorthSnapshot, ProjectionData } from '../../api/client';
+import type { Account, ContributionSource, IncomeData, NetWorthSnapshot, PlanningProfile, ProjectionData } from '../../api/client';
 
 export interface PensionSource {
   type: string;
@@ -95,6 +95,17 @@ export interface PlanningState {
   setHcDiscount: (v: number) => void;
   hcPortfolioGrowth: number;
   setHcPortfolioGrowth: (v: number) => void;
+
+  // Expected income (Income tab). When `income.has_income`, gross income,
+  // marginal rate and monthly budget above are computed from it.
+  income: IncomeData | null;
+  incomeFailed: boolean;
+  reloadIncome: () => void;
+  /** Saves the planning profile and reloads income and projection. */
+  saveProfile: (p: PlanningProfile) => Promise<void>;
+  /** What FIRE, Life Events and Pension Gap pay in each month. */
+  contribSource: ContributionSource;
+  setContribSource: (v: ContributionSource) => void;
 }
 
 const PlanningCtx = createContext<PlanningState | null>(null);

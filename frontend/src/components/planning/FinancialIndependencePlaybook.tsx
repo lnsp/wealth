@@ -3,7 +3,7 @@ import { usePlanning } from './PlanningContext';
 import { Section, SubHeading, MetricCard, MetricGrid, ProgressBar, EmptyState } from '../ui';
 import { fmtEUR, fmtPct, fmtDate } from '../../utils/format';
 import { Assumptions, downloadText, readStored, toNum, writeStored } from './shared';
-import { humanCapitalCrossover, parsePct } from './planningMath';
+import { humanCapitalCrossover, parsePct, scheduleByYear } from './planningMath';
 import { DEFAULT_MARGINAL_RATE_PCT } from './constants';
 
 const GROWTH_RATE = 0.07;
@@ -25,7 +25,7 @@ const actionKey = (year: number, action: string) => `${year}|${action}`;
 export default function FinancialIndependencePlaybook() {
   const {
     accounts, allSnapshots, investableNetWorth, projData, pensionCurrentAge, pensionAge, crBudget, crMarginalRate, crGrossIncome,
-    hcSalaryGrowth, hcDiscount, hcPortfolioGrowth,
+    hcSalaryGrowth, hcDiscount, hcPortfolioGrowth, income,
   } = usePlanning();
   const [done, setDone] = useState<Record<string, boolean>>(() => {
     try {
@@ -103,7 +103,7 @@ export default function FinancialIndependencePlaybook() {
   if (grossIncome > 0 && retireAge > currentAge) {
     const hc = humanCapitalCrossover({
       income: grossIncome, growth: hcSalaryGrowth / 100, discount: hcDiscount / 100, years: retireAge - currentAge,
-      startWealth: nw, monthlyContrib: monthlyBudget, portfolioGrowth: hcPortfolioGrowth / 100,
+      startWealth: nw, monthlyContrib: monthlyBudget, portfolioGrowth: hcPortfolioGrowth / 100, ...scheduleByYear(income),
     });
     const humanNow = hc.series[0]?.human ?? 0;
     if (humanNow > 0) {

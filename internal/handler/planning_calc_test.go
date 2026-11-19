@@ -236,7 +236,7 @@ func TestPensionsAt_StartAges(t *testing.T) {
 // Audit C4: the portfolio withdrawal is deflated to today's euros.
 func TestPortfolioAtRetirement_TodaysEuros(t *testing.T) {
 	rate := analytics.CapitalIncomeTaxRate(0)
-	d := portfolioAtRetirement(45073, 1557, 0.07, 0.02, 0.035, rate, 0.3, 1000, 32*12)
+	d := portfolioAtRetirement(45073, contributionPlan{Monthly: 1557}, 0.07, 0.02, 0.035, rate, 0.3, 1000, 32*12)
 	defl := math.Pow(1.02, 32)
 	if math.Abs(d.GrossMonthly-d.ValueNominal*0.035/12/defl) > 1e-6 {
 		t.Errorf("gross %.2f, want nominal / %.3f", d.GrossMonthly, defl)
@@ -252,7 +252,7 @@ func TestPortfolioAtRetirement_TodaysEuros(t *testing.T) {
 func TestExtraSavingsToClose_ClosesTheGapAfterTax(t *testing.T) {
 	rate := analytics.CapitalIncomeTaxRate(0)
 	pmt := extraSavingsToClose(500, 0.07, 0.02, 0.035, rate, 0.3, 30*12)
-	d := portfolioAtRetirement(0, pmt, 0.07, 0.02, 0.035, rate, 0.3, 0, 30*12)
+	d := portfolioAtRetirement(0, contributionPlan{Monthly: pmt}, 0.07, 0.02, 0.035, rate, 0.3, 0, 30*12)
 	if math.Abs(d.NetMonthly-500) > 0.01 {
 		t.Errorf("saving %.2f a month yields %.2f net, want 500", pmt, d.NetMonthly)
 	}
@@ -289,7 +289,7 @@ func TestMonthsBetween(t *testing.T) {
 
 func TestSimulateLifeEvents_RecurringAndBasis(t *testing.T) {
 	events := []lifeEventSim{{MonthOffset: 2, CashImpact: -1000, RecurringCost: 100, DurationMonths: 12}}
-	vals, bases := simulateLifeEvents(10000, 0, 0, events, 30)
+	vals, bases := simulateLifeEvents(10000, contributionPlan{}, 0, events, 30)
 	if math.Abs(vals[30]-(10000-1000-1200)) > 1e-9 {
 		t.Errorf("value after the event %.2f, want 7,800", vals[30])
 	}
@@ -298,7 +298,7 @@ func TestSimulateLifeEvents_RecurringAndBasis(t *testing.T) {
 	}
 	// Baseline FIRE month on the event path equals simulateFIRE's month.
 	p := germanFire(45073, 1557, 36000)
-	bv, bb := simulateLifeEvents(p.CurrentValue, p.MonthlyContrib, planMonthlyRate(7), nil, 600)
+	bv, bb := simulateLifeEvents(p.CurrentValue, contributionPlan{Monthly: p.MonthlyContrib}, planMonthlyRate(7), nil, 600)
 	if got, want := fireMonthOnPath(p, bv, bb), simulateFIRE(p, planNow).Month; got != want {
 		t.Errorf("life-event FIRE month %d, FIRE calculator %d", got, want)
 	}

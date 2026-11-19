@@ -256,6 +256,13 @@ func main() {
 			r.Get("/portfolio/time-machine", portfolioH.HandleTimeMachine)
 			r.Post("/portfolio/pension-gap", portfolioH.HandlePensionGap)
 			r.Get("/portfolio/unvested", portfolioH.HandleUnvested)
+			r.Get("/planning/profile", portfolioH.HandleGetPlanningProfile)
+			r.Put("/planning/profile", portfolioH.HandlePutPlanningProfile)
+			r.Get("/planning/income", portfolioH.HandleIncome)
+			r.Get("/planning/income-streams", portfolioH.HandleListIncomeStreams)
+			r.Post("/planning/income-streams", portfolioH.HandleCreateIncomeStream)
+			r.Put("/planning/income-streams/{id}", portfolioH.HandleUpdateIncomeStream)
+			r.Delete("/planning/income-streams/{id}", portfolioH.HandleDeleteIncomeStream)
 
 			r.Get("/assets", assetsH.HandleList)
 			r.Post("/assets", assetsH.HandleCreate)

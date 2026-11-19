@@ -4,7 +4,7 @@ import EChartWrapper from '../charts/EChartWrapper';
 import { Section, SubHeading, MetricCard, MetricGrid, NumberField, EmptyState } from '../ui';
 import { fmtEUR, fmtAxis } from '../../utils/format';
 import { toNum } from './shared';
-import { humanCapitalCrossover, humanCapitalPV } from './planningMath';
+import { humanCapitalCrossover, humanCapitalPV, scheduleByYear } from './planningMath';
 
 // Human Capital = present value of future earnings: this year's gross income,
 // growing at a salary growth rate (default 2 %) from next year on, discounted
@@ -17,8 +17,9 @@ export default function HumanCapital() {
     investableNetWorth, crGrossIncome, pensionCurrentAge, pensionAge, crBudget,
     hcSalaryGrowth: salaryGrowthPct, setHcSalaryGrowth: setSalaryGrowthPct,
     hcDiscount: discountPct, setHcDiscount: setDiscountPct,
-    hcPortfolioGrowth: portfolioGrowthPct, setHcPortfolioGrowth: setPortfolioGrowthPct,
+    hcPortfolioGrowth: portfolioGrowthPct, setHcPortfolioGrowth: setPortfolioGrowthPct, income,
   } = usePlanning();
+  const schedule = scheduleByYear(income);
   const tc = useThemeColors();
 
   const grossIncome = toNum(crGrossIncome);
@@ -30,12 +31,12 @@ export default function HumanCapital() {
   const monthlyContrib = toNum(crBudget);
 
   const ready = grossIncome > 0 && yearsToRetire > 0;
-  const humanCapital = ready ? Math.round(humanCapitalPV(grossIncome, growthRate, discountRate, yearsToRetire)) : 0;
+  const humanCapital = ready ? Math.round(humanCapitalPV(grossIncome, growthRate, discountRate, yearsToRetire, 0, schedule.incomes)) : 0;
   const financialCapital = investableNetWorth;
   const crossover = ready
     ? humanCapitalCrossover({
       income: grossIncome, growth: growthRate, discount: discountRate, years: yearsToRetire,
-      startWealth: financialCapital, monthlyContrib, portfolioGrowth: portfolioGrowthPct / 100,
+      startWealth: financialCapital, monthlyContrib, portfolioGrowth: portfolioGrowthPct / 100, ...schedule,
     })
     : { series: [], crossoverIndex: null };
   const crossoverData = crossover.series.map(d => ({ age: currentAge + d.yearIndex, human: Math.round(d.human), financial: Math.round(d.financial) }));
@@ -57,7 +58,7 @@ export default function HumanCapital() {
       ) : (
         <>
           <div className="grid grid-cols-2 gap-x-3 gap-y-4 md:grid-cols-3">
-            <NumberField label="Salary growth" unit="% p.a." value={salaryGrowthPct} onValueChange={setSalaryGrowthPct} />
+            {!schedule.incomes && <NumberField label="Salary growth" unit="% p.a." value={salaryGrowthPct} onValueChange={setSalaryGrowthPct} />}
             <NumberField label="Discount rate" unit="% p.a." value={discountPct} onValueChange={setDiscountPct} hint="How much less a euro earned next year is worth today." />
             <NumberField label="Portfolio growth" unit="% p.a." value={portfolioGrowthPct} onValueChange={setPortfolioGrowthPct} />
           </div>
@@ -79,7 +80,9 @@ export default function HumanCapital() {
 
           <SubHeading className="mt-6">Human and financial capital by age</SubHeading>
           <p className="mt-1 text-[13px] text-ink-muted">
-            Financial capital assumes you invest the <span data-privacy="blur">{fmtEUR(monthlyContrib)}</span> monthly budget from Your Profile.
+            {schedule.incomes
+              ? <>Earnings and savings come from your income streams on the Income tab.</>
+              : <>Financial capital assumes you invest the <span data-privacy="blur">{fmtEUR(monthlyContrib)}</span> monthly budget from Your Profile.</>}
           </p>
           <EChartWrapper
             option={{

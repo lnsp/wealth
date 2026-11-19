@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { InputHTMLAttributes, ReactNode, SelectHTMLAttributes } from 'react';
 
 interface FieldShellProps {
@@ -85,19 +85,22 @@ function formatForEdit(n: number, decimals?: number): string {
  */
 export function NumberField({ value, onValueChange, decimals, integer, onBlur, onFocus, ...rest }: NumberFieldProps) {
   const [draft, setDraft] = useState<string | null>(null);
-  useEffect(() => { setDraft(null); }, [value]);
+  const focused = useRef(false);
+  // Only an outside change replaces the text; while typing, reformatting "1100" as "1.100"
+  // would move the cursor and turn the next digit into a decimal ("1.1000" = 1,1).
+  useEffect(() => { if (!focused.current) setDraft(null); }, [value]);
   return (
     <Field
       {...rest}
       inputMode={integer ? 'numeric' : 'decimal'}
       value={draft ?? formatForEdit(value, decimals)}
-      onFocus={(e) => { setDraft(formatForEdit(value, decimals)); onFocus?.(e); }}
+      onFocus={(e) => { focused.current = true; setDraft(formatForEdit(value, decimals)); onFocus?.(e); }}
       onChange={(e) => {
         setDraft(e.target.value);
         const n = parseLocaleNumber(e.target.value);
         if (n !== null) onValueChange(integer ? Math.round(n) : n);
       }}
-      onBlur={(e) => { setDraft(null); onBlur?.(e); }}
+      onBlur={(e) => { focused.current = false; setDraft(null); onBlur?.(e); }}
     />
   );
 }

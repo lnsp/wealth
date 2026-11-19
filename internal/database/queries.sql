@@ -747,16 +747,17 @@ SELECT * FROM income_streams WHERE id = $1;
 -- name: CreateIncomeStream :one
 INSERT INTO income_streams (
     kind, name, currency, amount, growth, month, payout_factor, vest_months,
-    vest_every, cliff_months, account_id, first_year, start_date, end_date
+    vest_every, cliff_months, account_id, first_year, start_date, end_date, vest_weights
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 RETURNING *;
 
 -- name: UpdateIncomeStream :one
 UPDATE income_streams SET
     name = $2, currency = $3, amount = $4, growth = $5, month = $6,
     payout_factor = $7, vest_months = $8, vest_every = $9, cliff_months = $10,
-    account_id = $11, first_year = $12, start_date = $13, end_date = $14
+    account_id = $11, first_year = $12, start_date = $13, end_date = $14,
+    vest_weights = $15
 WHERE id = $1
 RETURNING *;
 

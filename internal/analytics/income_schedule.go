@@ -34,7 +34,8 @@ type IncomeStream struct {
 	VestMonths   int
 	VestEvery    int
 	CliffMonths  int
-	FirstYear    int // refresh: first modelled grant; 0 = first grant month from the schedule start
+	FirstYear    int       // refresh: first modelled grant; 0 = first grant month from the schedule start
+	VestWeights  []float64 // refresh: share vesting in each year of the schedule; nil vests evenly
 	Start, End   time.Time
 	Created      time.Time
 	Steps        []IncomeStep
@@ -308,6 +309,17 @@ func addRefresh(months []ScheduleMonth, s IncomeStream, in ScheduleInput, start 
 			first++
 		}
 	}
+	share := func(k int) float64 { return 1 / float64(tranches) }
+	if total := sumFloats(s.VestWeights); len(s.VestWeights) > 0 && total > 0 {
+		perYear := float64(max(1, 12/every))
+		share = func(k int) float64 {
+			year := (k*every - 1) / 12
+			if year >= len(s.VestWeights) {
+				return 0
+			}
+			return s.VestWeights[year] / total / perYear
+		}
+	}
 	end := start.AddDate(0, len(months), 0)
 	for g := first; ; g++ {
 		grant := time.Date(g, time.Month(s.Month), 1, 0, 0, 0, 0, time.UTC)
@@ -324,7 +336,7 @@ func addRefresh(months []ScheduleMonth, s IncomeStream, in ScheduleInput, start 
 			if i < 0 || i >= len(months) || months[i].Stopped {
 				continue
 			}
-			months[i].RefreshGross += value / float64(tranches) * drift(grant, vest)
+			months[i].RefreshGross += value * share(k) * drift(grant, vest)
 		}
 	}
 }
@@ -429,4 +441,12 @@ func applySavings(months []ScheduleMonth, years []ScheduleYear, in ScheduleInput
 		Y.Savings += m.Savings
 		Y.RunningCosts += m.RunningCosts
 	}
+}
+
+func sumFloats(vs []float64) float64 {
+	var t float64
+	for _, v := range vs {
+		t += v
+	}
+	return t
 }

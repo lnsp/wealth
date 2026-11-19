@@ -236,3 +236,29 @@ func TestScheduleSavingsRate(t *testing.T) {
 		nearly(t, "rate savings", m.Savings, want, 1e-9)
 	}
 }
+
+func TestScheduleFrontLoadedVesting(t *testing.T) {
+	frontLoaded := []float64{1.0 / 3, 1.0 / 3, 1.0 / 6, 1.0 / 6}
+	in := mockInput()
+	in.Held = nil
+	in.Streams[2].VestWeights = frontLoaded
+	in.Streams[2].End = date(2027, 3, 31) // one grant only
+	s := BuildSchedule(in)
+	perMonth := []float64{50000 / 3.0 / 12, 50000 / 3.0 / 12, 50000 / 6.0 / 12, 50000 / 6.0 / 12}
+	nearly(t, "2027 (Apr–Dec of year 1)", yearOf(s, 2027).RefreshGross*1.16, 9*perMonth[0], 0.01)
+	nearly(t, "2028 (end of year 1, start of year 2)", yearOf(s, 2028).RefreshGross*1.16, 3*perMonth[0]+9*perMonth[1], 0.01)
+	nearly(t, "2029 (end of year 2, start of year 3)", yearOf(s, 2029).RefreshGross*1.16, 3*perMonth[1]+9*perMonth[2], 0.01)
+	var total float64
+	for _, y := range s.Years {
+		total += y.RefreshGross
+	}
+	nearly(t, "the whole grant vests", total*1.16, 50000, 0.01)
+
+	// With a grant every year, the shape only moves vests earlier: the steady state is still one grant a year.
+	in = mockInput()
+	in.Streams[2].VestWeights = frontLoaded
+	nearly(t, "steady state", yearOf(BuildSchedule(in), 2031).RefreshGross*1.16, 50000, 0.01)
+	if even, front := yearOf(BuildSchedule(mockInput()), 2028).RefreshGross, yearOf(BuildSchedule(in), 2028).RefreshGross; front <= even {
+		t.Errorf("front-loading should raise early vests: %.0f vs %.0f", front, even)
+	}
+}

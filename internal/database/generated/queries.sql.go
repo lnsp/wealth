@@ -333,10 +333,10 @@ func (q *Queries) CreateFinancialGoal(ctx context.Context, arg CreateFinancialGo
 const createIncomeStream = `-- name: CreateIncomeStream :one
 INSERT INTO income_streams (
     kind, name, currency, amount, growth, month, payout_factor, vest_months,
-    vest_every, cliff_months, account_id, first_year, start_date, end_date
+    vest_every, cliff_months, account_id, first_year, start_date, end_date, vest_weights
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-RETURNING id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+RETURNING id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at, vest_weights
 `
 
 type CreateIncomeStreamParams struct {
@@ -354,6 +354,7 @@ type CreateIncomeStreamParams struct {
 	FirstYear    pgtype.Int4    `json:"first_year"`
 	StartDate    time.Time      `json:"start_date"`
 	EndDate      pgtype.Date    `json:"end_date"`
+	VestWeights  []float64      `json:"vest_weights"`
 }
 
 func (q *Queries) CreateIncomeStream(ctx context.Context, arg CreateIncomeStreamParams) (IncomeStream, error) {
@@ -372,6 +373,7 @@ func (q *Queries) CreateIncomeStream(ctx context.Context, arg CreateIncomeStream
 		arg.FirstYear,
 		arg.StartDate,
 		arg.EndDate,
+		arg.VestWeights,
 	)
 	var i IncomeStream
 	err := row.Scan(
@@ -391,6 +393,7 @@ func (q *Queries) CreateIncomeStream(ctx context.Context, arg CreateIncomeStream
 		&i.StartDate,
 		&i.EndDate,
 		&i.CreatedAt,
+		&i.VestWeights,
 	)
 	return i, err
 }
@@ -1061,7 +1064,7 @@ func (q *Queries) GetFirstTransactionDate(ctx context.Context) (time.Time, error
 }
 
 const getIncomeStream = `-- name: GetIncomeStream :one
-SELECT id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at FROM income_streams WHERE id = $1
+SELECT id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at, vest_weights FROM income_streams WHERE id = $1
 `
 
 func (q *Queries) GetIncomeStream(ctx context.Context, id uuid.UUID) (IncomeStream, error) {
@@ -1084,6 +1087,7 @@ func (q *Queries) GetIncomeStream(ctx context.Context, id uuid.UUID) (IncomeStre
 		&i.StartDate,
 		&i.EndDate,
 		&i.CreatedAt,
+		&i.VestWeights,
 	)
 	return i, err
 }
@@ -2430,7 +2434,7 @@ func (q *Queries) ListIncomeStreamSteps(ctx context.Context) ([]IncomeStreamStep
 }
 
 const listIncomeStreams = `-- name: ListIncomeStreams :many
-SELECT id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at FROM income_streams ORDER BY created_at, id
+SELECT id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at, vest_weights FROM income_streams ORDER BY created_at, id
 `
 
 func (q *Queries) ListIncomeStreams(ctx context.Context) ([]IncomeStream, error) {
@@ -2459,6 +2463,7 @@ func (q *Queries) ListIncomeStreams(ctx context.Context) ([]IncomeStream, error)
 			&i.StartDate,
 			&i.EndDate,
 			&i.CreatedAt,
+			&i.VestWeights,
 		); err != nil {
 			return nil, err
 		}
@@ -3731,9 +3736,10 @@ const updateIncomeStream = `-- name: UpdateIncomeStream :one
 UPDATE income_streams SET
     name = $2, currency = $3, amount = $4, growth = $5, month = $6,
     payout_factor = $7, vest_months = $8, vest_every = $9, cliff_months = $10,
-    account_id = $11, first_year = $12, start_date = $13, end_date = $14
+    account_id = $11, first_year = $12, start_date = $13, end_date = $14,
+    vest_weights = $15
 WHERE id = $1
-RETURNING id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at
+RETURNING id, kind, name, currency, amount, growth, month, payout_factor, vest_months, vest_every, cliff_months, account_id, first_year, start_date, end_date, created_at, vest_weights
 `
 
 type UpdateIncomeStreamParams struct {
@@ -3751,6 +3757,7 @@ type UpdateIncomeStreamParams struct {
 	FirstYear    pgtype.Int4    `json:"first_year"`
 	StartDate    time.Time      `json:"start_date"`
 	EndDate      pgtype.Date    `json:"end_date"`
+	VestWeights  []float64      `json:"vest_weights"`
 }
 
 func (q *Queries) UpdateIncomeStream(ctx context.Context, arg UpdateIncomeStreamParams) (IncomeStream, error) {
@@ -3769,6 +3776,7 @@ func (q *Queries) UpdateIncomeStream(ctx context.Context, arg UpdateIncomeStream
 		arg.FirstYear,
 		arg.StartDate,
 		arg.EndDate,
+		arg.VestWeights,
 	)
 	var i IncomeStream
 	err := row.Scan(
@@ -3788,6 +3796,7 @@ func (q *Queries) UpdateIncomeStream(ctx context.Context, arg UpdateIncomeStream
 		&i.StartDate,
 		&i.EndDate,
 		&i.CreatedAt,
+		&i.VestWeights,
 	)
 	return i, err
 }

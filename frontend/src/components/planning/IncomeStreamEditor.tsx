@@ -12,6 +12,21 @@ export const KIND_LABEL: Record<IncomeKind, string> = {
   one_off: 'One-off payment',
 };
 
+export const FRONT_LOADED = [1 / 3, 1 / 3, 1 / 6, 1 / 6];
+
+type Shape = 'even' | 'front' | 'custom';
+
+export function vestShape(weights: number[] | null, vestMonths: number | null): Shape {
+  if (!weights || weights.length === 0) return 'even';
+  if ((vestMonths ?? 0) === 48 && weights.length === 4 && weights.every((w, i) => Math.abs(w - FRONT_LOADED[i]) < 0.001)) return 'front';
+  return 'custom';
+}
+
+/** "33/33/17/17 %" */
+export function shapeLabel(weights: number[] | null): string {
+  return weights && weights.length ? `${weights.map(w => Math.round(w * 100)).join('/')} %` : 'evenly';
+}
+
 function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -19,13 +34,13 @@ function today(): string {
 export function newStream(kind: IncomeKind): IncomeStream {
   const base: IncomeStream = {
     kind, name: KIND_LABEL[kind], currency: 'EUR', amount: 0, growth: 0, month: null, payout_factor: null,
-    vest_months: null, vest_every: null, cliff_months: 0, account_id: null, first_year: null,
+    vest_months: null, vest_every: null, cliff_months: 0, account_id: null, first_year: null, vest_weights: null,
     start_date: today(), end_date: null, steps: [],
   };
   switch (kind) {
     case 'salary': return { ...base, growth: 0.03, month: 1 };
     case 'bonus': return { ...base, amount: 0.15, month: 3, payout_factor: 1 };
-    case 'rsu_refresh': return { ...base, currency: 'USD', month: 3, vest_months: 48, vest_every: 1 };
+    case 'rsu_refresh': return { ...base, currency: 'USD', month: 3, vest_months: 48, vest_every: 1, vest_weights: FRONT_LOADED };
     default: return base;
   }
 }
@@ -85,7 +100,11 @@ export default function IncomeStreamEditor({ stream, onSave, onCancel }: Props) 
           <NumberField label="Grant value" unit="USD" value={s.amount} onValueChange={v => set({ amount: Math.max(0, v), currency: 'USD' })} hint="Fixed in USD: the share count is set at the grant price." />
           <MonthSelect label="Granted every" value={s.month} onChange={v => set({ month: v })} />
           <NumberField label="Grant value grows" unit="% / year" value={pct(s.growth)} onValueChange={v => set({ growth: v / 100 })} />
-          <SelectField label="Vests over" value={String(s.vest_months ?? 48)} onChange={e => set({ vest_months: Number(e.target.value) })}>
+          <SelectField label="Vests over" value={String(s.vest_months ?? 48)} onChange={e => {
+            const months = Number(e.target.value);
+            const shape = vestShape(s.vest_weights, s.vest_months);
+            set({ vest_months: months, vest_weights: shape === 'even' || (shape === 'front' && months !== 48) ? null : shape === 'front' ? FRONT_LOADED : Array(months / 12).fill(12 / months) });
+          }}>
             {[12, 24, 36, 48, 60].map(m => <option key={m} value={m}>{m / 12} {m === 12 ? 'year' : 'years'}</option>)}
           </SelectField>
           <SelectField label="Vests every" value={String(s.vest_every ?? 1)} onChange={e => set({ vest_every: Number(e.target.value) })}>
@@ -93,6 +112,15 @@ export default function IncomeStreamEditor({ stream, onSave, onCancel }: Props) 
             <option value={3}>Quarter</option>
             <option value={6}>Half year</option>
             <option value={12}>Year</option>
+          </SelectField>
+          <SelectField label="Vesting shape" value={vestShape(s.vest_weights, s.vest_months)} onChange={e => {
+            const v = e.target.value as Shape;
+            const years = (s.vest_months ?? 48) / 12;
+            set({ vest_weights: v === 'even' ? null : v === 'front' ? FRONT_LOADED : (s.vest_weights?.length === years ? s.vest_weights : Array(years).fill(1 / years)) });
+          }}>
+            <option value="even">Even</option>
+            {(s.vest_months ?? 48) === 48 && <option value="front">Front-loaded: 1/3, 1/3, 1/6, 1/6</option>}
+            <option value="custom">Custom by year</option>
           </SelectField>
           <SelectField label="Cliff" value={String(s.cliff_months)} onChange={e => set({ cliff_months: Number(e.target.value) })}>
             <option value={0}>None</option>
@@ -110,6 +138,25 @@ export default function IncomeStreamEditor({ stream, onSave, onCancel }: Props) 
           <Field label="Ends" type="date" value={s.end_date ?? ''} onChange={e => set({ end_date: e.target.value || null })} hint="Empty: until your FIRE date or retirement." />
         )}
       </div>
+
+      {s.kind === 'rsu_refresh' && vestShape(s.vest_weights, s.vest_months) === 'custom' && s.vest_weights && (() => {
+        const weights = s.vest_weights;
+        const total = Math.round(weights.reduce((a, w) => a + w, 0) * 1000) / 10;
+        return (
+          <div className="mt-5">
+            <p className="label-caps mb-2">Share vesting each year</p>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+              {weights.map((w, i) => (
+                <NumberField key={i} label={`Year ${i + 1}`} unit="%" value={Math.round(w * 1000) / 10}
+                  onValueChange={v => set({ vest_weights: weights.map((x, j) => (j === i ? Math.max(0, v) / 100 : x)) })} />
+              ))}
+            </div>
+            <p className={`mt-2 text-[13px] ${Math.abs(total - 100) > 0.5 ? 'text-claret' : 'text-ink-muted'}`}>
+              Adds up to {total.toLocaleString('de-DE')} %{Math.abs(total - 100) > 0.5 ? '; it must be 100 %.' : '.'} Within a year, tranches vest evenly.
+            </p>
+          </div>
+        );
+      })()}
 
       {s.kind === 'salary' && (
         <div className="mt-5">

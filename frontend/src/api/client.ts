@@ -1019,6 +1019,8 @@ export interface IncomeStream {
   cliff_months: number;
   account_id: string | null;
   first_year: number | null;
+  /** rsu_refresh: share vesting in each year (sums to 1); null vests evenly. */
+  vest_weights: number[] | null;
   start_date: string;
   end_date: string | null;
   steps: { date: string; amount: number }[];

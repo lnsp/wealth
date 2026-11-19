@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -152,5 +153,31 @@ func TestLifeEventStopsScheduledContributions(t *testing.T) {
 	vals, _ := simulateLifeEvents(0, plan, 0, []lifeEventSim{{MonthOffset: 3, StopsContrib: true}}, 5)
 	if got := vals[5]; got != 2000 {
 		t.Errorf("value after stop: %.0f, want 2000 (the stop applies from its own month)", got)
+	}
+}
+
+func TestVestWeightsValidation(t *testing.T) {
+	refresh := func(w []float64) incomeStreamJSON {
+		return incomeStreamJSON{Kind: "rsu_refresh", Name: "r", Currency: "USD", Amount: 50000, Month: ip(3), VestMonths: ip(48), VestEvery: ip(1), StartDate: "2026-11-19", VestWeights: w}
+	}
+	ps, err := refresh([]float64{0.3333, 0.3333, 0.1667, 0.1667}).parse()
+	if err != nil {
+		t.Fatalf("front-loaded rejected: %v", err)
+	}
+	if got := ps.params.VestWeights; len(got) != 4 || math.Abs(got[0]+got[1]+got[2]+got[3]-1) > 1e-12 {
+		t.Errorf("weights not normalised: %v", got)
+	}
+	for name, w := range map[string][]float64{
+		"three years for 48 months": {0.5, 0.25, 0.25},
+		"over 100 %":                {0.5, 0.5, 0.5, 0.5},
+		"negative":                  {1.2, -0.2, 0, 0},
+	} {
+		if _, err := refresh(w).parse(); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	bonus := incomeStreamJSON{Kind: "bonus", Name: "b", Amount: 0.1, Month: ip(3), PayoutFactor: fp(1), StartDate: "2026-01-01", VestWeights: []float64{1}}
+	if _, err := bonus.parse(); err == nil {
+		t.Error("a bonus with a vesting shape was accepted")
 	}
 }

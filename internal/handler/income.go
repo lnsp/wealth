@@ -208,6 +208,7 @@ type incomeStreamJSON struct {
 	CliffMonths  int              `json:"cliff_months"`
 	AccountID    *string          `json:"account_id"`
 	FirstYear    *int             `json:"first_year"`
+	VestWeights  []float64        `json:"vest_weights"`
 	StartDate    string           `json:"start_date"`
 	EndDate      *string          `json:"end_date"`
 	Steps        []incomeStepJSON `json:"steps"`
@@ -236,7 +237,7 @@ func streamFromRow(s db.IncomeStream, steps []db.IncomeStreamStep) incomeStreamJ
 		Amount: numericToFloat(s.Amount), Growth: numericToFloat(s.Growth),
 		Month: intPtr(s.Month), PayoutFactor: floatPtr(s.PayoutFactor),
 		VestMonths: intPtr(s.VestMonths), VestEvery: intPtr(s.VestEvery),
-		CliffMonths: int(s.CliffMonths), FirstYear: intPtr(s.FirstYear),
+		CliffMonths: int(s.CliffMonths), FirstYear: intPtr(s.FirstYear), VestWeights: s.VestWeights,
 		StartDate: s.StartDate.Format("2006-01-02"), Steps: []incomeStepJSON{},
 		CreatedAt: s.CreatedAt.UTC().Format(time.RFC3339),
 	}
@@ -295,6 +296,9 @@ func (s incomeStreamJSON) parse() (parsedStream, error) {
 		}
 		end = pgtype.Date{Time: e, Valid: true}
 	}
+	if s.Kind != analytics.IncomeRSURefresh && len(s.VestWeights) > 0 {
+		return out, errors.New("only an RSU refresh has a vesting shape")
+	}
 	switch s.Kind {
 	case analytics.IncomeBonus:
 		if s.Month == nil || s.PayoutFactor == nil || !finite(*s.PayoutFactor) || *s.PayoutFactor < 0 || *s.PayoutFactor > 5 || s.Amount > 5 {
@@ -306,6 +310,13 @@ func (s incomeStreamJSON) parse() (parsedStream, error) {
 		}
 		if e := *s.VestEvery; e != 1 && e != 3 && e != 6 && e != 12 {
 			return out, errors.New("vest_every must be 1, 3, 6 or 12")
+		}
+		if len(s.VestWeights) > 0 {
+			weights, err := normalizeVestWeights(s.VestWeights, *s.VestMonths)
+			if err != nil {
+				return out, err
+			}
+			s.VestWeights = weights
 		}
 	}
 	var account *uuid.UUID
@@ -323,7 +334,7 @@ func (s incomeStreamJSON) parse() (parsedStream, error) {
 		Month: optInt4(s.Month), PayoutFactor: optNumeric(s.PayoutFactor),
 		VestMonths: optInt4(s.VestMonths), VestEvery: optInt4(s.VestEvery),
 		CliffMonths: int32(s.CliffMonths), AccountID: account, FirstYear: optInt4(s.FirstYear),
-		StartDate: start, EndDate: end,
+		StartDate: start, EndDate: end, VestWeights: s.VestWeights,
 	}
 	if s.Kind != analytics.IncomeSalary && len(s.Steps) > 0 {
 		return out, errors.New("only a salary has step changes")
@@ -381,6 +392,7 @@ func (h *PortfolioHandler) saveStream(ctx context.Context, id *uuid.UUID, ps par
 				Month: p.Month, PayoutFactor: p.PayoutFactor, VestMonths: p.VestMonths,
 				VestEvery: p.VestEvery, CliffMonths: p.CliffMonths, AccountID: p.AccountID,
 				FirstYear: p.FirstYear, StartDate: p.StartDate, EndDate: p.EndDate,
+				VestWeights: p.VestWeights,
 			})
 			if err != nil {
 				return err
@@ -405,6 +417,29 @@ func (h *PortfolioHandler) saveStream(ctx context.Context, id *uuid.UUID, ps par
 }
 
 var errKindChange = errors.New("a stream's kind can't change")
+
+// normalizeVestWeights checks one share per vesting year that adds up to 100 %
+// and rescales it to sum exactly to 1.
+func normalizeVestWeights(weights []float64, vestMonths int) ([]float64, error) {
+	if vestMonths%12 != 0 || len(weights) != vestMonths/12 {
+		return nil, fmt.Errorf("a vesting shape needs one share per year (%d months)", vestMonths)
+	}
+	var total float64
+	for _, w := range weights {
+		if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 || w > 1 {
+			return nil, errors.New("each year's share must be between 0 and 100 %")
+		}
+		total += w
+	}
+	if math.Abs(total-1) > 0.005 {
+		return nil, errors.New("the yearly shares must add up to 100 %")
+	}
+	out := make([]float64, len(weights))
+	for i, w := range weights {
+		out[i] = w / total
+	}
+	return out, nil
+}
 
 func (h *PortfolioHandler) writeStream(w http.ResponseWriter, ctx context.Context, id uuid.UUID, status int) {
 	all, err := h.listStreamsJSON(ctx)
@@ -537,6 +572,7 @@ func (h *PortfolioHandler) loadIncomeInputs(ctx context.Context, now time.Time) 
 		if s.FirstYear.Valid {
 			st.FirstYear = int(s.FirstYear.Int32)
 		}
+		st.VestWeights = s.VestWeights
 		if s.EndDate.Valid {
 			st.End = s.EndDate.Time
 		}
